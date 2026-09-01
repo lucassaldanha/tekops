@@ -1,5 +1,8 @@
+use crate::beaconapi::BeaconClient;
 use crate::logs::{stream_logs, LogSource};
+use crate::output::format_health_summary;
 use clap::{Parser, Subcommand};
+use std::env;
 use std::io::{BufReader, LineWriter};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -18,12 +21,66 @@ enum Commands {
         source: LogSource,
         path: Option<PathBuf>,
     },
+    /// Query the node's Beacon API
+    Beacon {
+        #[command(subcommand)]
+        command: BeaconCommand,
+        /// Beacon API base URL (default: http://localhost:5051, or $TEKU_OP_API_URL)
+        #[arg(long, global = true)]
+        api_url: Option<String>,
+        /// Print the raw API response as JSON instead of a summary
+        #[arg(long, global = true)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BeaconCommand {
+    /// Node health and sync status
+    Health,
 }
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Logs { source, path } => run_logs(source, path),
+        Commands::Beacon { command, api_url, json } => {
+            let base_url = api_url
+                .or_else(|| env::var("TEKU_OP_API_URL").ok())
+                .unwrap_or_else(|| "http://localhost:5051".to_string());
+            let client = BeaconClient::new(base_url);
+            run_beacon(client, command, json)
+        }
+    }
+}
+
+fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitCode {
+    match command {
+        BeaconCommand::Health => {
+            let syncing = match client.syncing() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let health = match client.health() {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if json {
+                println!(
+                    "{{\"is_syncing\":{},\"is_optimistic\":{},\"head_slot\":\"{}\",\"sync_distance\":\"{}\"}}",
+                    syncing.is_syncing, syncing.is_optimistic, syncing.head_slot, syncing.sync_distance
+                );
+            } else {
+                println!("{}", format_health_summary(&health, &syncing));
+            }
+            ExitCode::SUCCESS
+        }
     }
 }
 
