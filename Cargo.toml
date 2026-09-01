@@ -1,0 +1,19 @@
+[package]
+name = "teku-op"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+enr = { version = "0.12", features = ["k256"] }
+comfy-table = "7"
+owo-colors = "4"
+
+[dev-dependencies]
+mockito = "1"
+k256 = "0.13"
+rand = "0.8"
