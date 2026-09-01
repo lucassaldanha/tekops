@@ -1,5 +1,7 @@
 use crate::logfmt::format_log_line;
+use clap::ValueEnum;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 pub fn stream_logs<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::Result<()> {
     for line in reader.lines() {
@@ -7,6 +9,21 @@ pub fn stream_logs<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::Resul
         writeln!(writer, "{}", format_log_line(&line))?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum LogSource {
+    Teku,
+    Besu,
+}
+
+impl LogSource {
+    pub fn default_path(&self) -> PathBuf {
+        match self {
+            LogSource::Teku => PathBuf::from("/var/log/teku/teku.log"),
+            LogSource::Besu => PathBuf::from("/var/log/besu/besu.log"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -37,5 +54,11 @@ mod tests {
         stream_logs(reader, &mut output).unwrap();
 
         assert_eq!(String::from_utf8(output).unwrap().trim_end(), "garbage");
+    }
+
+    #[test]
+    fn default_paths_match_existing_bashrc_function() {
+        assert_eq!(LogSource::Teku.default_path(), PathBuf::from("/var/log/teku/teku.log"));
+        assert_eq!(LogSource::Besu.default_path(), PathBuf::from("/var/log/besu/besu.log"));
     }
 }

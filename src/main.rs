@@ -1,6 +1,9 @@
+mod cli;
 mod logfmt;
 mod logs;
 
-fn main() {
-    println!("Hello, world!");
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    cli::run()
 }
