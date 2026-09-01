@@ -38,6 +38,8 @@ enum Commands {
 enum BeaconCommand {
     /// Node health and sync status
     Health,
+    /// Chain head slot/root and finality checkpoints
+    Head,
 }
 
 pub fn run() -> ExitCode {
@@ -78,6 +80,31 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
                 );
             } else {
                 println!("{}", format_health_summary(&health, &syncing));
+            }
+            ExitCode::SUCCESS
+        }
+        BeaconCommand::Head => {
+            let header = match client.header_head() {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let finality = match client.finality_checkpoints() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if json {
+                println!(
+                    "{{\"slot\":\"{}\",\"root\":\"{}\",\"current_justified_epoch\":\"{}\",\"finalized_epoch\":\"{}\"}}",
+                    header.slot, header.root, finality.current_justified_epoch, finality.finalized_epoch
+                );
+            } else {
+                println!("{}", crate::output::format_head_summary(&header, &finality));
             }
             ExitCode::SUCCESS
         }

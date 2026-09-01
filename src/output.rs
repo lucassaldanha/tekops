@@ -1,4 +1,4 @@
-use crate::beaconapi::{HealthState, SyncingStatus};
+use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
@@ -16,6 +16,13 @@ pub fn format_health_summary(health: &HealthState, syncing: &SyncingStatus) -> S
         syncing.head_slot,
         syncing.sync_distance,
         yes_no(syncing.is_optimistic),
+    )
+}
+
+pub fn format_head_summary(header: &BlockHeader, finality: &FinalityCheckpoints) -> String {
+    format!(
+        "head slot: {} | head root: {} | justified epoch: {} | finalized epoch: {}",
+        header.slot, header.root, finality.current_justified_epoch, finality.finalized_epoch
     )
 }
 
@@ -51,6 +58,22 @@ mod tests {
         assert_eq!(
             out,
             "health: syncing | syncing: yes | head slot: 100 | sync distance: 50 | optimistic: yes"
+        );
+    }
+
+    #[test]
+    fn formats_head_summary() {
+        use crate::beaconapi::{BlockHeader, FinalityCheckpoints};
+        let header = BlockHeader { slot: "999".to_string(), root: "0xabc".to_string() };
+        let finality = FinalityCheckpoints {
+            previous_justified_epoch: "10".to_string(),
+            current_justified_epoch: "11".to_string(),
+            finalized_epoch: "9".to_string(),
+        };
+        let out = format_head_summary(&header, &finality);
+        assert_eq!(
+            out,
+            "head slot: 999 | head root: 0xabc | justified epoch: 11 | finalized epoch: 9"
         );
     }
 }
