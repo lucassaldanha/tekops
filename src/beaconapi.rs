@@ -91,6 +91,25 @@ pub struct FinalityCheckpoints {
     pub finalized_epoch: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PeersResponse {
+    data: Vec<PeerData>,
+}
+#[derive(Debug, Deserialize)]
+struct PeerData {
+    peer_id: String,
+    enr: Option<String>,
+    state: String,
+    direction: String,
+}
+
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub enr: Option<String>,
+    pub state: String,
+    pub direction: String,
+}
+
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self { base_url: base_url.into() }
@@ -154,6 +173,15 @@ impl BeaconClient {
             current_justified_epoch: parsed.data.current_justified.epoch,
             finalized_epoch: parsed.data.finalized.epoch,
         })
+    }
+
+    pub fn peers(&self) -> Result<Vec<PeerInfo>, ApiError> {
+        let parsed: PeersResponse = self.get_json("/eth/v1/node/peers")?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|p| PeerInfo { peer_id: p.peer_id, enr: p.enr, state: p.state, direction: p.direction })
+            .collect())
     }
 }
 
@@ -222,6 +250,22 @@ mod tests {
         let header = client.header_head().unwrap();
         assert_eq!(header.slot, "999");
         assert_eq!(header.root, "0xabc");
+    }
+
+    #[test]
+    fn peers_parses_list() {
+        let mut server = mockito::Server::new();
+        let body = r#"{"data":[
+            {"peer_id":"p1","enr":"enr:xyz","state":"connected","direction":"inbound"},
+            {"peer_id":"p2","enr":null,"state":"connected","direction":"outbound"}
+        ]}"#;
+        let _m = server.mock("GET", "/eth/v1/node/peers").with_status(200).with_body(body).create();
+        let client = BeaconClient::new(server.url());
+        let peers = client.peers().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer_id, "p1");
+        assert_eq!(peers[0].enr.as_deref(), Some("enr:xyz"));
+        assert_eq!(peers[1].enr, None);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
+use crate::enr::Protocol;
+use comfy_table::Table;
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
@@ -24,6 +26,37 @@ pub fn format_head_summary(header: &BlockHeader, finality: &FinalityCheckpoints)
         "head slot: {} | head root: {} | justified epoch: {} | finalized epoch: {}",
         header.slot, header.root, finality.current_justified_epoch, finality.finalized_epoch
     )
+}
+
+pub struct PeerRow {
+    pub peer_id: String,
+    pub direction: String,
+    pub state: String,
+    pub protocol: Protocol,
+}
+
+fn protocol_label(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Tcp => "TCP",
+        Protocol::Quic => "QUIC",
+        Protocol::Unknown => "Unknown",
+    }
+}
+
+pub fn format_peers_table(rows: &[PeerRow]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Direction", "State", "Protocol", "Peer ID"]);
+    let mut sorted: Vec<&PeerRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| (&a.direction, &a.state).cmp(&(&b.direction, &b.state)));
+    for row in sorted {
+        table.add_row(vec![
+            row.direction.clone(),
+            row.state.clone(),
+            protocol_label(row.protocol).to_string(),
+            row.peer_id.clone(),
+        ]);
+    }
+    table.to_string()
 }
 
 #[cfg(test)]
@@ -59,6 +92,22 @@ mod tests {
             out,
             "health: syncing | syncing: yes | head slot: 100 | sync distance: 50 | optimistic: yes"
         );
+    }
+
+    #[test]
+    fn formats_peers_table() {
+        use crate::enr::Protocol;
+        let rows = vec![
+            PeerRow { peer_id: "p1".to_string(), direction: "inbound".to_string(), state: "connected".to_string(), protocol: Protocol::Tcp },
+            PeerRow { peer_id: "p2".to_string(), direction: "outbound".to_string(), state: "connected".to_string(), protocol: Protocol::Quic },
+        ];
+        let table = format_peers_table(&rows);
+        assert!(table.contains("p1"));
+        assert!(table.contains("inbound"));
+        assert!(table.contains("TCP"));
+        assert!(table.contains("p2"));
+        assert!(table.contains("outbound"));
+        assert!(table.contains("QUIC"));
     }
 
     #[test]

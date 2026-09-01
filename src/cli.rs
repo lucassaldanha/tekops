@@ -1,6 +1,7 @@
 use crate::beaconapi::BeaconClient;
+use crate::enr::classify_protocol;
 use crate::logs::{stream_logs, LogSource};
-use crate::output::format_health_summary;
+use crate::output::{format_health_summary, format_peers_table, PeerRow};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::io::{BufReader, LineWriter};
@@ -40,6 +41,8 @@ enum BeaconCommand {
     Health,
     /// Chain head slot/root and finality checkpoints
     Head,
+    /// List connected peers, grouped by direction/state, with transport protocol
+    Peers,
 }
 
 pub fn run() -> ExitCode {
@@ -105,6 +108,39 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
                 );
             } else {
                 println!("{}", crate::output::format_head_summary(&header, &finality));
+            }
+            ExitCode::SUCCESS
+        }
+        BeaconCommand::Peers => {
+            let peers = match client.peers() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if json {
+                let json_rows: Vec<String> = peers
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{{\"peer_id\":\"{}\",\"direction\":\"{}\",\"state\":\"{}\"}}",
+                            p.peer_id, p.direction, p.state
+                        )
+                    })
+                    .collect();
+                println!("[{}]", json_rows.join(","));
+            } else {
+                let rows: Vec<PeerRow> = peers
+                    .into_iter()
+                    .map(|p| PeerRow {
+                        peer_id: p.peer_id,
+                        direction: p.direction,
+                        state: p.state,
+                        protocol: p.enr.as_deref().map(classify_protocol).unwrap_or(crate::enr::Protocol::Unknown),
+                    })
+                    .collect();
+                println!("{}", format_peers_table(&rows));
             }
             ExitCode::SUCCESS
         }
