@@ -5,9 +5,10 @@ use crate::output::{
     format_attester_duties, format_health_summary, format_peers_table, format_proposer_duties,
     PeerRow,
 };
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use std::env;
-use std::io::{BufReader, LineWriter};
+use std::io::{self, BufReader, LineWriter};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
@@ -36,6 +37,8 @@ enum Commands {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// Print a shell completion script
+    Completion { shell: Shell },
 }
 
 #[derive(Subcommand)]
@@ -80,6 +83,11 @@ pub fn run() -> ExitCode {
                 .unwrap_or_else(|| "http://localhost:5051".to_string());
             let client = BeaconClient::new(base_url);
             run_beacon(client, command, json)
+        }
+        Commands::Completion { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "teku-op", &mut io::stdout());
+            ExitCode::SUCCESS
         }
     }
 }
@@ -289,4 +297,27 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
     let _ = pager.wait();
     let _ = tail.kill();
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use clap_complete::{generate, Shell};
+
+    #[test]
+    fn generates_non_empty_bash_completion() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        generate(Shell::Bash, &mut cmd, "teku-op", &mut buf);
+        let script = String::from_utf8(buf).unwrap();
+        assert!(!script.is_empty());
+        assert!(script.contains("teku-op"));
+    }
+
+    #[test]
+    fn completion_subcommand_parses() {
+        let cli = Cli::try_parse_from(["teku-op", "completion", "bash"]).unwrap();
+        assert!(matches!(cli.command, Commands::Completion { shell: Shell::Bash }));
+    }
 }
