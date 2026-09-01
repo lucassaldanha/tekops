@@ -1,5 +1,6 @@
 mod beaconapi;
 mod cli;
+mod enr;
 mod logfmt;
 mod logs;
 mod output;
