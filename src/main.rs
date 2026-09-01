@@ -1,3 +1,4 @@
+mod beaconapi;
 mod cli;
 mod logfmt;
 mod logs;
