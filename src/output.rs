@@ -1,4 +1,7 @@
-use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus, ValidatorInfo};
+use crate::beaconapi::{
+    AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
+    ValidatorInfo,
+};
 use crate::enr::Protocol;
 use comfy_table::Table;
 
@@ -68,6 +71,24 @@ pub fn format_validators_table(validators: &[ValidatorInfo]) -> String {
     table.to_string()
 }
 
+pub fn format_attester_duties(duties: &[AttesterDuty]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Slot", "Validator Index", "Committee Index", "Pubkey"]);
+    for d in duties {
+        table.add_row(vec![d.slot.clone(), d.validator_index.clone(), d.committee_index.clone(), d.pubkey.clone()]);
+    }
+    table.to_string()
+}
+
+pub fn format_proposer_duties(duties: &[ProposerDuty]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Slot", "Validator Index", "Pubkey"]);
+    for d in duties {
+        table.add_row(vec![d.slot.clone(), d.validator_index.clone(), d.pubkey.clone()]);
+    }
+    table.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +154,33 @@ mod tests {
         assert!(table.contains("0xabc"));
         assert!(table.contains("32000000000"));
         assert!(table.contains("active_ongoing"));
+    }
+
+    #[test]
+    fn formats_attester_duties() {
+        use crate::beaconapi::AttesterDuty;
+        let duties = vec![AttesterDuty {
+            pubkey: "0xabc".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "2".to_string(),
+            slot: "100".to_string(),
+        }];
+        let table = format_attester_duties(&duties);
+        assert!(table.contains("0xabc"));
+        assert!(table.contains("100"));
+    }
+
+    #[test]
+    fn formats_proposer_duties() {
+        use crate::beaconapi::ProposerDuty;
+        let duties = vec![ProposerDuty {
+            pubkey: "0xdef".to_string(),
+            validator_index: "3".to_string(),
+            slot: "101".to_string(),
+        }];
+        let table = format_proposer_duties(&duties);
+        assert!(table.contains("0xdef"));
+        assert!(table.contains("101"));
     }
 
     #[test]

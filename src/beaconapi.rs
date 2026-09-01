@@ -133,6 +133,42 @@ pub struct ValidatorInfo {
     pub status: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttesterDutiesResponse {
+    data: Vec<AttesterDutyEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct AttesterDutyEntry {
+    pubkey: String,
+    validator_index: String,
+    committee_index: String,
+    slot: String,
+}
+
+pub struct AttesterDuty {
+    pub pubkey: String,
+    pub validator_index: String,
+    pub committee_index: String,
+    pub slot: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProposerDutiesResponse {
+    data: Vec<ProposerDutyEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct ProposerDutyEntry {
+    pubkey: String,
+    validator_index: String,
+    slot: String,
+}
+
+pub struct ProposerDuty {
+    pub pubkey: String,
+    pub validator_index: String,
+    pub slot: String,
+}
+
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self { base_url: base_url.into() }
@@ -220,6 +256,41 @@ impl BeaconClient {
                 balance: v.balance,
                 status: v.status,
             })
+            .collect())
+    }
+
+    pub fn duties_attester(&self, epoch: u64, indices: &[String]) -> Result<Vec<AttesterDuty>, ApiError> {
+        let path = format!("/eth/v1/validator/duties/attester/{epoch}");
+        let resp = ureq::post(&self.url(&path))
+            .send_json(serde_json::json!(indices))
+            .map_err(|e| match e {
+                ureq::Error::Status(code, resp) => {
+                    ApiError::Status(code, resp.into_string().unwrap_or_default())
+                }
+                ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
+            })?;
+        let parsed: AttesterDutiesResponse = resp
+            .into_json()
+            .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|d| AttesterDuty {
+                pubkey: d.pubkey,
+                validator_index: d.validator_index,
+                committee_index: d.committee_index,
+                slot: d.slot,
+            })
+            .collect())
+    }
+
+    pub fn duties_proposer(&self, epoch: u64) -> Result<Vec<ProposerDuty>, ApiError> {
+        let path = format!("/eth/v1/validator/duties/proposer/{epoch}");
+        let parsed: ProposerDutiesResponse = self.get_json(&path)?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|d| ProposerDuty { pubkey: d.pubkey, validator_index: d.validator_index, slot: d.slot })
             .collect())
     }
 }
@@ -325,6 +396,41 @@ mod tests {
         assert_eq!(validators[0].pubkey, "0xabc");
         assert_eq!(validators[0].balance, "32000000000");
         assert_eq!(validators[0].status, "active_ongoing");
+    }
+
+    #[test]
+    fn duties_attester_posts_indices_and_parses_response() {
+        let mut server = mockito::Server::new();
+        let body = r#"{"data":[{"pubkey":"0xabc","validator_index":"1","committee_index":"2","slot":"100"}]}"#;
+        let _m = server
+            .mock("POST", "/eth/v1/validator/duties/attester/5")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let client = BeaconClient::new(server.url());
+        let duties = client.duties_attester(5, &["1".to_string()]).unwrap();
+        assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].pubkey, "0xabc");
+        assert_eq!(duties[0].validator_index, "1");
+        assert_eq!(duties[0].committee_index, "2");
+        assert_eq!(duties[0].slot, "100");
+    }
+
+    #[test]
+    fn duties_proposer_parses_response() {
+        let mut server = mockito::Server::new();
+        let body = r#"{"data":[{"pubkey":"0xdef","validator_index":"3","slot":"101"}]}"#;
+        let _m = server
+            .mock("GET", "/eth/v1/validator/duties/proposer/5")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let client = BeaconClient::new(server.url());
+        let duties = client.duties_proposer(5).unwrap();
+        assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].pubkey, "0xdef");
+        assert_eq!(duties[0].validator_index, "3");
+        assert_eq!(duties[0].slot, "101");
     }
 
     #[test]

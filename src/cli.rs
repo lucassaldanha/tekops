@@ -1,7 +1,10 @@
 use crate::beaconapi::BeaconClient;
 use crate::enr::classify_protocol;
 use crate::logs::{stream_logs, LogSource};
-use crate::output::{format_health_summary, format_peers_table, PeerRow};
+use crate::output::{
+    format_attester_duties, format_health_summary, format_peers_table, format_proposer_duties,
+    PeerRow,
+};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::io::{BufReader, LineWriter};
@@ -45,6 +48,26 @@ enum BeaconCommand {
     Peers,
     /// Show status for one or more validators (by index or pubkey)
     Validators { ids: Vec<String> },
+    /// Attester or proposer duties for a given epoch
+    Duties {
+        #[command(subcommand)]
+        kind: DutiesKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum DutiesKind {
+    /// Attester duties for a set of validator indices in a given epoch
+    Attester {
+        #[arg(long)]
+        epoch: u64,
+        indices: Vec<String>,
+    },
+    /// Proposer duties for a given epoch
+    Proposer {
+        #[arg(long)]
+        epoch: u64,
+    },
 }
 
 pub fn run() -> ExitCode {
@@ -170,6 +193,56 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
             }
             ExitCode::SUCCESS
         }
+        BeaconCommand::Duties { kind } => match kind {
+            DutiesKind::Attester { epoch, indices } => {
+                let duties = match client.duties_attester(epoch, &indices) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if json {
+                    let json_rows: Vec<String> = duties
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{{\"pubkey\":\"{}\",\"validator_index\":\"{}\",\"committee_index\":\"{}\",\"slot\":\"{}\"}}",
+                                d.pubkey, d.validator_index, d.committee_index, d.slot
+                            )
+                        })
+                        .collect();
+                    println!("[{}]", json_rows.join(","));
+                } else {
+                    println!("{}", format_attester_duties(&duties));
+                }
+                ExitCode::SUCCESS
+            }
+            DutiesKind::Proposer { epoch } => {
+                let duties = match client.duties_proposer(epoch) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if json {
+                    let json_rows: Vec<String> = duties
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{{\"pubkey\":\"{}\",\"validator_index\":\"{}\",\"slot\":\"{}\"}}",
+                                d.pubkey, d.validator_index, d.slot
+                            )
+                        })
+                        .collect();
+                    println!("[{}]", json_rows.join(","));
+                } else {
+                    println!("{}", format_proposer_duties(&duties));
+                }
+                ExitCode::SUCCESS
+            }
+        },
     }
 }
 
