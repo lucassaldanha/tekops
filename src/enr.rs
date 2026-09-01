@@ -1,7 +1,9 @@
 use enr::{k256::ecdsa::SigningKey, Enr};
+use serde::Serialize;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Tcp,
     Quic,

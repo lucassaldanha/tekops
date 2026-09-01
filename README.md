@@ -24,9 +24,16 @@ Helper CLI for operating a Teku/Besu node, run directly on the node over SSH.
     teku-op beacon duties attester --epoch=N <index>...
     teku-op beacon duties proposer --epoch=N
 
-Every `beacon` subcommand accepts `--json` for the raw API response, and
-`--api-url` (or `$TEKU_OP_API_URL`) to point at a non-default Beacon API
-(default: `http://localhost:5051`).
+Every `beacon` subcommand accepts `--json` to print a JSON-serialized version
+of the parsed response instead of the summary/table (not a raw passthrough of
+the Beacon API's wire response - e.g. `peers --json` includes a `protocol`
+field that's derived locally, not sent by the API), and `--api-url` (or
+`$TEKU_OP_API_URL`) to point at a non-default Beacon API (default:
+`http://localhost:5051`).
+
+The Peers table's Protocol column reflects what the peer advertises in its
+ENR (exactly one of TCP or QUIC), not necessarily which transport is in
+active use for that specific connection.
 
 ## Shell completion
 

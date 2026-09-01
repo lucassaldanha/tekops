@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub struct BeaconClient {
@@ -9,6 +9,7 @@ pub struct BeaconClient {
 pub enum ApiError {
     Unreachable(String),
     Status(u16, String),
+    Malformed(String),
 }
 
 impl fmt::Display for ApiError {
@@ -16,11 +17,22 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Unreachable(msg) => write!(f, "could not reach Beacon API: {msg}"),
             ApiError::Status(code, msg) => write!(f, "Beacon API returned {code}: {msg}"),
+            ApiError::Malformed(msg) => write!(f, "Beacon API returned malformed data: {msg}"),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+fn map_ureq_error(e: ureq::Error) -> ApiError {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            ApiError::Status(code, resp.into_string().unwrap_or_default())
+        }
+        ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthState {
     Ready,
     Syncing,
@@ -40,6 +52,7 @@ struct SyncingData {
     sync_distance: String,
 }
 
+#[derive(Serialize)]
 pub struct SyncingStatus {
     pub is_syncing: bool,
     pub is_optimistic: bool,
@@ -65,6 +78,7 @@ struct HeaderMessage {
     slot: String,
 }
 
+#[derive(Serialize)]
 pub struct BlockHeader {
     pub slot: String,
     pub root: String,
@@ -85,6 +99,7 @@ struct Checkpoint {
     epoch: String,
 }
 
+#[derive(Serialize)]
 pub struct FinalityCheckpoints {
     pub previous_justified_epoch: String,
     pub current_justified_epoch: String,
@@ -126,6 +141,7 @@ struct ValidatorDetail {
     pubkey: String,
 }
 
+#[derive(Serialize)]
 pub struct ValidatorInfo {
     pub index: String,
     pub pubkey: String,
@@ -145,6 +161,7 @@ struct AttesterDutyEntry {
     slot: String,
 }
 
+#[derive(Serialize)]
 pub struct AttesterDuty {
     pub pubkey: String,
     pub validator_index: String,
@@ -163,6 +180,7 @@ struct ProposerDutyEntry {
     slot: String,
 }
 
+#[derive(Serialize)]
 pub struct ProposerDuty {
     pub pubkey: String,
     pub validator_index: String,
@@ -182,19 +200,14 @@ impl BeaconClient {
         match ureq::get(&self.url(path)).call() {
             Ok(resp) => Ok(resp.status()),
             Err(ureq::Error::Status(code, _)) => Ok(code),
-            Err(ureq::Error::Transport(t)) => Err(ApiError::Unreachable(t.to_string())),
+            Err(e) => Err(map_ureq_error(e)),
         }
     }
 
     fn get_json<T: for<'de> serde::Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
-        let resp = ureq::get(&self.url(path)).call().map_err(|e| match e {
-            ureq::Error::Status(code, resp) => {
-                ApiError::Status(code, resp.into_string().unwrap_or_default())
-            }
-            ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
-        })?;
+        let resp = ureq::get(&self.url(path)).call().map_err(map_ureq_error)?;
         resp.into_json()
-            .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))
+            .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
 
     fn post_json<T: for<'de> serde::Deserialize<'de>>(
@@ -202,14 +215,9 @@ impl BeaconClient {
         path: &str,
         body: impl serde::Serialize,
     ) -> Result<T, ApiError> {
-        let resp = ureq::post(&self.url(path)).send_json(body).map_err(|e| match e {
-            ureq::Error::Status(code, resp) => {
-                ApiError::Status(code, resp.into_string().unwrap_or_default())
-            }
-            ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
-        })?;
+        let resp = ureq::post(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
         resp.into_json()
-            .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))
+            .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
 
     pub fn health(&self) -> Result<HealthState, ApiError> {

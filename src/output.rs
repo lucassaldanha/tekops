@@ -4,6 +4,7 @@ use crate::beaconapi::{
 };
 use crate::enr::Protocol;
 use comfy_table::Table;
+use serde::Serialize;
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
@@ -31,6 +32,7 @@ pub fn format_head_summary(header: &BlockHeader, finality: &FinalityCheckpoints)
     )
 }
 
+#[derive(Serialize)]
 pub struct PeerRow {
     pub peer_id: String,
     pub direction: String,
