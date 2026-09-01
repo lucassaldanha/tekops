@@ -43,6 +43,8 @@ enum BeaconCommand {
     Head,
     /// List connected peers, grouped by direction/state, with transport protocol
     Peers,
+    /// Show status for one or more validators (by index or pubkey)
+    Validators { ids: Vec<String> },
 }
 
 pub fn run() -> ExitCode {
@@ -141,6 +143,30 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
                     })
                     .collect();
                 println!("{}", format_peers_table(&rows));
+            }
+            ExitCode::SUCCESS
+        }
+        BeaconCommand::Validators { ids } => {
+            let validators = match client.validators(&ids) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if json {
+                let json_rows: Vec<String> = validators
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "{{\"index\":\"{}\",\"pubkey\":\"{}\",\"balance\":\"{}\",\"status\":\"{}\"}}",
+                            v.index, v.pubkey, v.balance, v.status
+                        )
+                    })
+                    .collect();
+                println!("[{}]", json_rows.join(","));
+            } else {
+                println!("{}", crate::output::format_validators_table(&validators));
             }
             ExitCode::SUCCESS
         }

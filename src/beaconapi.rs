@@ -110,6 +110,29 @@ pub struct PeerInfo {
     pub direction: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ValidatorsResponse {
+    data: Vec<ValidatorEntry>,
+}
+#[derive(Debug, Deserialize)]
+struct ValidatorEntry {
+    index: String,
+    balance: String,
+    status: String,
+    validator: ValidatorDetail,
+}
+#[derive(Debug, Deserialize)]
+struct ValidatorDetail {
+    pubkey: String,
+}
+
+pub struct ValidatorInfo {
+    pub index: String,
+    pub pubkey: String,
+    pub balance: String,
+    pub status: String,
+}
+
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self { base_url: base_url.into() }
@@ -181,6 +204,22 @@ impl BeaconClient {
             .data
             .into_iter()
             .map(|p| PeerInfo { peer_id: p.peer_id, enr: p.enr, state: p.state, direction: p.direction })
+            .collect())
+    }
+
+    pub fn validators(&self, ids: &[String]) -> Result<Vec<ValidatorInfo>, ApiError> {
+        let query = ids.join(",");
+        let path = format!("/eth/v1/beacon/states/head/validators?id={query}");
+        let parsed: ValidatorsResponse = self.get_json(&path)?;
+        Ok(parsed
+            .data
+            .into_iter()
+            .map(|v| ValidatorInfo {
+                index: v.index,
+                pubkey: v.validator.pubkey,
+                balance: v.balance,
+                status: v.status,
+            })
             .collect())
     }
 }
@@ -266,6 +305,26 @@ mod tests {
         assert_eq!(peers[0].peer_id, "p1");
         assert_eq!(peers[0].enr.as_deref(), Some("enr:xyz"));
         assert_eq!(peers[1].enr, None);
+    }
+
+    #[test]
+    fn validators_parses_list() {
+        let mut server = mockito::Server::new();
+        let body = r#"{"data":[
+            {"index":"1","balance":"32000000000","status":"active_ongoing","validator":{"pubkey":"0xabc"}}
+        ]}"#;
+        let _m = server
+            .mock("GET", "/eth/v1/beacon/states/head/validators?id=1")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let client = BeaconClient::new(server.url());
+        let validators = client.validators(&["1".to_string()]).unwrap();
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].index, "1");
+        assert_eq!(validators[0].pubkey, "0xabc");
+        assert_eq!(validators[0].balance, "32000000000");
+        assert_eq!(validators[0].status, "active_ongoing");
     }
 
     #[test]

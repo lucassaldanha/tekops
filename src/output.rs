@@ -1,4 +1,4 @@
-use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
+use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus, ValidatorInfo};
 use crate::enr::Protocol;
 use comfy_table::Table;
 
@@ -59,6 +59,15 @@ pub fn format_peers_table(rows: &[PeerRow]) -> String {
     table.to_string()
 }
 
+pub fn format_validators_table(validators: &[ValidatorInfo]) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Index", "Pubkey", "Balance", "Status"]);
+    for v in validators {
+        table.add_row(vec![v.index.clone(), v.pubkey.clone(), v.balance.clone(), v.status.clone()]);
+    }
+    table.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +117,22 @@ mod tests {
         assert!(table.contains("p2"));
         assert!(table.contains("outbound"));
         assert!(table.contains("QUIC"));
+    }
+
+    #[test]
+    fn formats_validators_table() {
+        use crate::beaconapi::ValidatorInfo;
+        let validators = vec![ValidatorInfo {
+            index: "1".to_string(),
+            pubkey: "0xabc".to_string(),
+            balance: "32000000000".to_string(),
+            status: "active_ongoing".to_string(),
+        }];
+        let table = format_validators_table(&validators);
+        assert!(table.contains("1"));
+        assert!(table.contains("0xabc"));
+        assert!(table.contains("32000000000"));
+        assert!(table.contains("active_ongoing"));
     }
 
     #[test]
