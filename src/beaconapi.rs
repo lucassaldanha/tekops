@@ -197,6 +197,21 @@ impl BeaconClient {
             .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))
     }
 
+    fn post_json<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: impl serde::Serialize,
+    ) -> Result<T, ApiError> {
+        let resp = ureq::post(&self.url(path)).send_json(body).map_err(|e| match e {
+            ureq::Error::Status(code, resp) => {
+                ApiError::Status(code, resp.into_string().unwrap_or_default())
+            }
+            ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
+        })?;
+        resp.into_json()
+            .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))
+    }
+
     pub fn health(&self) -> Result<HealthState, ApiError> {
         match self.request_status("/eth/v1/node/health")? {
             200 => Ok(HealthState::Ready),
@@ -261,17 +276,7 @@ impl BeaconClient {
 
     pub fn duties_attester(&self, epoch: u64, indices: &[String]) -> Result<Vec<AttesterDuty>, ApiError> {
         let path = format!("/eth/v1/validator/duties/attester/{epoch}");
-        let resp = ureq::post(&self.url(&path))
-            .send_json(serde_json::json!(indices))
-            .map_err(|e| match e {
-                ureq::Error::Status(code, resp) => {
-                    ApiError::Status(code, resp.into_string().unwrap_or_default())
-                }
-                ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
-            })?;
-        let parsed: AttesterDutiesResponse = resp
-            .into_json()
-            .map_err(|e| ApiError::Status(0, format!("invalid JSON: {e}")))?;
+        let parsed: AttesterDutiesResponse = self.post_json(&path, indices)?;
         Ok(parsed
             .data
             .into_iter()
