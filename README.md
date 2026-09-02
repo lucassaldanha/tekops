@@ -48,7 +48,7 @@ Beacon API (default: `http://localhost:5051`).
 messages, aggregates) read from the validator client's own Prometheus
 `/metrics` page, not the Beacon API - it also accepts `--json`, plus
 `--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default metrics
-endpoint (default: `http://localhost:8081/metrics`). It's a local
+endpoint (default: `http://localhost:8010/metrics`). It's a local
 equivalent of the Grafana panel query
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})` -
 `tekops` fetches the raw exposition text and filters/sums locally, since a

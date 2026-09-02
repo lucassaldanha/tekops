@@ -70,7 +70,7 @@ enum Commands {
     },
     /// Published blocks, attestations, sync committee messages, and aggregates
     Duties {
-        /// Prometheus metrics URL (default: http://localhost:8081/metrics, or $TEKOPS_METRIC_URL)
+        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
         #[arg(long)]
         metric_url: Option<String>,
         /// Print a JSON-serialized summary instead of a formatted table
@@ -152,7 +152,7 @@ fn resolve_base_url(api_url: Option<String>) -> String {
 fn resolve_metric_url(metric_url: Option<String>) -> String {
     metric_url
         .or_else(|| env::var("TEKOPS_METRIC_URL").ok())
-        .unwrap_or_else(|| "http://localhost:8081/metrics".to_string())
+        .unwrap_or_else(|| "http://localhost:8010/metrics".to_string())
 }
 
 fn exit_for(result: Result<(), ApiError>) -> ExitCode {
