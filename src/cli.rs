@@ -1,8 +1,8 @@
 use crate::beaconapi::{
     ApiError, BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus,
 };
-use crate::enr::{classify_protocol, Protocol};
 use crate::logs::{stream_logs, LogSource};
+use crate::protocol::classify_protocol;
 use crate::output::{
     format_attester_duties, format_head_summary, format_health_summary, format_peers_table,
     format_proposer_duties, format_validators_table, PeerRow,
@@ -41,6 +41,15 @@ enum Commands {
         #[arg(long, global = true)]
         json: bool,
     },
+    /// List connected peers, grouped by direction/protocol, with peer counts
+    Peers {
+        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
@@ -51,8 +60,6 @@ enum BeaconCommand {
     Health,
     /// Chain head slot/root and finality checkpoints
     Head,
-    /// List connected peers, grouped by direction/state, with transport protocol
-    Peers,
     /// Show status for one or more validators (by index or pubkey)
     Validators {
         #[arg(required = true)]
@@ -86,16 +93,33 @@ pub fn run() -> ExitCode {
     match cli.command {
         Commands::Logs { source, path } => run_logs(source, path),
         Commands::Beacon { command, api_url, json } => {
-            let base_url = api_url
-                .or_else(|| env::var("TEKOPS_API_URL").ok())
-                .unwrap_or_else(|| "http://localhost:5051".to_string());
-            let client = BeaconClient::new(base_url);
+            let client = BeaconClient::new(resolve_base_url(api_url));
             run_beacon(client, command, json)
+        }
+        Commands::Peers { api_url, json } => {
+            let client = BeaconClient::new(resolve_base_url(api_url));
+            exit_for(beacon_peers(&client, json))
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "tekops", &mut io::stdout());
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn resolve_base_url(api_url: Option<String>) -> String {
+    api_url
+        .or_else(|| env::var("TEKOPS_API_URL").ok())
+        .unwrap_or_else(|| "http://localhost:5051".to_string())
+}
+
+fn exit_for(result: Result<(), ApiError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -119,7 +143,6 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
     let result = match command {
         BeaconCommand::Health => beacon_health(&client, json),
         BeaconCommand::Head => beacon_head(&client, json),
-        BeaconCommand::Peers => beacon_peers(&client, json),
         BeaconCommand::Validators { ids } => beacon_validators(&client, &ids, json),
         BeaconCommand::Duties { kind } => match kind {
             DutiesKind::Attester { epoch, indices } => {
@@ -128,13 +151,7 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
             DutiesKind::Proposer { epoch } => beacon_duties_proposer(&client, epoch, json),
         },
     };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    exit_for(result)
 }
 
 fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
@@ -169,7 +186,7 @@ fn beacon_peers(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
             peer_id: p.peer_id,
             direction: p.direction,
             state: p.state,
-            protocol: p.enr.as_deref().map(classify_protocol).unwrap_or(Protocol::Unknown),
+            protocol: classify_protocol(&p.last_seen_p2p_address),
         })
         .collect();
     if json {
@@ -274,6 +291,7 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
 mod tests {
     use super::*;
     use crate::beaconapi::{AttesterDuty, ProposerDuty, ValidatorInfo};
+    use crate::protocol::Protocol;
     use clap::CommandFactory;
     use clap_complete::{generate, Shell};
 
@@ -297,6 +315,12 @@ mod tests {
     fn validators_requires_at_least_one_id() {
         let result = Cli::try_parse_from(["tekops", "beacon", "validators"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn peers_is_a_top_level_command() {
+        let cli = Cli::try_parse_from(["tekops", "peers"]).unwrap();
+        assert!(matches!(cli.command, Commands::Peers { api_url: None, json: false }));
     }
 
     #[test]
@@ -356,7 +380,7 @@ mod tests {
             peer_id: "p\"1".to_string(),
             direction: "inbound".to_string(),
             state: "connected".to_string(),
-            protocol: Protocol::Unknown,
+            protocol: Protocol::Tcp,
         }];
         let json = serde_json::to_string(&rows).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -7,14 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `tekops`: a single-binary Rust CLI for operating a Teku/Besu Ethereum node, run directly on the node over SSH. Two feature areas:
 
 - `tekops logs teku|besu [path]` — tails and colorizes a JSON log file (replaces an old bashrc/jq function).
-- `tekops beacon health|head|peers|validators|duties` — a typed HTTP client wrapper around a curated set of Beacon API endpoints.
+- `tekops beacon health|head|validators|duties`, plus the top-level `tekops peers` — a typed HTTP client wrapper around a curated set of Beacon API endpoints.
 
 ## Commands
 
 ```bash
 cargo build --release        # local build
 cargo test                   # full suite
-cargo test beaconapi::       # one module's tests (also: logfmt::, logs::, output::, enr::, cli::)
+cargo test beaconapi::       # one module's tests (also: logfmt::, logs::, output::, protocol::, cli::)
 cargo test health_ready_on_200  # a single test by name
 cargo clippy --all-targets   # lint
 ```
@@ -37,10 +37,10 @@ The resulting binary is a static-PIE ELF (`file` confirms `static-pie linked`) �
 Each module has one job; `cli.rs` is the only place that wires them together.
 
 - **`main.rs`** — just `mod` declarations and `cli::run()`.
-- **`cli.rs`** — all `clap` command/subcommand definitions and dispatch. Every `beacon` subcommand follows the same shape: call one or more `BeaconClient` methods, then either print a `serde_json`-serialized struct (`--json`) or hand the result to an `output::format_*` function. `run_beacon` centralizes error handling — each `beacon_*` handler returns `Result<(), ApiError>` and the one call site in `run_beacon` prints `error: {e}` and sets the exit code.
+- **`cli.rs`** — all `clap` command/subcommand definitions and dispatch. Every `beacon` subcommand (and the top-level `peers` command) follows the same shape: call one or more `BeaconClient` methods, then either print a `serde_json`-serialized struct (`--json`) or hand the result to an `output::format_*` function. `exit_for` centralizes error handling — each `beacon_*`/`peers` handler returns `Result<(), ApiError>` and `exit_for` prints `error: {e}` and sets the exit code. `peers` lives at the top level (`tekops peers`, not `tekops beacon peers`) since it's used far more often than the other `beacon` subcommands.
 - **`beaconapi.rs`** — `BeaconClient`, backed by `ureq`. Two shared helpers, `get_json`/`post_json`, wrap the request/error-mapping/JSON-decode boilerplate (via `map_ureq_error`) — every endpoint method should go through one of these rather than hand-rolling a `ureq` call. Wire response shapes (nested `{"data": {...}}` envelopes, `validator.pubkey` nesting, etc.) are private structs that get flattened into the public structs (`SyncingStatus`, `BlockHeader`, `PeerInfo`, `ValidatorInfo`, ...) — callers never see the wire nesting. `ApiError` has `Unreachable`, `Status(u16, String)`, and `Malformed(String)` (for responses that returned 2xx but didn't decode).
-- **`output.rs`** — pure formatting functions (`format_health_summary`, `format_peers_table`, etc.) that take already-fetched data and return a `String`. `comfy-table` is used for the tabular ones.
-- **`enr.rs`** — decodes a peer's ENR (via the `enr`/`k256` crates) to classify its transport as `Protocol::Tcp`/`Quic`/`Unknown`. A peer's ENR advertises exactly one of `tcp`/`tcp6` or `quic`/`quic6`, never both, so there's no tie-breaking logic.
+- **`output.rs`** — pure formatting functions (`format_health_summary`, `format_peers_table`, etc.) that take already-fetched data and return a `String`. `comfy-table` is used for the tabular ones. `format_peers_table` prints a summary grouped by direction/protocol (count per group plus a total), not one row per peer — matching how peer counts actually get eyeballed on this node.
+- **`protocol.rs`** — classifies a peer's transport as `Protocol::Tcp`/`Quic` from its `last_seen_p2p_address` multiaddr (`Quic` if it contains a `/quic` component, `Tcp` otherwise). An earlier version decoded the peer's ENR instead (via the `enr`/`k256` crates), but the Beacon API doesn't reliably populate that field and it always classified as `Unknown` in practice — don't reintroduce ENR-based classification.
 - **`logfmt.rs`** — pure function, one JSON log line in, one colorized/formatted line out. No I/O, easy to unit test in isolation.
 - **`logs.rs`** — `LogSource` (teku/besu, default paths) and the generic `stream_logs<R: BufRead, W: Write>` loop, kept generic specifically so it's testable with in-memory buffers instead of real subprocess pipes.
 

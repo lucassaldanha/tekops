@@ -2,9 +2,10 @@ use crate::beaconapi::{
     AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
     ValidatorInfo,
 };
-use crate::enr::Protocol;
+use crate::protocol::Protocol;
 use comfy_table::Table;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
@@ -44,22 +45,19 @@ fn protocol_label(p: Protocol) -> &'static str {
     match p {
         Protocol::Tcp => "TCP",
         Protocol::Quic => "QUIC",
-        Protocol::Unknown => "Unknown",
     }
 }
 
 pub fn format_peers_table(rows: &[PeerRow]) -> String {
+    let total = rows.len();
+    let mut counts: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    for row in rows {
+        *counts.entry((row.direction.clone(), protocol_label(row.protocol))).or_insert(0) += 1;
+    }
     let mut table = Table::new();
-    table.set_header(vec!["Direction", "State", "Protocol", "Peer ID"]);
-    let mut sorted: Vec<&PeerRow> = rows.iter().collect();
-    sorted.sort_by(|a, b| (&a.direction, &a.state).cmp(&(&b.direction, &b.state)));
-    for row in sorted {
-        table.add_row(vec![
-            row.direction.clone(),
-            row.state.clone(),
-            protocol_label(row.protocol).to_string(),
-            row.peer_id.clone(),
-        ]);
+    table.set_header(vec!["Direction", "Protocol", "Count", "Total"]);
+    for ((direction, protocol), count) in counts {
+        table.add_row(vec![direction, protocol.to_string(), count.to_string(), total.to_string()]);
     }
     table.to_string()
 }
@@ -127,19 +125,23 @@ mod tests {
     }
 
     #[test]
-    fn formats_peers_table() {
-        use crate::enr::Protocol;
+    fn formats_peers_table_grouped_by_direction_and_protocol() {
+        use crate::protocol::Protocol;
         let rows = vec![
             PeerRow { peer_id: "p1".to_string(), direction: "inbound".to_string(), state: "connected".to_string(), protocol: Protocol::Tcp },
-            PeerRow { peer_id: "p2".to_string(), direction: "outbound".to_string(), state: "connected".to_string(), protocol: Protocol::Quic },
+            PeerRow { peer_id: "p2".to_string(), direction: "inbound".to_string(), state: "connected".to_string(), protocol: Protocol::Tcp },
+            PeerRow { peer_id: "p3".to_string(), direction: "outbound".to_string(), state: "connected".to_string(), protocol: Protocol::Quic },
         ];
         let table = format_peers_table(&rows);
-        assert!(table.contains("p1"));
         assert!(table.contains("inbound"));
         assert!(table.contains("TCP"));
-        assert!(table.contains("p2"));
         assert!(table.contains("outbound"));
         assert!(table.contains("QUIC"));
+        // 2 inbound/tcp peers, and a total of 3 across all rows
+        assert!(table.contains('2'));
+        assert!(table.contains('3'));
+        assert!(!table.contains("p1"));
+        assert!(!table.contains("connected"));
     }
 
     #[test]

@@ -113,14 +113,14 @@ struct PeersResponse {
 #[derive(Debug, Deserialize)]
 struct PeerData {
     peer_id: String,
-    enr: Option<String>,
+    last_seen_p2p_address: String,
     state: String,
     direction: String,
 }
 
 pub struct PeerInfo {
     pub peer_id: String,
-    pub enr: Option<String>,
+    pub last_seen_p2p_address: String,
     pub state: String,
     pub direction: String,
 }
@@ -262,7 +262,12 @@ impl BeaconClient {
         Ok(parsed
             .data
             .into_iter()
-            .map(|p| PeerInfo { peer_id: p.peer_id, enr: p.enr, state: p.state, direction: p.direction })
+            .map(|p| PeerInfo {
+                peer_id: p.peer_id,
+                last_seen_p2p_address: p.last_seen_p2p_address,
+                state: p.state,
+                direction: p.direction,
+            })
             .collect())
     }
 
@@ -379,16 +384,16 @@ mod tests {
     fn peers_parses_list() {
         let mut server = mockito::Server::new();
         let body = r#"{"data":[
-            {"peer_id":"p1","enr":"enr:xyz","state":"connected","direction":"inbound"},
-            {"peer_id":"p2","enr":null,"state":"connected","direction":"outbound"}
+            {"peer_id":"p1","last_seen_p2p_address":"/ip4/1.2.3.4/udp/9001/quic","state":"connected","direction":"inbound"},
+            {"peer_id":"p2","last_seen_p2p_address":"/ip4/5.6.7.8/tcp/9000","state":"connected","direction":"outbound"}
         ]}"#;
         let _m = server.mock("GET", "/eth/v1/node/peers").with_status(200).with_body(body).create();
         let client = BeaconClient::new(server.url());
         let peers = client.peers().unwrap();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].peer_id, "p1");
-        assert_eq!(peers[0].enr.as_deref(), Some("enr:xyz"));
-        assert_eq!(peers[1].enr, None);
+        assert_eq!(peers[0].last_seen_p2p_address, "/ip4/1.2.3.4/udp/9001/quic");
+        assert_eq!(peers[1].last_seen_p2p_address, "/ip4/5.6.7.8/tcp/9000");
     }
 
     #[test]
