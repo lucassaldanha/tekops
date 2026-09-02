@@ -11,19 +11,20 @@ fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-pub fn format_health_summary(health: &HealthState, syncing: &SyncingStatus) -> String {
+pub fn format_health_table(health: &HealthState, syncing: &SyncingStatus) -> String {
     let health_str = match health {
         HealthState::Ready => "ready",
         HealthState::Syncing => "syncing",
         HealthState::NotReady => "not ready",
     };
-    format!(
-        "health: {health_str} | syncing: {} | head slot: {} | sync distance: {} | optimistic: {}",
-        yes_no(syncing.is_syncing),
-        syncing.head_slot,
-        syncing.sync_distance,
-        yes_no(syncing.is_optimistic),
-    )
+    let mut table = Table::new();
+    table.set_header(vec!["Field", "Value"]);
+    table.add_row(vec!["Health".to_string(), health_str.to_string()]);
+    table.add_row(vec!["Syncing".to_string(), yes_no(syncing.is_syncing).to_string()]);
+    table.add_row(vec!["Head Slot".to_string(), syncing.head_slot.clone()]);
+    table.add_row(vec!["Sync Distance".to_string(), syncing.sync_distance.clone()]);
+    table.add_row(vec!["Optimistic".to_string(), yes_no(syncing.is_optimistic).to_string()]);
+    table.to_string()
 }
 
 pub fn format_head_table(header: &BlockHeader, finality: &FinalityCheckpoints) -> String {
@@ -98,33 +99,32 @@ mod tests {
     use crate::beaconapi::{HealthState, SyncingStatus};
 
     #[test]
-    fn formats_health_summary() {
+    fn formats_health_table() {
         let syncing = SyncingStatus {
             is_syncing: false,
             is_optimistic: false,
             head_slot: "123456".to_string(),
             sync_distance: "0".to_string(),
         };
-        let out = format_health_summary(&HealthState::Ready, &syncing);
-        assert_eq!(
-            out,
-            "health: ready | syncing: no | head slot: 123456 | sync distance: 0 | optimistic: no"
-        );
+        let table = format_health_table(&HealthState::Ready, &syncing);
+        assert!(table.contains("ready"));
+        assert!(table.contains("123456"));
+        assert!(table.contains("no"));
     }
 
     #[test]
-    fn formats_health_summary_while_syncing() {
+    fn formats_health_table_while_syncing() {
         let syncing = SyncingStatus {
             is_syncing: true,
             is_optimistic: true,
             head_slot: "100".to_string(),
             sync_distance: "50".to_string(),
         };
-        let out = format_health_summary(&HealthState::Syncing, &syncing);
-        assert_eq!(
-            out,
-            "health: syncing | syncing: yes | head slot: 100 | sync distance: 50 | optimistic: yes"
-        );
+        let table = format_health_table(&HealthState::Syncing, &syncing);
+        assert!(table.contains("syncing"));
+        assert!(table.contains("100"));
+        assert!(table.contains("50"));
+        assert!(table.contains("yes"));
     }
 
     #[test]

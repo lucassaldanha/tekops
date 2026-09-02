@@ -4,7 +4,7 @@ use crate::beaconapi::{
 use crate::logs::{resolve_log_path, stream_logs, LogSource};
 use crate::protocol::classify_protocol;
 use crate::output::{
-    format_attester_duties, format_head_table, format_health_summary, format_peers_table,
+    format_attester_duties, format_head_table, format_health_table, format_peers_table,
     format_proposer_duties, format_validators_table, PeerRow,
 };
 use clap::{CommandFactory, Parser, Subcommand};
@@ -181,7 +181,7 @@ fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
         let payload = HealthJson { health: &health, syncing: &syncing };
         println!("{}", serde_json::to_string(&payload).expect("serialize health json"));
     } else {
-        println!("{}", format_health_summary(&health, &syncing));
+        println!("{}", format_health_table(&health, &syncing));
     }
     Ok(())
 }
