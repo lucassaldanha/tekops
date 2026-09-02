@@ -5,7 +5,8 @@ use crate::metrics::MetricsClient;
 use crate::protocol::classify_protocol;
 use crate::output::{
     format_attester_duties, format_duties_table, format_head_table, format_health_table,
-    format_peers_table, format_proposer_duties, format_validators_table, PeerRow,
+    format_peers_table, format_proposer_duties, format_validator_metrics_table,
+    format_validators_table, PeerRow,
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -77,6 +78,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Validator key counts by status, and total locally-stated ETH balance
+    Validators {
+        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
+        #[arg(long)]
+        metric_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
@@ -134,6 +144,10 @@ pub fn run() -> ExitCode {
         Commands::Duties { metric_url, json } => {
             let client = MetricsClient::new(resolve_metric_url(metric_url));
             exit_for(metrics_duties(&client, json))
+        }
+        Commands::Validators { metric_url, json } => {
+            let client = MetricsClient::new(resolve_metric_url(metric_url));
+            exit_for(metrics_validators(&client, json))
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
@@ -223,6 +237,16 @@ fn metrics_duties(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
         println!("{}", serde_json::to_string(&metrics).expect("serialize duties metrics json"));
     } else {
         println!("{}", format_duties_table(&metrics));
+    }
+    Ok(())
+}
+
+fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
+    let metrics = client.validators()?;
+    if json {
+        println!("{}", serde_json::to_string(&metrics).expect("serialize validator metrics json"));
+    } else {
+        println!("{}", format_validator_metrics_table(&metrics));
     }
     Ok(())
 }
@@ -403,6 +427,12 @@ mod tests {
     }
 
     #[test]
+    fn validators_is_a_top_level_command_distinct_from_beacon_validators() {
+        let cli = Cli::try_parse_from(["tekops", "validators"]).unwrap();
+        assert!(matches!(cli.command, Commands::Validators { metric_url: None, json: false }));
+    }
+
+    #[test]
     fn duties_attester_requires_at_least_one_index() {
         let result = Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
         assert!(result.is_err());
@@ -507,6 +537,19 @@ mod tests {
         assert_eq!(value["published_attestations"], 2);
         assert_eq!(value["published_sync_committee_messages"], 3);
         assert_eq!(value["published_aggregates"], 4);
+    }
+
+    #[test]
+    fn validator_metrics_json_output_is_valid_json() {
+        use crate::metrics::ValidatorMetrics;
+        use std::collections::BTreeMap;
+        let mut counts_by_status = BTreeMap::new();
+        counts_by_status.insert("active_ongoing".to_string(), 100);
+        let metrics = ValidatorMetrics { counts_by_status, total_eth: 63.5 };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["counts_by_status"]["active_ongoing"], 100);
+        assert_eq!(value["total_eth"], 63.5);
     }
 
     #[test]

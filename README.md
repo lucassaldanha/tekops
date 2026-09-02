@@ -36,6 +36,7 @@ runtime dependencies - nothing but that one file needs to reach the node.
     tekops health
     tekops head
     tekops duties
+    tekops validators
 
 Every `beacon` subcommand, plus `peers`, `health`, and `head`, accepts
 `--json` to print a JSON-serialized version of the parsed response instead of
@@ -44,16 +45,27 @@ the table (not a raw passthrough of the Beacon API's wire response - e.g.
 by the API), and `--api-url` (or `$TEKOPS_API_URL`) to point at a non-default
 Beacon API (default: `http://localhost:5051`).
 
-`duties` prints published-duty counts (blocks, attestations, sync committee
-messages, aggregates) read from the validator client's own Prometheus
-`/metrics` page, not the Beacon API - it also accepts `--json`, plus
+`duties` and `validators` both read the validator client's own Prometheus
+`/metrics` page instead of the Beacon API - they accept `--json`, plus
 `--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default metrics
-endpoint (default: `http://localhost:8010/metrics`). It's a local
-equivalent of the Grafana panel query
+endpoint (default: `http://localhost:8010/metrics`). They're a local
+equivalent of Grafana panel queries like
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})` -
 `tekops` fetches the raw exposition text and filters/sums locally, since a
 single node's `/metrics` page has no query engine behind it (and no
 `instance` label to filter on - that's added by Prometheus at scrape time).
+
+`duties` prints published-duty counts: blocks, attestations, sync committee
+messages, aggregates.
+
+`validators` prints two tables: validator key counts grouped by status (a
+local equivalent of `sort_desc(sum by (status)
+(validator_local_validator_counts{instance=~"$system"}))`), and total
+locally-stated ETH balance (summed from `validator_local_validator_balances`,
+reported in Gwei and converted to ETH). Not to be confused with `tekops
+beacon validators <index-or-pubkey>...`, which looks up individual
+validators' on-chain status via the Beacon API rather than reading local
+validator-client metrics.
 
 `peers` prints a table of peer counts grouped by direction and protocol, plus
 the total peer count, rather than one row per peer:

@@ -2,7 +2,7 @@ use crate::beaconapi::{
     AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
     ValidatorInfo,
 };
-use crate::metrics::DutiesMetrics;
+use crate::metrics::{DutiesMetrics, ValidatorMetrics};
 use crate::protocol::Protocol;
 use comfy_table::Table;
 use serde::Serialize;
@@ -49,6 +49,20 @@ pub fn format_duties_table(metrics: &DutiesMetrics) -> String {
     ]);
     table.add_row(vec!["Published Aggregates".to_string(), metrics.published_aggregates.to_string()]);
     table.to_string()
+}
+
+pub fn format_validator_metrics_table(metrics: &ValidatorMetrics) -> String {
+    let mut counts_table = Table::new();
+    counts_table.set_header(vec!["Status", "Count"]);
+    for (status, count) in &metrics.counts_by_status {
+        counts_table.add_row(vec![status.clone(), count.to_string()]);
+    }
+
+    let mut total_table = Table::new();
+    total_table.set_header(vec!["Field", "Value"]);
+    total_table.add_row(vec!["Total ETH".to_string(), format!("{:.4}", metrics.total_eth)]);
+
+    format!("{counts_table}\n\n{total_table}")
 }
 
 #[derive(Serialize)]
@@ -237,5 +251,19 @@ mod tests {
         assert!(table.contains('3'));
         assert!(table.contains("Published Aggregates"));
         assert!(table.contains('4'));
+    }
+
+    #[test]
+    fn formats_validator_metrics_table() {
+        let mut counts_by_status = BTreeMap::new();
+        counts_by_status.insert("active_ongoing".to_string(), 100);
+        counts_by_status.insert("pending_queued".to_string(), 3);
+        let metrics = ValidatorMetrics { counts_by_status, total_eth: 63.5 };
+        let table = format_validator_metrics_table(&metrics);
+        assert!(table.contains("active_ongoing"));
+        assert!(table.contains("100"));
+        assert!(table.contains("pending_queued"));
+        assert!(table.contains("Total ETH"));
+        assert!(table.contains("63.5000"));
     }
 }

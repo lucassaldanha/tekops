@@ -92,6 +92,25 @@ fn matching_value(samples: &[Sample], name: &str, matchers: &[(&str, &str)]) -> 
         .sum()
 }
 
+/// Sums every sample matching `name`, grouped by the value of `group_label` -
+/// mirroring a PromQL `sum by (label) (metric{...})`. Samples missing the
+/// label are dropped rather than grouped under an empty key.
+fn sum_by_label(samples: &[Sample], name: &str, group_label: &str) -> BTreeMap<String, f64> {
+    let mut totals: BTreeMap<String, f64> = BTreeMap::new();
+    for s in samples.iter().filter(|s| s.name == name) {
+        if let Some(value) = s.labels.get(group_label) {
+            *totals.entry(value.clone()).or_insert(0.0) += s.value;
+        }
+    }
+    totals
+}
+
+/// Sums every sample matching `name`, ignoring labels entirely - mirroring a
+/// plain PromQL `sum(metric{...})` with no `by`/label matchers.
+fn sum_all(samples: &[Sample], name: &str) -> f64 {
+    samples.iter().filter(|s| s.name == name).map(|s| s.value).sum()
+}
+
 #[derive(Debug, Serialize)]
 pub struct DutiesMetrics {
     pub published_blocks: u64,
@@ -100,7 +119,16 @@ pub struct DutiesMetrics {
     pub published_aggregates: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ValidatorMetrics {
+    pub counts_by_status: BTreeMap<String, u64>,
+    pub total_eth: f64,
+}
+
 const VALIDATOR_REQUESTS_METRIC: &str = "validator_beacon_node_requests_total";
+const VALIDATOR_COUNTS_METRIC: &str = "validator_local_validator_counts";
+const VALIDATOR_BALANCES_METRIC: &str = "validator_local_validator_balances";
+const GWEI_PER_ETH: f64 = 1_000_000_000.0;
 
 impl MetricsClient {
     pub fn new(url: impl Into<String>) -> Self {
@@ -126,6 +154,16 @@ impl MetricsClient {
             published_sync_committee_messages: published("send_sync_committee_messages"),
             published_aggregates: published("publish_aggregate_and_proofs"),
         })
+    }
+
+    pub fn validators(&self) -> Result<ValidatorMetrics, ApiError> {
+        let samples = self.fetch()?;
+        let counts_by_status = sum_by_label(&samples, VALIDATOR_COUNTS_METRIC, "status")
+            .into_iter()
+            .map(|(status, value)| (status, value.round() as u64))
+            .collect();
+        let total_eth = sum_all(&samples, VALIDATOR_BALANCES_METRIC) / GWEI_PER_ETH;
+        Ok(ValidatorMetrics { counts_by_status, total_eth })
     }
 }
 
@@ -226,6 +264,61 @@ validator_beacon_node_requests_total{method="publish_aggregate_and_proofs",outco
     fn duties_errors_when_unreachable() {
         let client = MetricsClient::new("http://127.0.0.1:1/metrics");
         let err = client.duties().unwrap_err();
+        assert!(matches!(err, ApiError::Unreachable(_)));
+    }
+
+    #[test]
+    fn sum_by_label_groups_and_sums_matching_series() {
+        let body = r#"
+validator_local_validator_counts{status="active_ongoing"} 100
+validator_local_validator_counts{status="active_ongoing"} 20
+validator_local_validator_counts{status="pending_queued"} 3
+"#;
+        let samples = parse_exposition(body);
+        let totals = sum_by_label(&samples, "validator_local_validator_counts", "status");
+        assert_eq!(totals.get("active_ongoing"), Some(&120.0));
+        assert_eq!(totals.get("pending_queued"), Some(&3.0));
+        assert_eq!(totals.len(), 2);
+    }
+
+    #[test]
+    fn sum_by_label_drops_samples_missing_the_group_label() {
+        let samples = parse_exposition("validator_local_validator_counts 42");
+        let totals = sum_by_label(&samples, "validator_local_validator_counts", "status");
+        assert!(totals.is_empty());
+    }
+
+    #[test]
+    fn sum_all_ignores_labels() {
+        let body = r#"
+validator_local_validator_balances{pubkey="0x1"} 32000000000
+validator_local_validator_balances{pubkey="0x2"} 31900000000
+"#;
+        let samples = parse_exposition(body);
+        assert_eq!(sum_all(&samples, "validator_local_validator_balances"), 63900000000.0);
+    }
+
+    #[test]
+    fn validators_reads_counts_and_converts_balance_gwei_to_eth() {
+        let mut server = mockito::Server::new();
+        let body = r#"
+validator_local_validator_counts{status="active_ongoing"} 2
+validator_local_validator_counts{status="pending_queued"} 1
+validator_local_validator_balances{pubkey="0x1"} 32000000000
+validator_local_validator_balances{pubkey="0x2"} 31500000000
+"#;
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let metrics = client.validators().unwrap();
+        assert_eq!(metrics.counts_by_status.get("active_ongoing"), Some(&2));
+        assert_eq!(metrics.counts_by_status.get("pending_queued"), Some(&1));
+        assert_eq!(metrics.total_eth, 63.5);
+    }
+
+    #[test]
+    fn validators_errors_when_unreachable() {
+        let client = MetricsClient::new("http://127.0.0.1:1/metrics");
+        let err = client.validators().unwrap_err();
         assert!(matches!(err, ApiError::Unreachable(_)));
     }
 }
