@@ -17,7 +17,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 
 #[derive(Parser)]
-#[command(name = "teku-op", about = "Helper tools for operating a Teku/Besu node")]
+#[command(name = "tekops", about = "Helper tools for operating a Teku/Besu node")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -34,7 +34,7 @@ enum Commands {
     Beacon {
         #[command(subcommand)]
         command: BeaconCommand,
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKU_OP_API_URL)
+        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
         #[arg(long, global = true)]
         api_url: Option<String>,
         /// Print a JSON-serialized summary instead of a formatted table
@@ -87,14 +87,14 @@ pub fn run() -> ExitCode {
         Commands::Logs { source, path } => run_logs(source, path),
         Commands::Beacon { command, api_url, json } => {
             let base_url = api_url
-                .or_else(|| env::var("TEKU_OP_API_URL").ok())
+                .or_else(|| env::var("TEKOPS_API_URL").ok())
                 .unwrap_or_else(|| "http://localhost:5051".to_string());
             let client = BeaconClient::new(base_url);
             run_beacon(client, command, json)
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "teku-op", &mut io::stdout());
+            generate(shell, &mut cmd, "tekops", &mut io::stdout());
             ExitCode::SUCCESS
         }
     }
@@ -281,27 +281,27 @@ mod tests {
     fn generates_non_empty_bash_completion() {
         let mut cmd = Cli::command();
         let mut buf = Vec::new();
-        generate(Shell::Bash, &mut cmd, "teku-op", &mut buf);
+        generate(Shell::Bash, &mut cmd, "tekops", &mut buf);
         let script = String::from_utf8(buf).unwrap();
         assert!(!script.is_empty());
-        assert!(script.contains("teku-op"));
+        assert!(script.contains("tekops"));
     }
 
     #[test]
     fn completion_subcommand_parses() {
-        let cli = Cli::try_parse_from(["teku-op", "completion", "bash"]).unwrap();
+        let cli = Cli::try_parse_from(["tekops", "completion", "bash"]).unwrap();
         assert!(matches!(cli.command, Commands::Completion { shell: Shell::Bash }));
     }
 
     #[test]
     fn validators_requires_at_least_one_id() {
-        let result = Cli::try_parse_from(["teku-op", "beacon", "validators"]);
+        let result = Cli::try_parse_from(["tekops", "beacon", "validators"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn duties_attester_requires_at_least_one_index() {
-        let result = Cli::try_parse_from(["teku-op", "beacon", "duties", "attester", "--epoch", "1"]);
+        let result = Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
         assert!(result.is_err());
     }
 

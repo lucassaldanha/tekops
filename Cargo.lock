@@ -1369,7 +1369,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "teku-op"
+name = "tekops"
 version = "0.1.0"
 dependencies = [
  "clap",

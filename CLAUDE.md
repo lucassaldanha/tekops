@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`teku-op`: a single-binary Rust CLI for operating a Teku/Besu Ethereum node, run directly on the node over SSH. Two feature areas:
+`tekops`: a single-binary Rust CLI for operating a Teku/Besu Ethereum node, run directly on the node over SSH. Two feature areas:
 
-- `teku-op logs teku|besu [path]` — tails and colorizes a JSON log file (replaces an old bashrc/jq function).
-- `teku-op beacon health|head|peers|validators|duties` — a typed HTTP client wrapper around a curated set of Beacon API endpoints.
+- `tekops logs teku|besu [path]` — tails and colorizes a JSON log file (replaces an old bashrc/jq function).
+- `tekops beacon health|head|peers|validators|duties` — a typed HTTP client wrapper around a curated set of Beacon API endpoints.
 
 ## Commands
 
@@ -26,8 +26,8 @@ The node runs Linux x86_64. **This dev machine's Rust is Homebrew-installed, not
 ```bash
 docker run --rm --platform linux/amd64 \
   -v "$(pwd):/volume" clux/muslrust:stable cargo build --release
-# binary at target/x86_64-unknown-linux-musl/release/teku-op — copy just this one file
-scp target/x86_64-unknown-linux-musl/release/teku-op <node>:/usr/local/bin/teku-op
+# binary at target/x86_64-unknown-linux-musl/release/tekops — copy just this one file
+scp target/x86_64-unknown-linux-musl/release/tekops <node>:/usr/local/bin/tekops
 ```
 
 The resulting binary is a static-PIE ELF (`file` confirms `static-pie linked`) — no runtime deps on the node, nothing else needs to be copied over. (The README's cross-compile section still says `rustup target add`, which doesn't apply on this machine — the Docker approach above is what actually works here.)
