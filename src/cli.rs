@@ -1,11 +1,11 @@
-use crate::beaconapi::{
-    ApiError, BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus,
-};
+use crate::beaconapi::{BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
+use crate::http::ApiError;
 use crate::logs::{resolve_log_path, stream_logs, LogSource};
+use crate::metrics::MetricsClient;
 use crate::protocol::classify_protocol;
 use crate::output::{
-    format_attester_duties, format_head_table, format_health_table, format_peers_table,
-    format_proposer_duties, format_validators_table, PeerRow,
+    format_attester_duties, format_duties_table, format_head_table, format_health_table,
+    format_peers_table, format_proposer_duties, format_validators_table, PeerRow,
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -68,6 +68,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Published blocks, attestations, sync committee messages, and aggregates
+    Duties {
+        /// Prometheus metrics URL (default: http://localhost:8081/metrics, or $TEKOPS_METRIC_URL)
+        #[arg(long)]
+        metric_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
@@ -122,6 +131,10 @@ pub fn run() -> ExitCode {
             let client = BeaconClient::new(resolve_base_url(api_url));
             exit_for(beacon_head(&client, json))
         }
+        Commands::Duties { metric_url, json } => {
+            let client = MetricsClient::new(resolve_metric_url(metric_url));
+            exit_for(metrics_duties(&client, json))
+        }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "tekops", &mut io::stdout());
@@ -134,6 +147,12 @@ fn resolve_base_url(api_url: Option<String>) -> String {
     api_url
         .or_else(|| env::var("TEKOPS_API_URL").ok())
         .unwrap_or_else(|| "http://localhost:5051".to_string())
+}
+
+fn resolve_metric_url(metric_url: Option<String>) -> String {
+    metric_url
+        .or_else(|| env::var("TEKOPS_METRIC_URL").ok())
+        .unwrap_or_else(|| "http://localhost:8081/metrics".to_string())
 }
 
 fn exit_for(result: Result<(), ApiError>) -> ExitCode {
@@ -194,6 +213,16 @@ fn beacon_head(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
         println!("{}", serde_json::to_string(&payload).expect("serialize head json"));
     } else {
         println!("{}", format_head_table(&header, &finality));
+    }
+    Ok(())
+}
+
+fn metrics_duties(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
+    let metrics = client.duties()?;
+    if json {
+        println!("{}", serde_json::to_string(&metrics).expect("serialize duties metrics json"));
+    } else {
+        println!("{}", format_duties_table(&metrics));
     }
     Ok(())
 }
@@ -368,6 +397,12 @@ mod tests {
     }
 
     #[test]
+    fn duties_is_a_top_level_command() {
+        let cli = Cli::try_parse_from(["tekops", "duties"]).unwrap();
+        assert!(matches!(cli.command, Commands::Duties { metric_url: None, json: false }));
+    }
+
+    #[test]
     fn duties_attester_requires_at_least_one_index() {
         let result = Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
         assert!(result.is_err());
@@ -455,6 +490,23 @@ mod tests {
         let json = serde_json::to_string(&duties).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value[0]["slot"], "100");
+    }
+
+    #[test]
+    fn duties_metrics_json_output_is_valid_json() {
+        use crate::metrics::DutiesMetrics;
+        let metrics = DutiesMetrics {
+            published_blocks: 1,
+            published_attestations: 2,
+            published_sync_committee_messages: 3,
+            published_aggregates: 4,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["published_blocks"], 1);
+        assert_eq!(value["published_attestations"], 2);
+        assert_eq!(value["published_sync_committee_messages"], 3);
+        assert_eq!(value["published_aggregates"], 4);
     }
 
     #[test]

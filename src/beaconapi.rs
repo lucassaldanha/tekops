@@ -1,34 +1,8 @@
+use crate::http::{map_ureq_error, ApiError};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 pub struct BeaconClient {
     base_url: String,
-}
-
-#[derive(Debug)]
-pub enum ApiError {
-    Unreachable(String),
-    Status(u16, String),
-    Malformed(String),
-}
-
-impl fmt::Display for ApiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ApiError::Unreachable(msg) => write!(f, "could not reach Beacon API: {msg}"),
-            ApiError::Status(code, msg) => write!(f, "Beacon API returned {code}: {msg}"),
-            ApiError::Malformed(msg) => write!(f, "Beacon API returned malformed data: {msg}"),
-        }
-    }
-}
-
-fn map_ureq_error(e: ureq::Error) -> ApiError {
-    match e {
-        ureq::Error::Status(code, resp) => {
-            ApiError::Status(code, resp.into_string().unwrap_or_default())
-        }
-        ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]

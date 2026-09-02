@@ -1,7 +1,9 @@
 mod beaconapi;
 mod cli;
+mod http;
 mod logfmt;
 mod logs;
+mod metrics;
 mod output;
 mod protocol;
 

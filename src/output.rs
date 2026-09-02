@@ -2,6 +2,7 @@ use crate::beaconapi::{
     AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
     ValidatorInfo,
 };
+use crate::metrics::DutiesMetrics;
 use crate::protocol::Protocol;
 use comfy_table::Table;
 use serde::Serialize;
@@ -34,6 +35,19 @@ pub fn format_head_table(header: &BlockHeader, finality: &FinalityCheckpoints) -
     table.add_row(vec!["Head Root".to_string(), header.root.clone()]);
     table.add_row(vec!["Justified Epoch".to_string(), finality.current_justified_epoch.clone()]);
     table.add_row(vec!["Finalized Epoch".to_string(), finality.finalized_epoch.clone()]);
+    table.to_string()
+}
+
+pub fn format_duties_table(metrics: &DutiesMetrics) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Metric", "Value"]);
+    table.add_row(vec!["Published Blocks".to_string(), metrics.published_blocks.to_string()]);
+    table.add_row(vec!["Published Attestations".to_string(), metrics.published_attestations.to_string()]);
+    table.add_row(vec![
+        "Published Sync Committee Messages".to_string(),
+        metrics.published_sync_committee_messages.to_string(),
+    ]);
+    table.add_row(vec!["Published Aggregates".to_string(), metrics.published_aggregates.to_string()]);
     table.to_string()
 }
 
@@ -204,5 +218,24 @@ mod tests {
         assert!(table.contains("0xabc"));
         assert!(table.contains("11"));
         assert!(table.contains('9'));
+    }
+
+    #[test]
+    fn formats_duties_table() {
+        let metrics = DutiesMetrics {
+            published_blocks: 1,
+            published_attestations: 2,
+            published_sync_committee_messages: 3,
+            published_aggregates: 4,
+        };
+        let table = format_duties_table(&metrics);
+        assert!(table.contains("Published Blocks"));
+        assert!(table.contains('1'));
+        assert!(table.contains("Published Attestations"));
+        assert!(table.contains('2'));
+        assert!(table.contains("Published Sync Committee Messages"));
+        assert!(table.contains('3'));
+        assert!(table.contains("Published Aggregates"));
+        assert!(table.contains('4'));
     }
 }
