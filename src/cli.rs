@@ -13,6 +13,7 @@ use clap_complete::{generate, Shell};
 use serde::Serialize;
 use std::env;
 use std::io::{self, BufReader, LineWriter};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -381,10 +382,29 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The terminal delivers Ctrl+C to the whole foreground process group. `less`
+    // is designed to catch it and drop out of follow mode, but tekops itself has
+    // no handler and would otherwise die right along with it, tearing down the
+    // pager it's supervising. Ignoring it here lets tekops outlive the keypress;
+    // `tail` is put in its own process group so the same Ctrl+C doesn't kill it
+    // too, which would otherwise permanently break `less`'s `F` (resume follow).
+    //
+    // The `termination` feature extends this same ignore to SIGTERM/SIGHUP (e.g.
+    // a dropped SSH session). Unlike SIGINT, `less` has no special handling for
+    // those and just dies normally, so `pager.wait()` below still returns and
+    // the existing cleanup (kill `tail`, let the temp file's Drop run) still
+    // executes. Without this, tekops and `less` would die immediately alongside
+    // the signal, skipping that cleanup entirely: `tail` (isolated into its own
+    // process group above, specifically so Ctrl+C can't reach it) would be
+    // orphaned and keep running forever, and the temp file backing `less` would
+    // never be removed — a real leak, one per dropped session, not hypothetical.
+    let _ = ctrlc::set_handler(|| {});
+
     let mut tail = match Command::new("tail")
         .args(["-F", "-n", "200"])
         .arg(&path)
         .stdout(Stdio::piped())
+        .process_group(0)
         .spawn()
     {
         Ok(child) => child,
@@ -394,11 +414,23 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    let mut pager = match Command::new("less")
-        .args(["-R", "+F"])
-        .stdin(Stdio::piped())
-        .spawn()
-    {
+    // `less` is fed through a real temp file rather than piped directly into its
+    // stdin. A pipe has no knowable end short of reading more of it, so a search
+    // for text that isn't in the buffer yet leaves `less` unable to tell "not
+    // found" from "not yet written" — it blocks waiting for more input rather
+    // than reporting no match, indistinguishable from a hang. A real file has a
+    // stat()-able size, so `less` can tell those two cases apart and searches
+    // that miss return immediately instead of freezing the pager.
+    let sink = match tempfile::Builder::new().prefix("tekops-logs-").tempfile() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: failed to create temp file for log output: {e}");
+            let _ = tail.kill();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut pager = match Command::new("less").args(["-R", "+F"]).arg(sink.path()).spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("error: failed to spawn less: {e}");
@@ -408,7 +440,7 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
     };
 
     let reader = BufReader::new(tail.stdout.take().expect("tail stdout piped"));
-    let mut writer = LineWriter::new(pager.stdin.take().expect("less stdin piped"));
+    let mut writer = LineWriter::new(sink.reopen().expect("reopen temp file for writing"));
 
     // tail -F never reaches EOF, so the pager (not the streaming loop) owns
     // process lifetime: run streaming on its own thread and wait on the pager.
@@ -420,8 +452,6 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
 
     match streaming.join().expect("log streaming thread panicked") {
         Ok(()) => ExitCode::SUCCESS,
-        // The pager closing its stdin (a clean quit) surfaces here as a broken pipe.
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error while streaming logs: {e}");
             ExitCode::FAILURE

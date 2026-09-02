@@ -10,6 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 comfy-table = "7"
+ctrlc = { version = "3", features = ["termination"] }
+tempfile = "3"
 
 [dev-dependencies]
 mockito = "1"
