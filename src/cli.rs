@@ -4,7 +4,7 @@ use crate::beaconapi::{
 use crate::logs::{resolve_log_path, stream_logs, LogSource};
 use crate::protocol::classify_protocol;
 use crate::output::{
-    format_attester_duties, format_head_summary, format_health_summary, format_peers_table,
+    format_attester_duties, format_head_table, format_health_summary, format_peers_table,
     format_proposer_duties, format_validators_table, PeerRow,
 };
 use clap::{CommandFactory, Parser, Subcommand};
@@ -59,14 +59,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Chain head slot/root and finality checkpoints
+    Head {
+        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
 
 #[derive(Subcommand)]
 enum BeaconCommand {
-    /// Chain head slot/root and finality checkpoints
-    Head,
     /// Show status for one or more validators (by index or pubkey)
     Validators {
         #[arg(required = true)]
@@ -111,6 +118,10 @@ pub fn run() -> ExitCode {
             let client = BeaconClient::new(resolve_base_url(api_url));
             exit_for(beacon_health(&client, json))
         }
+        Commands::Head { api_url, json } => {
+            let client = BeaconClient::new(resolve_base_url(api_url));
+            exit_for(beacon_head(&client, json))
+        }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "tekops", &mut io::stdout());
@@ -152,7 +163,6 @@ struct HeadJson<'a> {
 
 fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitCode {
     let result = match command {
-        BeaconCommand::Head => beacon_head(&client, json),
         BeaconCommand::Validators { ids } => beacon_validators(&client, &ids, json),
         BeaconCommand::Duties { kind } => match kind {
             DutiesKind::Attester { epoch, indices } => {
@@ -183,7 +193,7 @@ fn beacon_head(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
         let payload = HeadJson { header: &header, finality: &finality };
         println!("{}", serde_json::to_string(&payload).expect("serialize head json"));
     } else {
-        println!("{}", format_head_summary(&header, &finality));
+        println!("{}", format_head_table(&header, &finality));
     }
     Ok(())
 }
@@ -349,6 +359,12 @@ mod tests {
     fn health_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "health"]).unwrap();
         assert!(matches!(cli.command, Commands::Health { api_url: None, json: false }));
+    }
+
+    #[test]
+    fn head_is_a_top_level_command() {
+        let cli = Cli::try_parse_from(["tekops", "head"]).unwrap();
+        assert!(matches!(cli.command, Commands::Head { api_url: None, json: false }));
     }
 
     #[test]

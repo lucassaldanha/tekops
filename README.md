@@ -28,20 +28,20 @@ runtime dependencies - nothing but that one file needs to reach the node.
     tekops logs teku [path]      # defaults to /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE
     tekops logs besu [path]      # defaults to /var/log/besu/besu.log
 
-    tekops beacon head
     tekops beacon validators <index-or-pubkey>...
     tekops beacon duties attester --epoch=N <index>...
     tekops beacon duties proposer --epoch=N
 
     tekops peers
     tekops health
+    tekops head
 
-Every `beacon` subcommand, plus `peers` and `health`, accepts `--json` to
-print a JSON-serialized version of the parsed response instead of the
-summary/table (not a raw passthrough of the Beacon API's wire response - e.g.
-`peers --json` includes a `protocol` field that's derived locally, not sent
-by the API), and `--api-url` (or `$TEKOPS_API_URL`) to point at a non-default
-Beacon API (default: `http://localhost:5051`).
+Every `beacon` subcommand, plus `peers`, `health`, and `head`, accepts
+`--json` to print a JSON-serialized version of the parsed response instead of
+the summary/table (not a raw passthrough of the Beacon API's wire response -
+e.g. `peers --json` includes a `protocol` field that's derived locally, not
+sent by the API), and `--api-url` (or `$TEKOPS_API_URL`) to point at a
+non-default Beacon API (default: `http://localhost:5051`).
 
 `peers` prints a table of peer counts grouped by direction and protocol, plus
 the total peer count, rather than one row per peer:

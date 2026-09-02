@@ -26,11 +26,14 @@ pub fn format_health_summary(health: &HealthState, syncing: &SyncingStatus) -> S
     )
 }
 
-pub fn format_head_summary(header: &BlockHeader, finality: &FinalityCheckpoints) -> String {
-    format!(
-        "head slot: {} | head root: {} | justified epoch: {} | finalized epoch: {}",
-        header.slot, header.root, finality.current_justified_epoch, finality.finalized_epoch
-    )
+pub fn format_head_table(header: &BlockHeader, finality: &FinalityCheckpoints) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Field", "Value"]);
+    table.add_row(vec!["Head Slot".to_string(), header.slot.clone()]);
+    table.add_row(vec!["Head Root".to_string(), header.root.clone()]);
+    table.add_row(vec!["Justified Epoch".to_string(), finality.current_justified_epoch.clone()]);
+    table.add_row(vec!["Finalized Epoch".to_string(), finality.finalized_epoch.clone()]);
+    table.to_string()
 }
 
 #[derive(Serialize)]
@@ -188,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_head_summary() {
+    fn formats_head_table() {
         use crate::beaconapi::{BlockHeader, FinalityCheckpoints};
         let header = BlockHeader { slot: "999".to_string(), root: "0xabc".to_string() };
         let finality = FinalityCheckpoints {
@@ -196,10 +199,10 @@ mod tests {
             current_justified_epoch: "11".to_string(),
             finalized_epoch: "9".to_string(),
         };
-        let out = format_head_summary(&header, &finality);
-        assert_eq!(
-            out,
-            "head slot: 999 | head root: 0xabc | justified epoch: 11 | finalized epoch: 9"
-        );
+        let table = format_head_table(&header, &finality);
+        assert!(table.contains("999"));
+        assert!(table.contains("0xabc"));
+        assert!(table.contains("11"));
+        assert!(table.contains('9'));
     }
 }
