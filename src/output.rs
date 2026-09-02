@@ -2,7 +2,7 @@ use crate::beaconapi::{
     AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
     ValidatorInfo,
 };
-use crate::metrics::{DutiesMetrics, ValidatorMetrics};
+use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
 use crate::protocol::Protocol;
 use comfy_table::Table;
 use serde::Serialize;
@@ -63,6 +63,15 @@ pub fn format_validator_metrics_table(metrics: &ValidatorMetrics) -> String {
     total_table.add_row(vec!["Total ETH".to_string(), format!("{:.4}", metrics.total_eth)]);
 
     format!("{counts_table}\n\n{total_table}")
+}
+
+pub fn format_version_table(info: &VersionInfo) -> String {
+    let mut table = Table::new();
+    table.set_header(vec!["Version"]);
+    for version in &info.versions {
+        table.add_row(vec![version.clone()]);
+    }
+    table.to_string()
 }
 
 #[derive(Serialize)]
@@ -265,5 +274,20 @@ mod tests {
         assert!(table.contains("pending_queued"));
         assert!(table.contains("Total ETH"));
         assert!(table.contains("63.5000"));
+    }
+
+    #[test]
+    fn formats_version_table() {
+        let info = VersionInfo { versions: vec!["teku/v24.9.0".to_string()] };
+        let table = format_version_table(&info);
+        assert!(table.contains("teku/v24.9.0"));
+    }
+
+    #[test]
+    fn formats_version_table_with_multiple_versions() {
+        let info = VersionInfo { versions: vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()] };
+        let table = format_version_table(&info);
+        assert!(table.contains("teku/v24.10.0"));
+        assert!(table.contains("teku/v24.9.0"));
     }
 }

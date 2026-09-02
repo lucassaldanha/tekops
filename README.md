@@ -37,6 +37,7 @@ runtime dependencies - nothing but that one file needs to reach the node.
     tekops head
     tekops duties
     tekops validators
+    tekops version
 
 Every `beacon` subcommand, plus `peers`, `health`, and `head`, accepts
 `--json` to print a JSON-serialized version of the parsed response instead of
@@ -45,11 +46,11 @@ the table (not a raw passthrough of the Beacon API's wire response - e.g.
 by the API), and `--api-url` (or `$TEKOPS_API_URL`) to point at a non-default
 Beacon API (default: `http://localhost:5051`).
 
-`duties` and `validators` both read the validator client's own Prometheus
-`/metrics` page instead of the Beacon API - they accept `--json`, plus
-`--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default metrics
-endpoint (default: `http://localhost:8010/metrics`). They're a local
-equivalent of Grafana panel queries like
+`duties`, `validators`, and `version` all read the validator client's own
+Prometheus `/metrics` page instead of the Beacon API - they accept `--json`,
+plus `--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default
+metrics endpoint (default: `http://localhost:8010/metrics`). `duties` and
+`validators` are a local equivalent of Grafana panel queries like
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})` -
 `tekops` fetches the raw exposition text and filters/sums locally, since a
 single node's `/metrics` page has no query engine behind it (and no
@@ -66,6 +67,12 @@ reported in Gwei and converted to ETH). Not to be confused with `tekops
 beacon validators <index-or-pubkey>...`, which looks up individual
 validators' on-chain status via the Beacon API rather than reading local
 validator-client metrics.
+
+`version` prints the running Teku version, read from the `version` label on
+whichever of `beacon_teku_version_total` or `validator_teku_version_total` is
+present on the scrape (only one exists at a time, depending on whether
+`--metric-url` points at a beacon node's or a validator client's `/metrics`
+endpoint).
 
 `peers` prints a table of peer counts grouped by direction and protocol, plus
 the total peer count, rather than one row per peer:

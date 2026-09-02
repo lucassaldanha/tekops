@@ -6,7 +6,7 @@ use crate::protocol::classify_protocol;
 use crate::output::{
     format_attester_duties, format_duties_table, format_head_table, format_health_table,
     format_peers_table, format_proposer_duties, format_validator_metrics_table,
-    format_validators_table, PeerRow,
+    format_validators_table, format_version_table, PeerRow,
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -87,6 +87,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Running Teku version, read from the beacon node or validator client
+    /// metrics (whichever is present on the scrape)
+    Version {
+        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
+        #[arg(long)]
+        metric_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
@@ -148,6 +158,10 @@ pub fn run() -> ExitCode {
         Commands::Validators { metric_url, json } => {
             let client = MetricsClient::new(resolve_metric_url(metric_url));
             exit_for(metrics_validators(&client, json))
+        }
+        Commands::Version { metric_url, json } => {
+            let client = MetricsClient::new(resolve_metric_url(metric_url));
+            exit_for(metrics_version(&client, json))
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
@@ -247,6 +261,16 @@ fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError
         println!("{}", serde_json::to_string(&metrics).expect("serialize validator metrics json"));
     } else {
         println!("{}", format_validator_metrics_table(&metrics));
+    }
+    Ok(())
+}
+
+fn metrics_version(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
+    let info = client.version()?;
+    if json {
+        println!("{}", serde_json::to_string(&info).expect("serialize version json"));
+    } else {
+        println!("{}", format_version_table(&info));
     }
     Ok(())
 }
@@ -433,6 +457,12 @@ mod tests {
     }
 
     #[test]
+    fn version_is_a_top_level_command() {
+        let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
+        assert!(matches!(cli.command, Commands::Version { metric_url: None, json: false }));
+    }
+
+    #[test]
     fn duties_attester_requires_at_least_one_index() {
         let result = Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
         assert!(result.is_err());
@@ -550,6 +580,15 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["counts_by_status"]["active_ongoing"], 100);
         assert_eq!(value["total_eth"], 63.5);
+    }
+
+    #[test]
+    fn version_json_output_is_valid_json() {
+        use crate::metrics::VersionInfo;
+        let info = VersionInfo { versions: vec!["teku/v24.9.0".to_string()] };
+        let json = serde_json::to_string(&info).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["versions"][0], "teku/v24.9.0");
     }
 
     #[test]

@@ -111,6 +111,19 @@ fn sum_all(samples: &[Sample], name: &str) -> f64 {
     samples.iter().filter(|s| s.name == name).map(|s| s.value).sum()
 }
 
+/// Every distinct value of `label` across samples matching `name`, sorted.
+/// Used for "info" style metrics (e.g. a version metric whose value is
+/// always 1 and whose label carries the actual data) where there's normally
+/// exactly one matching series, but more than one shouldn't be silently
+/// dropped (e.g. mid-upgrade, briefly both the old and new version report).
+fn distinct_label_values(samples: &[Sample], name: &str, label: &str) -> Vec<String> {
+    let mut values: Vec<String> =
+        samples.iter().filter(|s| s.name == name).filter_map(|s| s.labels.get(label).cloned()).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
 #[derive(Debug, Serialize)]
 pub struct DutiesMetrics {
     pub published_blocks: u64,
@@ -125,10 +138,17 @@ pub struct ValidatorMetrics {
     pub total_eth: f64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct VersionInfo {
+    pub versions: Vec<String>,
+}
+
 const VALIDATOR_REQUESTS_METRIC: &str = "validator_beacon_node_requests_total";
 const VALIDATOR_COUNTS_METRIC: &str = "validator_local_validator_counts";
 const VALIDATOR_BALANCES_METRIC: &str = "validator_local_validator_balances";
 const GWEI_PER_ETH: f64 = 1_000_000_000.0;
+const BEACON_VERSION_METRIC: &str = "beacon_teku_version_total";
+const VALIDATOR_VERSION_METRIC: &str = "validator_teku_version_total";
 
 impl MetricsClient {
     pub fn new(url: impl Into<String>) -> Self {
@@ -164,6 +184,19 @@ impl MetricsClient {
             .collect();
         let total_eth = sum_all(&samples, VALIDATOR_BALANCES_METRIC) / GWEI_PER_ETH;
         Ok(ValidatorMetrics { counts_by_status, total_eth })
+    }
+
+    /// Reads the running Teku version from whichever of the beacon-node or
+    /// validator-client version metric is present on this scrape - only one
+    /// exists at a time, depending on which process's `/metrics` endpoint
+    /// this client points at.
+    pub fn version(&self) -> Result<VersionInfo, ApiError> {
+        let samples = self.fetch()?;
+        let mut versions = distinct_label_values(&samples, BEACON_VERSION_METRIC, "version");
+        if versions.is_empty() {
+            versions = distinct_label_values(&samples, VALIDATOR_VERSION_METRIC, "version");
+        }
+        Ok(VersionInfo { versions })
     }
 }
 
@@ -319,6 +352,54 @@ validator_local_validator_balances{pubkey="0x2"} 31500000000
     fn validators_errors_when_unreachable() {
         let client = MetricsClient::new("http://127.0.0.1:1/metrics");
         let err = client.validators().unwrap_err();
+        assert!(matches!(err, ApiError::Unreachable(_)));
+    }
+
+    #[test]
+    fn distinct_label_values_dedupes_and_sorts() {
+        let body = r#"
+beacon_teku_version_total{version="teku/v24.9.0"} 1
+beacon_teku_version_total{version="teku/v24.9.0"} 1
+beacon_teku_version_total{version="teku/v24.10.0"} 1
+"#;
+        let samples = parse_exposition(body);
+        let values = distinct_label_values(&samples, "beacon_teku_version_total", "version");
+        assert_eq!(values, vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()]);
+    }
+
+    #[test]
+    fn version_reads_beacon_metric_when_present() {
+        let mut server = mockito::Server::new();
+        let body = r#"beacon_teku_version_total{version="teku/v24.9.0"} 1"#;
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let info = client.version().unwrap();
+        assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
+    }
+
+    #[test]
+    fn version_falls_back_to_validator_metric_when_beacon_metric_absent() {
+        let mut server = mockito::Server::new();
+        let body = r#"validator_teku_version_total{version="teku/v24.9.0"} 1"#;
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let info = client.version().unwrap();
+        assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
+    }
+
+    #[test]
+    fn version_is_empty_when_neither_metric_present() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let info = client.version().unwrap();
+        assert!(info.versions.is_empty());
+    }
+
+    #[test]
+    fn version_errors_when_unreachable() {
+        let client = MetricsClient::new("http://127.0.0.1:1/metrics");
+        let err = client.version().unwrap_err();
         assert!(matches!(err, ApiError::Unreachable(_)));
     }
 }
