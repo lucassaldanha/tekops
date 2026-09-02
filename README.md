@@ -24,7 +24,8 @@ runtime dependencies - nothing but that one file needs to reach the node.
 
 ## Usage
 
-    tekops logs teku [path]      # defaults to /var/log/teku/teku.log
+    tekops logs [path]           # source defaults to teku
+    tekops logs teku [path]      # defaults to /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE
     tekops logs besu [path]      # defaults to /var/log/besu/besu.log
 
     tekops beacon head

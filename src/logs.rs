@@ -26,6 +26,21 @@ impl LogSource {
     }
 }
 
+/// Resolves the log file path for `tekops logs`: an explicit positional
+/// `path` wins, then `$TEKOPS_LOGS_FILE` (Teku only, since that's the source
+/// this env var's own fallback value describes), then the source's default.
+pub fn resolve_log_path(
+    source: LogSource,
+    path: Option<PathBuf>,
+    teku_logs_file_env: Option<String>,
+) -> PathBuf {
+    path.or_else(|| match source {
+        LogSource::Teku => teku_logs_file_env.map(PathBuf::from),
+        LogSource::Besu => None,
+    })
+    .unwrap_or_else(|| source.default_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +75,33 @@ mod tests {
     fn default_paths_match_existing_bashrc_function() {
         assert_eq!(LogSource::Teku.default_path(), PathBuf::from("/var/log/teku/teku.log"));
         assert_eq!(LogSource::Besu.default_path(), PathBuf::from("/var/log/besu/besu.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_prefers_explicit_positional_path() {
+        let path = resolve_log_path(
+            LogSource::Teku,
+            Some(PathBuf::from("/custom.log")),
+            Some("/env.log".to_string()),
+        );
+        assert_eq!(path, PathBuf::from("/custom.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_falls_back_to_env_var_for_teku() {
+        let path = resolve_log_path(LogSource::Teku, None, Some("/env.log".to_string()));
+        assert_eq!(path, PathBuf::from("/env.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_falls_back_to_default_when_unset() {
+        let path = resolve_log_path(LogSource::Teku, None, None);
+        assert_eq!(path, PathBuf::from("/var/log/teku/teku.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_ignores_env_var_for_besu() {
+        let path = resolve_log_path(LogSource::Besu, None, Some("/env.log".to_string()));
+        assert_eq!(path, PathBuf::from("/var/log/besu/besu.log"));
     }
 }

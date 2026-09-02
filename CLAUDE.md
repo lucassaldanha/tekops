@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `tekops`: a single-binary Rust CLI for operating a Teku/Besu Ethereum node, run directly on the node over SSH. Two feature areas:
 
-- `tekops logs teku|besu [path]` — tails and colorizes a JSON log file (replaces an old bashrc/jq function).
+- `tekops logs [teku|besu] [path]` — tails and colorizes a JSON log file (replaces an old bashrc/jq function). Source defaults to teku when omitted.
 - `tekops beacon head|validators|duties`, plus the top-level `tekops peers` and `tekops health` — a typed HTTP client wrapper around a curated set of Beacon API endpoints.
 
 ## Commands
@@ -42,7 +42,7 @@ Each module has one job; `cli.rs` is the only place that wires them together.
 - **`output.rs`** — pure formatting functions (`format_health_summary`, `format_peers_table`, etc.) that take already-fetched data and return a `String`. `comfy-table` is used for the tabular ones. `format_peers_table` prints a summary grouped by direction/protocol (count per group plus a total), not one row per peer — matching how peer counts actually get eyeballed on this node.
 - **`protocol.rs`** — classifies a peer's transport as `Protocol::Tcp`/`Quic` from its `last_seen_p2p_address` multiaddr (`Quic` if it contains a `/quic` component, `Tcp` otherwise). An earlier version decoded the peer's ENR instead (via the `enr`/`k256` crates), but the Beacon API doesn't reliably populate that field and it always classified as `Unknown` in practice — don't reintroduce ENR-based classification.
 - **`logfmt.rs`** — pure function, one JSON log line in, one colorized/formatted line out. No I/O, easy to unit test in isolation.
-- **`logs.rs`** — `LogSource` (teku/besu, default paths) and the generic `stream_logs<R: BufRead, W: Write>` loop, kept generic specifically so it's testable with in-memory buffers instead of real subprocess pipes.
+- **`logs.rs`** — `LogSource` (teku/besu, default paths), `resolve_log_path` (positional path > `$TEKOPS_LOGS_FILE` for teku only > source's hardcoded default — takes the env value as a parameter rather than reading it directly so it stays a pure, race-free unit test), and the generic `stream_logs<R: BufRead, W: Write>` loop, kept generic specifically so it's testable with in-memory buffers instead of real subprocess pipes.
 
 ### The `logs` subcommand's process lifetime (non-obvious, don't regress)
 

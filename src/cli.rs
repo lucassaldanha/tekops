@@ -1,7 +1,7 @@
 use crate::beaconapi::{
     ApiError, BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus,
 };
-use crate::logs::{stream_logs, LogSource};
+use crate::logs::{resolve_log_path, stream_logs, LogSource};
 use crate::protocol::classify_protocol;
 use crate::output::{
     format_attester_duties, format_head_summary, format_health_summary, format_peers_table,
@@ -25,9 +25,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Tail and colorize a Teku or Besu JSON log file
+    /// Tail and colorize a Teku or Besu JSON log file (defaults to teku)
     Logs {
-        source: LogSource,
+        source: Option<LogSource>,
         path: Option<PathBuf>,
     },
     /// Query the node's Beacon API
@@ -98,7 +98,7 @@ enum DutiesKind {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Logs { source, path } => run_logs(source, path),
+        Commands::Logs { source, path } => run_logs(source.unwrap_or(LogSource::Teku), path),
         Commands::Beacon { command, api_url, json } => {
             let client = BeaconClient::new(resolve_base_url(api_url));
             run_beacon(client, command, json)
@@ -243,7 +243,7 @@ fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Resu
 }
 
 fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
-    let path = path.unwrap_or_else(|| source.default_path());
+    let path = resolve_log_path(source, path, env::var("TEKOPS_LOGS_FILE").ok());
     if !path.exists() {
         eprintln!("error: log file not found: {}", path.display());
         return ExitCode::FAILURE;
@@ -325,6 +325,18 @@ mod tests {
     fn validators_requires_at_least_one_id() {
         let result = Cli::try_parse_from(["tekops", "beacon", "validators"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn logs_without_source_parses_with_source_none() {
+        let cli = Cli::try_parse_from(["tekops", "logs"]).unwrap();
+        assert!(matches!(cli.command, Commands::Logs { source: None, path: None }));
+    }
+
+    #[test]
+    fn logs_with_explicit_source_still_parses() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "besu"]).unwrap();
+        assert!(matches!(cli.command, Commands::Logs { source: Some(LogSource::Besu), path: None }));
     }
 
     #[test]
