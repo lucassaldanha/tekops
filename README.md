@@ -38,13 +38,14 @@ runtime dependencies - nothing but that one file needs to reach the node.
     tekops duties
     tekops validators
     tekops version
+    tekops log-level <LEVEL> [--filter=org.example ...]
 
-Every `beacon` subcommand, plus `peers`, `health`, and `head`, accepts
-`--json` to print a JSON-serialized version of the parsed response instead of
-the table (not a raw passthrough of the Beacon API's wire response - e.g.
-`peers --json` includes a `protocol` field that's derived locally, not sent
-by the API), and `--api-url` (or `$TEKOPS_API_URL`) to point at a non-default
-Beacon API (default: `http://localhost:5051`).
+Every `beacon` subcommand, plus `peers`, `health`, `head`, and `log-level`,
+accepts `--json` to print a JSON-serialized version of the parsed response
+instead of the table (not a raw passthrough of the Beacon API's wire
+response - e.g. `peers --json` includes a `protocol` field that's derived
+locally, not sent by the API), and `--api-url` (or `$TEKOPS_API_URL`) to
+point at a non-default Beacon API (default: `http://localhost:5051`).
 
 `duties`, `validators`, and `version` all read the validator client's own
 Prometheus `/metrics` page instead of the Beacon API - they accept `--json`,
@@ -73,6 +74,15 @@ whichever of `beacon_teku_version_total` or `validator_teku_version_total` is
 present on the scrape (only one exists at a time, depending on whether
 `--metric-url` points at a beacon node's or a validator client's `/metrics`
 endpoint).
+
+`log-level` sends a `PUT` to `/teku/v1/admin/log_level` to change the node's
+runtime log level - the only mutating command `tekops` has. The level is a
+positional argument, e.g. `tekops log-level info`, sent to the API exactly
+as typed (no case normalization). Repeat `--filter` to scope the change to
+one or more logger names (e.g. `org.hyperledger.besu`, or a fully-qualified
+class); omit it entirely to change the global log level - `log_filter` is
+left out of the request body in that case rather than sent as `null` or
+`[]`.
 
 `peers` prints a table of peer counts grouped by direction and protocol, plus
 the total peer count, rather than one row per peer:

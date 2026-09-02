@@ -97,6 +97,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Set the node's runtime log level, optionally scoped to specific loggers
+    LogLevel {
+        /// Log level to set (e.g. INFO, DEBUG, WARN, TRACE)
+        level: String,
+        /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu); omit to change the global level
+        #[arg(long = "filter")]
+        log_filter: Vec<String>,
+        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Print a JSON-serialized summary instead of a formatted table
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a shell completion script
     Completion { shell: Shell },
 }
@@ -163,6 +177,10 @@ pub fn run() -> ExitCode {
             let client = MetricsClient::new(resolve_metric_url(metric_url));
             exit_for(metrics_version(&client, json))
         }
+        Commands::LogLevel { level, log_filter, api_url, json } => {
+            let client = BeaconClient::new(resolve_base_url(api_url));
+            exit_for(beacon_log_level(&client, &level, log_filter, json))
+        }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "tekops", &mut io::stdout());
@@ -206,6 +224,13 @@ struct HeadJson<'a> {
     header: &'a BlockHeader,
     #[serde(flatten)]
     finality: &'a FinalityCheckpoints,
+}
+
+#[derive(Serialize)]
+struct LogLevelJson<'a> {
+    level: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_filter: Option<Vec<String>>,
 }
 
 fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitCode {
@@ -325,6 +350,26 @@ fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Resu
         println!("{}", serde_json::to_string(&duties).expect("serialize proposer duties json"));
     } else {
         println!("{}", format_proposer_duties(&duties));
+    }
+    Ok(())
+}
+
+fn beacon_log_level(
+    client: &BeaconClient,
+    level: &str,
+    log_filter: Vec<String>,
+    json: bool,
+) -> Result<(), ApiError> {
+    let log_filter = if log_filter.is_empty() { None } else { Some(log_filter) };
+    client.set_log_level(level, log_filter.clone())?;
+    if json {
+        let payload = LogLevelJson { level, log_filter };
+        println!("{}", serde_json::to_string(&payload).expect("serialize log level json"));
+    } else {
+        match &log_filter {
+            Some(loggers) => println!("log level set to {level} for: {}", loggers.join(", ")),
+            None => println!("log level set to {level} (global)"),
+        }
     }
     Ok(())
 }
@@ -469,6 +514,47 @@ mod tests {
     }
 
     #[test]
+    fn log_level_requires_a_level_argument() {
+        let result = Cli::try_parse_from(["tekops", "log-level"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn log_level_is_a_top_level_command() {
+        let cli = Cli::try_parse_from(["tekops", "log-level", "DEBUG"]).unwrap();
+        match cli.command {
+            Commands::LogLevel { level, log_filter, api_url, json } => {
+                assert_eq!(level, "DEBUG");
+                assert!(log_filter.is_empty());
+                assert_eq!(api_url, None);
+                assert!(!json);
+            }
+            _ => panic!("expected LogLevel command"),
+        }
+    }
+
+    #[test]
+    fn log_level_parses_with_multiple_filters() {
+        let cli = Cli::try_parse_from([
+            "tekops",
+            "log-level",
+            "DEBUG",
+            "--filter",
+            "org.a",
+            "--filter",
+            "org.b",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::LogLevel { level, log_filter, .. } => {
+                assert_eq!(level, "DEBUG");
+                assert_eq!(log_filter, vec!["org.a".to_string(), "org.b".to_string()]);
+            }
+            _ => panic!("expected LogLevel command"),
+        }
+    }
+
+    #[test]
     fn health_json_output_is_valid_json() {
         let syncing = SyncingStatus {
             is_syncing: true,
@@ -601,5 +687,23 @@ mod tests {
         let json = serde_json::to_string(&duties).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value[0]["pubkey"], "0xdef");
+    }
+
+    #[test]
+    fn log_level_json_output_includes_filter_when_scoped() {
+        let payload = LogLevelJson { level: "DEBUG", log_filter: Some(vec!["org.example".to_string()]) };
+        let json = serde_json::to_string(&payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["level"], "DEBUG");
+        assert_eq!(value["log_filter"][0], "org.example");
+    }
+
+    #[test]
+    fn log_level_json_output_omits_filter_when_global() {
+        let payload = LogLevelJson { level: "DEBUG", log_filter: None };
+        let json = serde_json::to_string(&payload).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["level"], "DEBUG");
+        assert!(value.get("log_filter").is_none());
     }
 }

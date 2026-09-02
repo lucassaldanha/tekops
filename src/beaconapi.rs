@@ -161,6 +161,13 @@ pub struct ProposerDuty {
     pub slot: String,
 }
 
+#[derive(Serialize)]
+struct LogLevelRequest {
+    level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_filter: Option<Vec<String>>,
+}
+
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self { base_url: base_url.into() }
@@ -192,6 +199,11 @@ impl BeaconClient {
         let resp = ureq::post(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
+    }
+
+    fn put_json(&self, path: &str, body: impl serde::Serialize) -> Result<(), ApiError> {
+        ureq::put(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
+        Ok(())
     }
 
     pub fn health(&self) -> Result<HealthState, ApiError> {
@@ -284,6 +296,15 @@ impl BeaconClient {
             .into_iter()
             .map(|d| ProposerDuty { pubkey: d.pubkey, validator_index: d.validator_index, slot: d.slot })
             .collect())
+    }
+
+    /// Sets the node's runtime log level. `log_filter` scopes the change to
+    /// specific logger names (e.g. `org.hyperledger.besu`); `None` changes
+    /// the global level, and must be omitted from the request body entirely
+    /// rather than sent as `null` or `[]`.
+    pub fn set_log_level(&self, level: &str, log_filter: Option<Vec<String>>) -> Result<(), ApiError> {
+        let body = LogLevelRequest { level: level.to_string(), log_filter };
+        self.put_json("/teku/v1/admin/log_level", body)
     }
 }
 
@@ -439,5 +460,40 @@ mod tests {
         assert_eq!(fc.previous_justified_epoch, "10");
         assert_eq!(fc.current_justified_epoch, "11");
         assert_eq!(fc.finalized_epoch, "9");
+    }
+
+    #[test]
+    fn set_log_level_omits_log_filter_when_global() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("PUT", "/teku/v1/admin/log_level")
+            .match_body(mockito::Matcher::Json(serde_json::json!({"level": "DEBUG"})))
+            .with_status(200)
+            .create();
+        let client = BeaconClient::new(server.url());
+        client.set_log_level("DEBUG", None).unwrap();
+    }
+
+    #[test]
+    fn set_log_level_includes_log_filter_when_scoped() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("PUT", "/teku/v1/admin/log_level")
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"level": "DEBUG", "log_filter": ["org.example"]}),
+            ))
+            .with_status(200)
+            .create();
+        let client = BeaconClient::new(server.url());
+        client.set_log_level("DEBUG", Some(vec!["org.example".to_string()])).unwrap();
+    }
+
+    #[test]
+    fn set_log_level_errors_on_non_2xx_status() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("PUT", "/teku/v1/admin/log_level").with_status(400).create();
+        let client = BeaconClient::new(server.url());
+        let err = client.set_log_level("NOT_A_LEVEL", None).unwrap_err();
+        assert!(matches!(err, ApiError::Status(400, _)));
     }
 }
