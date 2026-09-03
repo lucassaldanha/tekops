@@ -33,7 +33,7 @@ fn parse_line(line: &str) -> Option<Sample> {
 
     let (name, labels, rest) = match line.find('{') {
         Some(open) => {
-            let close = open + line[open..].find('}')?;
+            let close = open + find_closing_brace(&line[open..])?;
             let name = line[..open].to_string();
             let labels = parse_labels(&line[open + 1..close]);
             (name, labels, line[close + 1..].trim())
@@ -46,16 +46,53 @@ fn parse_line(line: &str) -> Option<Sample> {
 
     // `rest` is "value" or "value timestamp" - only the value matters here.
     let value: f64 = rest.split_whitespace().next()?.parse().ok()?;
+    // The exposition format permits `NaN`, `+Inf` and `-Inf`, and Rust parses
+    // all three happily. Letting one through poisons every aggregate it lands
+    // in - a single NaN balance turns an otherwise correct total into NaN,
+    // which then serializes to `null`. Drop them at the door instead, so a
+    // partially-populated scrape degrades to a smaller total rather than to
+    // no answer at all.
+    if !value.is_finite() {
+        return None;
+    }
     Some(Sample { name, labels, value })
+}
+
+/// Finds the `}` that closes the label set, ignoring any that appear inside a
+/// quoted label value. A naive `find('}')` truncates the label set early on a
+/// value like `version="teku/v25.1.0 {dev}"`, which then fails to parse and
+/// silently drops the whole sample.
+fn find_closing_brace(s: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '}' if !in_quotes => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_labels(raw: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     let mut start = 0;
     let mut in_quotes = false;
+    let mut escaped = false;
     let mut pairs = Vec::new();
     for (i, c) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
+            '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
             ',' if !in_quotes => {
                 pairs.push(&raw[start..i]);
@@ -70,10 +107,40 @@ fn parse_labels(raw: &str) -> BTreeMap<String, String> {
     }
     for pair in pairs {
         if let Some((key, value)) = pair.trim().split_once('=') {
-            labels.insert(key.trim().to_string(), value.trim().trim_matches('"').to_string());
+            labels.insert(key.trim().to_string(), unquote(value.trim()));
         }
     }
     labels
+}
+
+/// Strips the surrounding quotes from a label value and resolves the escape
+/// sequences the exposition format defines (`\\`, `\"`, `\n`). Only the outer
+/// pair of quotes is removed, so a value that legitimately starts or ends with
+/// one survives intact.
+fn unquote(value: &str) -> String {
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Sums the value of every sample matching `name` and all `matchers`
@@ -110,6 +177,15 @@ fn sum_by_label(samples: &[Sample], name: &str, group_label: &str) -> BTreeMap<S
 /// plain PromQL `sum(metric{...})` with no `by`/label matchers.
 fn sum_all(samples: &[Sample], name: &str) -> f64 {
     samples.iter().filter(|s| s.name == name).map(|s| s.value).sum()
+}
+
+/// Whether the scrape carries any sample for `name` at all, regardless of
+/// labels or value. Absence means the metric family isn't exported by whatever
+/// process is behind this endpoint - a different question entirely from the
+/// metric being present and reading zero, and one the aggregation helpers
+/// above can't answer since both cases sum to 0.
+fn has_metric(samples: &[Sample], name: &str) -> bool {
+    samples.iter().any(|s| s.name == name)
 }
 
 /// Every distinct value of `label` across samples matching `name`, sorted.
@@ -165,6 +241,7 @@ impl MetricsClient {
 
     pub fn duties(&self) -> Result<DutiesMetrics, ApiError> {
         let samples = self.fetch()?;
+        self.require_metric(&samples, VALIDATOR_REQUESTS_METRIC)?;
         let published = |method: &str| {
             matching_value(&samples, VALIDATOR_REQUESTS_METRIC, &[("method", method), ("outcome", "success")])
                 .round() as u64
@@ -179,6 +256,7 @@ impl MetricsClient {
 
     pub fn validators(&self) -> Result<ValidatorMetrics, ApiError> {
         let samples = self.fetch()?;
+        self.require_metric(&samples, VALIDATOR_COUNTS_METRIC)?;
         let counts_by_status = sum_by_label(&samples, VALIDATOR_COUNTS_METRIC, "status")
             .into_iter()
             .map(|(status, value)| (status, value.round() as u64))
@@ -197,7 +275,30 @@ impl MetricsClient {
         if versions.is_empty() {
             versions = distinct_label_values(&samples, VALIDATOR_VERSION_METRIC, "version");
         }
+        if versions.is_empty() {
+            return Err(ApiError::Malformed(format!(
+                "no version metric found at {} (looked for {BEACON_VERSION_METRIC} and \
+                 {VALIDATOR_VERSION_METRIC}); is this a Teku metrics endpoint?",
+                self.url
+            )));
+        }
         Ok(VersionInfo { versions })
+    }
+
+    /// Fails when `name` is absent from the scrape entirely. Without this the
+    /// aggregation helpers report a confident zero for a metric that was never
+    /// exported, so pointing at the wrong process (the beacon node's port
+    /// instead of the validator client's, say) renders as "this validator
+    /// published nothing" - the alarm reading, from a healthy node.
+    fn require_metric(&self, samples: &[Sample], name: &str) -> Result<(), ApiError> {
+        if has_metric(samples, name) {
+            return Ok(());
+        }
+        Err(ApiError::Malformed(format!(
+            "metric {name} not found at {} - the endpoint responded but exports no such metric; \
+             check that this is the right process's metrics port",
+            self.url
+        )))
     }
 }
 
@@ -389,12 +490,86 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
     }
 
     #[test]
-    fn version_is_empty_when_neither_metric_present() {
+    fn version_errors_when_neither_metric_present() {
         let mut server = mockito::Server::new();
         let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
-        let info = client.version().unwrap();
-        assert!(info.versions.is_empty());
+        let err = client.version().unwrap_err();
+        assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn find_closing_brace_ignores_braces_inside_quoted_values() {
+        let body = r#"beacon_teku_version_total{version="teku/v25.1.0 {dev}"} 1"#;
+        let samples = parse_exposition(body);
+        assert_eq!(samples.len(), 1, "sample was dropped: {samples:?}");
+        assert_eq!(samples[0].labels.get("version"), Some(&"teku/v25.1.0 {dev}".to_string()));
+        assert_eq!(samples[0].value, 1.0);
+    }
+
+    #[test]
+    fn parses_labels_containing_escaped_quotes() {
+        let body = r#"m{a="x\"y",b="2"} 5"#;
+        let samples = parse_exposition(body);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].labels.get("a"), Some(&"x\"y".to_string()));
+        assert_eq!(samples[0].labels.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn parses_label_value_containing_a_comma() {
+        let samples = parse_exposition(r#"m{a="x,y",b="z"} 1"#);
+        assert_eq!(samples[0].labels.get("a"), Some(&"x,y".to_string()));
+        assert_eq!(samples[0].labels.get("b"), Some(&"z".to_string()));
+    }
+
+    #[test]
+    fn drops_non_finite_sample_values() {
+        for body in ["m NaN", "m +Inf", "m -Inf", "m inf"] {
+            assert!(parse_exposition(body).is_empty(), "{body} should have been dropped");
+        }
+    }
+
+    #[test]
+    fn a_nan_balance_does_not_poison_the_total() {
+        let mut server = mockito::Server::new();
+        let body = r#"
+validator_local_validator_counts{status="active_ongoing"} 2
+validator_local_validator_balances{pubkey="0x1"} NaN
+validator_local_validator_balances{pubkey="0x2"} 32000000000
+"#;
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let metrics = client.validators().unwrap();
+        assert_eq!(metrics.total_eth, 32.0, "the real balance must survive the NaN");
+    }
+
+    #[test]
+    fn duties_errors_when_the_metric_family_is_absent() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let err = client.duties().unwrap_err();
+        assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn duties_still_reports_a_genuine_zero_when_the_metric_is_present() {
+        let mut server = mockito::Server::new();
+        let body = r#"validator_beacon_node_requests_total{method="publish_block",outcome="failure"} 3"#;
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let duties = client.duties().unwrap();
+        assert_eq!(duties.published_blocks, 0, "present-but-zero must not be an error");
+    }
+
+    #[test]
+    fn validators_errors_when_the_metric_family_is_absent() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let err = client.validators().unwrap_err();
+        assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
     }
 
     #[test]
