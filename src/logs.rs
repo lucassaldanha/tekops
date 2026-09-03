@@ -3,10 +3,48 @@ use clap::ValueEnum;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+/// How much colorized output one session may buffer before it stops following.
+///
+/// The buffer is a real file (so `less` can search it - see the note in
+/// `cli::run_logs`), and it only ever grows. On a busy node an open-ended
+/// session would grow it without bound, which matters because `/tmp` is tmpfs
+/// on most systemd distros: that is RAM, on the machine running the validator.
+/// Stopping is the only bound that keeps the pager's view coherent, since
+/// truncating a file `less` is holding offsets into corrupts what it displays.
+pub const MAX_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn stream_logs<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::Result<()> {
+    stream_logs_capped(reader, writer, MAX_BUFFER_BYTES)
+}
+
+/// Formats each line into `writer` until the reader ends or `max_bytes` have
+/// been written, whichever comes first. Hitting the cap is a normal end to the
+/// stream, not an error: the session keeps working as scrollback, so it says so
+/// in-band and returns `Ok`.
+pub fn stream_logs_capped<R: BufRead, W: Write>(
+    reader: R,
+    writer: &mut W,
+    max_bytes: u64,
+) -> io::Result<()> {
+    let mut written: u64 = 0;
     for line in reader.lines() {
         let line = line?;
-        writeln!(writer, "{}", format_log_line(&line))?;
+        let formatted = format_log_line(&line);
+        // +1 for the newline `writeln!` adds.
+        let next = written.saturating_add(formatted.len() as u64 + 1);
+        if next > max_bytes {
+            writeln!(writer)?;
+            writeln!(
+                writer,
+                "*** tekops: {} MiB buffer limit reached, stopped following.",
+                max_bytes / (1024 * 1024)
+            )?;
+            writeln!(writer, "*** Scrollback and search still work. Quit and rerun to resume.")?;
+            writer.flush()?;
+            return Ok(());
+        }
+        writeln!(writer, "{formatted}")?;
+        written = next;
     }
     Ok(())
 }
@@ -69,6 +107,63 @@ mod tests {
         stream_logs(reader, &mut output).unwrap();
 
         assert_eq!(String::from_utf8(output).unwrap().trim_end(), "garbage");
+    }
+
+    fn log_line(message: &str) -> String {
+        format!(
+            "{{\"@timestamp\":\"t\",\"level\":\"INFO\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"{message}\"}}\n"
+        )
+    }
+
+    #[test]
+    fn stops_following_once_the_buffer_cap_is_reached() {
+        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
+        let mut output = Vec::new();
+
+        stream_logs_capped(Cursor::new(input), &mut output, 200).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("buffer limit reached"), "no notice emitted: {output:?}");
+        assert!(output.contains("Quit and rerun to resume"));
+        assert!(output.contains("line0"), "content before the cap should survive");
+        assert!(!output.contains("line499"), "content past the cap should be dropped");
+    }
+
+    #[test]
+    fn buffer_cap_bounds_what_is_written() {
+        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
+        let mut output = Vec::new();
+        let cap = 1024;
+
+        stream_logs_capped(Cursor::new(input), &mut output, cap).unwrap();
+
+        // The log content itself stays under the cap; only the fixed-size
+        // notice is allowed past it, so the bound stays meaningful.
+        assert!(
+            (output.len() as u64) < cap + 200,
+            "wrote {} bytes for a {cap}-byte cap",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn a_stream_under_the_cap_is_untouched_and_has_no_notice() {
+        let input = log_line("only line");
+        let mut output = Vec::new();
+
+        stream_logs_capped(Cursor::new(input), &mut output, MAX_BUFFER_BYTES).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("only line"));
+        assert!(!output.contains("buffer limit"), "notice on an under-cap stream: {output:?}");
+        assert_eq!(output.lines().count(), 1);
+    }
+
+    #[test]
+    fn hitting_the_cap_is_not_an_error() {
+        let input: String = (0..100).map(|i| log_line(&format!("line{i}"))).collect();
+        let mut output = Vec::new();
+        assert!(stream_logs_capped(Cursor::new(input), &mut output, 50).is_ok());
     }
 
     #[test]

@@ -12,17 +12,52 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use serde::Serialize;
 use std::env;
-use std::io::{self, BufReader, LineWriter};
+use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 
 #[derive(Parser)]
-#[command(name = "tekops", about = "Helper tools for operating a Teku/Besu node")]
+#[command(
+    name = "tekops",
+    about = "Helper tools for operating a Teku/Besu node",
+    // Reports the tekops build itself, which is distinct from `tekops version`
+    // (the running Teku's version, read from the metrics endpoint). The deploy
+    // model is a hand-copied binary, so a node's build is otherwise unknowable.
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// The Beacon API connection flags, shared by every command that talks to it
+/// rather than repeated per command.
+///
+/// `global` keeps `tekops beacon validators 1 --json` working - the flags used
+/// to be declared that way on the `beacon` command specifically, so dropping it
+/// here would silently break trailing flags on its subcommands. On the leaf
+/// commands, which have no subcommands to propagate to, it's a no-op.
+#[derive(clap::Args)]
+struct ApiArgs {
+    /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
+    #[arg(long, global = true)]
+    api_url: Option<String>,
+    /// Print a JSON-serialized summary instead of a formatted table
+    #[arg(long, global = true)]
+    json: bool,
+}
+
+/// The Prometheus scrape flags, shared by every command that reads metrics.
+#[derive(clap::Args)]
+struct MetricArgs {
+    /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
+    #[arg(long, global = true)]
+    metric_url: Option<String>,
+    /// Print a JSON-serialized summary instead of a formatted table
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -36,67 +71,39 @@ enum Commands {
     Beacon {
         #[command(subcommand)]
         command: BeaconCommand,
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-        #[arg(long, global = true)]
-        api_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long, global = true)]
-        json: bool,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// List connected peers, grouped by direction/protocol, with peer counts
     Peers {
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-        #[arg(long)]
-        api_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Node health and sync status
     Health {
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-        #[arg(long)]
-        api_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Chain head slot/root and finality checkpoints
     Head {
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-        #[arg(long)]
-        api_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Published blocks, attestations, sync committee messages, and aggregates
     Duties {
-        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
-        #[arg(long)]
-        metric_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        metrics: MetricArgs,
     },
     /// Validator key counts by status, and total locally-stated ETH balance
     Validators {
-        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
-        #[arg(long)]
-        metric_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        metrics: MetricArgs,
     },
     /// Running Teku version, read from the beacon node or validator client
     /// metrics (whichever is present on the scrape)
     Version {
-        /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
-        #[arg(long)]
-        metric_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        metrics: MetricArgs,
     },
     /// Set the node's runtime log level, optionally scoped to specific loggers
     LogLevel {
@@ -105,12 +112,8 @@ enum Commands {
         /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu); omit to change the global level
         #[arg(long = "filter")]
         log_filter: Vec<String>,
-        /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-        #[arg(long)]
-        api_url: Option<String>,
-        /// Print a JSON-serialized summary instead of a formatted table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        api: ApiArgs,
     },
     /// Print a shell completion script
     Completion { shell: Shell },
@@ -150,37 +153,37 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Logs { source, path } => run_logs(source.unwrap_or(LogSource::Teku), path),
-        Commands::Beacon { command, api_url, json } => {
-            let client = BeaconClient::new(resolve_base_url(api_url));
-            run_beacon(client, command, json)
+        Commands::Beacon { command, api } => {
+            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            run_beacon(client, command, api.json)
         }
-        Commands::Peers { api_url, json } => {
-            let client = BeaconClient::new(resolve_base_url(api_url));
-            exit_for(beacon_peers(&client, json))
+        Commands::Peers { api } => {
+            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            exit_for(beacon_peers(&client, api.json))
         }
-        Commands::Health { api_url, json } => {
-            let client = BeaconClient::new(resolve_base_url(api_url));
-            exit_for(beacon_health(&client, json))
+        Commands::Health { api } => {
+            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            exit_for(beacon_health(&client, api.json))
         }
-        Commands::Head { api_url, json } => {
-            let client = BeaconClient::new(resolve_base_url(api_url));
-            exit_for(beacon_head(&client, json))
+        Commands::Head { api } => {
+            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            exit_for(beacon_head(&client, api.json))
         }
-        Commands::Duties { metric_url, json } => {
-            let client = MetricsClient::new(resolve_metric_url(metric_url));
-            exit_for(metrics_duties(&client, json))
+        Commands::Duties { metrics } => {
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            exit_for(metrics_duties(&client, metrics.json))
         }
-        Commands::Validators { metric_url, json } => {
-            let client = MetricsClient::new(resolve_metric_url(metric_url));
-            exit_for(metrics_validators(&client, json))
+        Commands::Validators { metrics } => {
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            exit_for(metrics_validators(&client, metrics.json))
         }
-        Commands::Version { metric_url, json } => {
-            let client = MetricsClient::new(resolve_metric_url(metric_url));
-            exit_for(metrics_version(&client, json))
+        Commands::Version { metrics } => {
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            exit_for(metrics_version(&client, metrics.json))
         }
-        Commands::LogLevel { level, log_filter, api_url, json } => {
-            let client = BeaconClient::new(resolve_base_url(api_url));
-            exit_for(beacon_log_level(&client, &level, log_filter, json))
+        Commands::LogLevel { level, log_filter, api } => {
+            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            exit_for(beacon_log_level(&client, &level, log_filter, api.json))
         }
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
@@ -398,7 +401,17 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
     // process group above, specifically so Ctrl+C can't reach it) would be
     // orphaned and keep running forever, and the temp file backing `less` would
     // never be removed — a real leak, one per dropped session, not hypothetical.
-    let _ = ctrlc::set_handler(|| {});
+    // Failing to install this is not cosmetic: it silently reverts the process
+    // to the exact behaviour the handler exists to prevent - Ctrl+C kills
+    // tekops mid-session, leaving `tail` (deliberately in its own process
+    // group, out of the signal's reach) orphaned forever and the temp file
+    // below undeleted. Swallowing the error hides a guaranteed leak, so say so
+    // and bail rather than starting a session that can't clean up after itself.
+    if let Err(e) = ctrlc::set_handler(|| {}) {
+        eprintln!("error: could not install signal handler: {e}");
+        eprintln!("refusing to start: Ctrl+C or a dropped session would orphan the log tailer");
+        return ExitCode::FAILURE;
+    }
 
     let mut tail = match Command::new("tail")
         .args(["-F", "-n", "200"])
@@ -439,23 +452,60 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    let reader = BufReader::new(tail.stdout.take().expect("tail stdout piped"));
-    let mut writer = LineWriter::new(sink.reopen().expect("reopen temp file for writing"));
+    // Both of these can fail for real (fd exhaustion, /tmp remounted read-only)
+    // and both happen with the pager already on screen, so a panic here would
+    // dump a Rust backtrace over a live `less` and skip the cleanup below.
+    let Some(stdout) = tail.stdout.take() else {
+        eprintln!("error: tail stdout was not piped");
+        let _ = pager.kill();
+        let _ = tail.kill();
+        return ExitCode::FAILURE;
+    };
+    let writer = match sink.reopen() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: failed to open temp file for writing: {e}");
+            let _ = pager.kill();
+            let _ = tail.kill();
+            return ExitCode::FAILURE;
+        }
+    };
+    match supervise_pager(pager, tail, BufReader::new(stdout), LineWriter::new(writer)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error while streaming logs: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    // tail -F never reaches EOF, so the pager (not the streaming loop) owns
-    // process lifetime: run streaming on its own thread and wait on the pager.
+/// Runs the streaming loop against `reader` while the pager owns process
+/// lifetime, then tears the tailer down.
+///
+/// The ordering here is the whole point, and it has regressed before. `tail -F`
+/// never reaches EOF, so the streaming loop cannot be what ends the process -
+/// blocking the main thread on it hangs until the log happens to move, which on
+/// a quiet node is forever. So: stream on a worker thread, block the main
+/// thread on the pager, and only once the pager has exited kill the tailer.
+/// Killing it is what closes the pipe and gives the worker its EOF; joining
+/// before the kill deadlocks instead.
+fn supervise_pager(
+    mut pager: Child,
+    mut tail: Child,
+    reader: impl BufRead + Send + 'static,
+    mut writer: impl Write + Send + 'static,
+) -> io::Result<()> {
     let streaming = thread::spawn(move || stream_logs(reader, &mut writer));
 
     let _ = pager.wait();
     let _ = tail.kill();
     let _ = tail.wait();
 
-    match streaming.join().expect("log streaming thread panicked") {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error while streaming logs: {e}");
-            ExitCode::FAILURE
-        }
+    match streaming.join() {
+        Ok(result) => result,
+        // The pager has already exited by this point, so the terminal is the
+        // user's again and a plain error beats a propagated panic.
+        Err(_) => Err(io::Error::other("log streaming thread panicked")),
     }
 }
 
@@ -466,6 +516,88 @@ mod tests {
     use crate::protocol::Protocol;
     use clap::CommandFactory;
     use clap_complete::{generate, Shell};
+
+    /// Stands in for `tail -F`: a child that never exits on its own and whose
+    /// stdout pipe therefore never reaches EOF. Reading it blocks forever,
+    /// which is precisely the condition that makes the ordering in
+    /// `supervise_pager` load-bearing.
+    fn never_ending_child() -> Child {
+        Command::new("sleep").arg("300").stdout(Stdio::piped()).spawn().expect("spawn sleep")
+    }
+
+    /// The documented regression: with `tail -F` never reaching EOF, quitting
+    /// the pager on a quiet log must still end the session. If the wait/kill
+    /// ordering is inverted this test hangs rather than fails, so it runs on a
+    /// worker thread with a hard deadline.
+    #[test]
+    fn supervise_pager_returns_once_the_pager_exits_even_if_the_log_is_silent() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut tail = never_ending_child();
+            let stdout = tail.stdout.take().expect("piped");
+            // A pager that exits promptly, as if the user pressed `q`.
+            let pager = Command::new("sleep").arg("0.2").spawn().expect("spawn pager stand-in");
+            let result = supervise_pager(pager, tail, BufReader::new(stdout), io::sink());
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(ok) => assert!(ok, "supervise_pager returned an error"),
+            Err(_) => panic!(
+                "supervise_pager did not return after the pager exited - \
+                 the wait/kill/join ordering has regressed into a hang"
+            ),
+        }
+    }
+
+    /// The tailer must not outlive the session; leaking it was the original
+    /// bug behind the process-group work.
+    #[test]
+    fn supervise_pager_reaps_the_tailer() {
+        let mut tail = never_ending_child();
+        let pid = tail.id();
+        let stdout = tail.stdout.take().expect("piped");
+        let pager = Command::new("sleep").arg("0.2").spawn().expect("spawn pager stand-in");
+
+        supervise_pager(pager, tail, BufReader::new(stdout), io::sink()).unwrap();
+
+        // The child was killed and waited on, so it is fully reaped rather than
+        // left as a zombie or still running.
+        let still_alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("kill -0")
+            .success();
+        assert!(!still_alive, "tailer pid {pid} survived the session");
+    }
+
+    /// The colorized bytes must actually reach the sink the pager reads, not
+    /// just be produced and dropped.
+    #[test]
+    fn supervise_pager_streams_log_lines_into_the_sink() {
+        let mut source = Command::new("printf")
+            .arg(r#"{"@timestamp":"t","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn printf");
+        let stdout = source.stdout.take().expect("piped");
+        let pager = Command::new("sleep").arg("0.3").spawn().expect("spawn pager stand-in");
+
+        let sink = tempfile::Builder::new().prefix("tekops-test-").tempfile().unwrap();
+        let writer = LineWriter::new(sink.reopen().unwrap());
+        supervise_pager(pager, source, BufReader::new(stdout), writer).unwrap();
+
+        let written = std::fs::read_to_string(sink.path()).unwrap();
+        assert!(written.contains("INFO [m] C - hello"), "got {written:?}");
+    }
+
+    #[test]
+    fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
+        let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
+        assert!(!missing.exists(), "test precondition");
+        let code = run_logs(LogSource::Teku, Some(missing));
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
 
     #[test]
     fn generates_non_empty_bash_completion() {
@@ -504,37 +636,37 @@ mod tests {
     #[test]
     fn peers_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "peers"]).unwrap();
-        assert!(matches!(cli.command, Commands::Peers { api_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Peers { api: ApiArgs { api_url: None, json: false } }));
     }
 
     #[test]
     fn health_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "health"]).unwrap();
-        assert!(matches!(cli.command, Commands::Health { api_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Health { api: ApiArgs { api_url: None, json: false } }));
     }
 
     #[test]
     fn head_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "head"]).unwrap();
-        assert!(matches!(cli.command, Commands::Head { api_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Head { api: ApiArgs { api_url: None, json: false } }));
     }
 
     #[test]
     fn duties_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "duties"]).unwrap();
-        assert!(matches!(cli.command, Commands::Duties { metric_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Duties { metrics: MetricArgs { metric_url: None, json: false } }));
     }
 
     #[test]
     fn validators_is_a_top_level_command_distinct_from_beacon_validators() {
         let cli = Cli::try_parse_from(["tekops", "validators"]).unwrap();
-        assert!(matches!(cli.command, Commands::Validators { metric_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Validators { metrics: MetricArgs { metric_url: None, json: false } }));
     }
 
     #[test]
     fn version_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
-        assert!(matches!(cli.command, Commands::Version { metric_url: None, json: false }));
+        assert!(matches!(cli.command, Commands::Version { metrics: MetricArgs { metric_url: None, json: false } }));
     }
 
     #[test]
@@ -553,11 +685,11 @@ mod tests {
     fn log_level_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "log-level", "DEBUG"]).unwrap();
         match cli.command {
-            Commands::LogLevel { level, log_filter, api_url, json } => {
+            Commands::LogLevel { level, log_filter, api } => {
                 assert_eq!(level, "DEBUG");
                 assert!(log_filter.is_empty());
-                assert_eq!(api_url, None);
-                assert!(!json);
+                assert_eq!(api.api_url, None);
+                assert!(!api.json);
             }
             _ => panic!("expected LogLevel command"),
         }
@@ -582,6 +714,68 @@ mod tests {
             }
             _ => panic!("expected LogLevel command"),
         }
+    }
+
+    /// The `beacon` flags were declared `global` before they were flattened
+    /// into `ApiArgs`; without that, a flag after the subcommand stops parsing.
+    #[test]
+    fn beacon_subcommand_accepts_flags_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["tekops", "beacon", "validators", "1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Beacon { api, .. } => assert!(api.json),
+            _ => panic!("expected Beacon command"),
+        }
+    }
+
+    #[test]
+    fn beacon_subcommand_accepts_flags_before_the_subcommand() {
+        let cli =
+            Cli::try_parse_from(["tekops", "beacon", "--json", "validators", "1"]).unwrap();
+        match cli.command {
+            Commands::Beacon { api, .. } => assert!(api.json),
+            _ => panic!("expected Beacon command"),
+        }
+    }
+
+    #[test]
+    fn api_url_flag_still_reaches_each_top_level_command() {
+        let cli =
+            Cli::try_parse_from(["tekops", "health", "--api-url", "http://x:1/"]).unwrap();
+        match cli.command {
+            Commands::Health { api } => assert_eq!(api.api_url.as_deref(), Some("http://x:1/")),
+            _ => panic!("expected Health command"),
+        }
+    }
+
+    #[test]
+    fn metric_url_flag_still_reaches_each_metrics_command() {
+        let cli =
+            Cli::try_parse_from(["tekops", "duties", "--metric-url", "http://x:2/m"]).unwrap();
+        match cli.command {
+            Commands::Duties { metrics } => {
+                assert_eq!(metrics.metric_url.as_deref(), Some("http://x:2/m"))
+            }
+            _ => panic!("expected Duties command"),
+        }
+    }
+
+    /// `--version` reports the tekops build; `tekops version` reports the
+    /// running Teku's. Both must exist, and they answer different questions.
+    #[test]
+    fn version_flag_reports_the_tekops_build() {
+        let err = match Cli::try_parse_from(["tekops", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit parsing"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = err.to_string();
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")), "got {rendered:?}");
+    }
+
+    #[test]
+    fn version_subcommand_is_still_the_teku_version_query() {
+        let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
+        assert!(matches!(cli.command, Commands::Version { .. }));
     }
 
     #[test]

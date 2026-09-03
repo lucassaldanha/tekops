@@ -47,10 +47,20 @@ response - e.g. `peers --json` includes a `protocol` field that's derived
 locally, not sent by the API), and `--api-url` (or `$TEKOPS_API_URL`) to
 point at a non-default Beacon API (default: `http://localhost:5051`).
 
+`tekops --version` reports the `tekops` build itself, which is a different
+question from `tekops version` (the running Teku's version, below).
+
+Every network command gives up after 10 seconds rather than waiting forever
+on a node that accepts the connection but never answers.
+
 `duties`, `validators`, and `version` all read the validator client's own
 Prometheus `/metrics` page instead of the Beacon API - they accept `--json`,
 plus `--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default
-metrics endpoint (default: `http://localhost:8010/metrics`). `duties` and
+metrics endpoint (default: `http://localhost:8010/metrics`). If the endpoint
+responds but doesn't export the metric being asked for, these fail with an
+error rather than reporting a confident zero - pointing at the beacon node's
+metrics port instead of the validator client's would otherwise render as
+"this validator published nothing". `duties` and
 `validators` are a local equivalent of Grafana panel queries like
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})` -
 `tekops` fetches the raw exposition text and filters/sums locally, since a
