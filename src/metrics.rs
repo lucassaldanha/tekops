@@ -1,9 +1,10 @@
-use crate::http::{map_ureq_error, ApiError};
+use crate::http::{agent, map_ureq_error, ApiError};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 pub struct MetricsClient {
     url: String,
+    agent: ureq::Agent,
 }
 
 /// One sample scraped from a Prometheus text-exposition page: a metric name,
@@ -152,11 +153,11 @@ const VALIDATOR_VERSION_METRIC: &str = "validator_teku_version_total";
 
 impl MetricsClient {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self { url: url.into(), agent: agent() }
     }
 
     fn fetch(&self) -> Result<Vec<Sample>, ApiError> {
-        let resp = ureq::get(&self.url).call().map_err(map_ureq_error)?;
+        let resp = self.agent.get(&self.url).call().map_err(map_ureq_error)?;
         let body =
             resp.into_string().map_err(|e| ApiError::Malformed(format!("invalid response body: {e}")))?;
         Ok(parse_exposition(&body))

@@ -1,8 +1,9 @@
-use crate::http::{map_ureq_error, ApiError};
+use crate::http::{agent, map_ureq_error, ApiError};
 use serde::{Deserialize, Serialize};
 
 pub struct BeaconClient {
     base_url: String,
+    agent: ureq::Agent,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -170,7 +171,7 @@ struct LogLevelRequest {
 
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into() }
+        Self { base_url: base_url.into(), agent: agent() }
     }
 
     fn url(&self, path: &str) -> String {
@@ -178,7 +179,7 @@ impl BeaconClient {
     }
 
     fn request_status(&self, path: &str) -> Result<u16, ApiError> {
-        match ureq::get(&self.url(path)).call() {
+        match self.agent.get(&self.url(path)).call() {
             Ok(resp) => Ok(resp.status()),
             Err(ureq::Error::Status(code, _)) => Ok(code),
             Err(e) => Err(map_ureq_error(e)),
@@ -186,7 +187,7 @@ impl BeaconClient {
     }
 
     fn get_json<T: for<'de> serde::Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
-        let resp = ureq::get(&self.url(path)).call().map_err(map_ureq_error)?;
+        let resp = self.agent.get(&self.url(path)).call().map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
@@ -196,13 +197,13 @@ impl BeaconClient {
         path: &str,
         body: impl serde::Serialize,
     ) -> Result<T, ApiError> {
-        let resp = ureq::post(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
+        let resp = self.agent.post(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
 
     fn put_json(&self, path: &str, body: impl serde::Serialize) -> Result<(), ApiError> {
-        ureq::put(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
+        self.agent.put(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
         Ok(())
     }
 
