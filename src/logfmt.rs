@@ -1,3 +1,4 @@
+use crate::term::sanitize;
 use serde_json::Value;
 
 fn color_for_level(level: &str) -> &'static str {
@@ -12,10 +13,20 @@ fn color_for_level(level: &str) -> &'static str {
 
 pub fn format_log_line(raw: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return raw.to_string();
+        // A line that isn't JSON is still untrusted bytes headed for a
+        // terminal, so it gets the same treatment as the parsed fields below.
+        return sanitize(raw);
     };
 
-    let get = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    // Log fields carry data the node didn't author - peer identifiers, remote
+    // agent strings, exception text from malformed gossip. The colorized
+    // output is written to a temp file that `less -R` renders with escapes
+    // live, so an unsanitized field can clear the operator's screen, retitle
+    // the terminal, or forge a red ERROR line that appears to come from tekops
+    // itself. Strip control characters before they reach the format string.
+    let get = |key: &str| {
+        value.get(key).and_then(Value::as_str).map(sanitize).unwrap_or_default()
+    };
     let timestamp = get("@timestamp");
     let level = get("level");
     let thread = get("thread");
@@ -83,5 +94,36 @@ mod tests {
     fn malformed_json_passes_through_unchanged() {
         let raw = "not json at all";
         assert_eq!(format_log_line(raw), "not json at all");
+    }
+
+    #[test]
+    fn strips_terminal_escapes_from_log_fields() {
+        // A peer-supplied string reaching Teku's logs: clear-screen, retitle
+        // the window, then forge what looks like a tekops-emitted ERROR line.
+        // `\u001b` keeps this valid JSON: raw control bytes inside a JSON
+        // string are invalid, and would silently divert this to the
+        // malformed-line path instead of the parsed-field path under test.
+        let raw = r#"{"@timestamp":"t","level":"INFO","thread":"main","class":"P2P","message":"peer: \u001b[2J\u001b]0;PWNED\u0007\u001b[31mFAKE ERROR\u001b[0m"}"#;
+        let out = format_log_line(raw);
+
+        // Exactly two escapes survive: the ones tekops itself wraps the line in.
+        assert_eq!(out.matches('\u{1b}').count(), 2, "field escapes leaked: {out:?}");
+        assert!(out.starts_with("\u{1b}[32m"));
+        assert!(out.ends_with("\u{1b}[0m"));
+        assert!(!out.contains('\u{7}'), "BEL leaked: {out:?}");
+        assert!(out.contains("FAKE ERROR"), "text should survive, only control chars go");
+    }
+
+    #[test]
+    fn strips_terminal_escapes_from_malformed_lines_too() {
+        let out = format_log_line("garbage \u{1b}[2J more");
+        assert!(!out.contains('\u{1b}'), "escape leaked via the passthrough path: {out:?}");
+    }
+
+    #[test]
+    fn keeps_newlines_in_java_stack_traces() {
+        let raw = r#"{"@timestamp":"t","level":"ERROR","thread":"t1","class":"C","message":"boom","throwable":"java.lang.RuntimeException\n\tat C.run"}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("java.lang.RuntimeException\n\tat C.run"));
     }
 }

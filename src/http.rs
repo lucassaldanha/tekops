@@ -1,3 +1,4 @@
+use crate::term::sanitize;
 use std::fmt;
 use std::time::Duration;
 
@@ -46,7 +47,7 @@ fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
 pub(crate) fn map_ureq_error(e: ureq::Error) -> ApiError {
     match e {
         ureq::Error::Status(code, resp) => {
-            ApiError::Status(code, resp.into_string().unwrap_or_default())
+            ApiError::Status(code, sanitize(&resp.into_string().unwrap_or_default()))
         }
         ureq::Error::Transport(t) => ApiError::Unreachable(t.to_string()),
     }
@@ -111,4 +112,30 @@ mod tests {
         assert_eq!(resp.into_string().unwrap(), "hi");
     }
 
+    #[test]
+    fn status_error_body_is_sanitized() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = "\u{1b}[2Jfire";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let err = map_ureq_error(agent().get(&format!("http://{addr}/")).call().unwrap_err());
+        match err {
+            ApiError::Status(500, body) => assert!(!body.contains('\u{1b}'), "ESC survived: {body:?}"),
+            other => panic!("expected a 500 status error, got {other:?}"),
+        }
+    }
 }
