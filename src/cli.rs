@@ -8,8 +8,7 @@ use crate::output::{
     format_peers_table, format_proposer_duties, format_validator_metrics_table,
     format_validators_table, format_version_table, PeerRow,
 };
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::env;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
@@ -115,8 +114,6 @@ enum Commands {
         #[command(flatten)]
         api: ApiArgs,
     },
-    /// Print a shell completion script
-    Completion { shell: Shell },
 }
 
 #[derive(Subcommand)]
@@ -184,11 +181,6 @@ pub fn run() -> ExitCode {
         Commands::LogLevel { level, log_filter, api } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
-        }
-        Commands::Completion { shell } => {
-            let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "tekops", &mut io::stdout());
-            ExitCode::SUCCESS
         }
     }
 }
@@ -514,8 +506,6 @@ mod tests {
     use super::*;
     use crate::beaconapi::{AttesterDuty, ProposerDuty, ValidatorInfo};
     use crate::protocol::Protocol;
-    use clap::CommandFactory;
-    use clap_complete::{generate, Shell};
 
     /// Stands in for `tail -F`: a child that never exits on its own and whose
     /// stdout pipe therefore never reaches EOF. Reading it blocks forever,
@@ -597,22 +587,6 @@ mod tests {
         assert!(!missing.exists(), "test precondition");
         let code = run_logs(LogSource::Teku, Some(missing));
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
-    }
-
-    #[test]
-    fn generates_non_empty_bash_completion() {
-        let mut cmd = Cli::command();
-        let mut buf = Vec::new();
-        generate(Shell::Bash, &mut cmd, "tekops", &mut buf);
-        let script = String::from_utf8(buf).unwrap();
-        assert!(!script.is_empty());
-        assert!(script.contains("tekops"));
-    }
-
-    #[test]
-    fn completion_subcommand_parses() {
-        let cli = Cli::try_parse_from(["tekops", "completion", "bash"]).unwrap();
-        assert!(matches!(cli.command, Commands::Completion { shell: Shell::Bash }));
     }
 
     #[test]

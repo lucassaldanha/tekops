@@ -112,7 +112,3 @@ the total peer count, rather than one row per peer:
 The Protocol column is derived from each peer's `last_seen_p2p_address`
 multiaddr (QUIC if it advertises a `/quic` component, TCP otherwise) rather
 than the peer's ENR, which the Beacon API doesn't reliably populate.
-
-## Shell completion
-
-    source <(tekops completion bash)   # or: zsh
