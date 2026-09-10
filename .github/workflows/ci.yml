@@ -12,7 +12,7 @@ jobs:
     name: test and lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No setup-toolchain action on purpose: the runner ships rustup, and
       # rustup honours rust-toolchain.toml on its own. Pinning the toolchain
