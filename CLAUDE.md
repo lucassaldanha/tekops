@@ -22,16 +22,27 @@ cargo clippy --all-targets   # lint
 
 ### Cross-compiling for deployment
 
-The node runs Linux x86_64. **This dev machine's Rust is Homebrew-installed, not `rustup`** - there is no `rustup target add`, and the `cross` tool doesn't work either (it shells out to `rustup toolchain list` even though the actual build runs in Docker). The working approach is to build directly inside a Rust-musl Docker image, forcing the `amd64` platform (this machine is Apple Silicon, so Docker otherwise defaults to an `aarch64` build):
-
 ```bash
-docker run --rm --platform linux/amd64 \
-  -v "$(pwd):/volume" clux/muslrust:stable cargo build --release
-# binary at target/x86_64-unknown-linux-musl/release/tekops - copy just this one file
-scp target/x86_64-unknown-linux-musl/release/tekops <node>:/usr/local/bin/tekops
+scripts/build-release.sh x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin
+scp dist/tekops-v*-x86_64-unknown-linux-musl.tar.gz <node>:
 ```
 
-The resulting binary is a static-PIE ELF (`file` confirms `static-pie linked`) - no runtime deps on the node, nothing else needs to be copied over. The README documents this same Docker approach; keep the two in sync if either changes.
+Don't hand-roll a `docker run` for this any more; the script is what CI runs, and a hand-typed variant produces a binary that won't hash the same. **This dev machine's Rust is Homebrew-installed, not `rustup`** - there is no `rustup target add`, and the `cross` tool doesn't work either (it shells out to `rustup toolchain list` even though the actual build runs in Docker), which is why the Linux targets build inside a container at all. The script forces `--platform linux/amd64` since this machine is Apple Silicon and Docker would otherwise pick an `aarch64` image.
+
+Both Linux binaries are statically linked with no runtime deps on the node (`file` confirms `static-pie linked` for x86_64 and `statically linked` for aarch64) - nothing but that one file needs to reach the node.
+
+### Releases
+
+A `v*` tag triggers `.github/workflows/release.yml`, which verifies the tag against `Cargo.toml`, runs the suite, builds three targets, and publishes tarballs plus `SHA256SUMS`. `.github/workflows/ci.yml` runs tests and clippy on every push and PR.
+
+Four things here are load-bearing and each closes a specific hole:
+
+- **Images are pinned by `@sha256:` digest, never by tag.** `clux/muslrust:stable` (what this file used to document) moves whenever Rust ships, so the same tag yields a different compiler and the published checksums stop meaning anything. Refresh a digest with `docker pull` followed by `docker inspect --format='{{index .RepoDigests 0}}'`.
+- **`rust-toolchain.toml` pins an exact version, never `stable`.** It is a rustup feature, and this dev machine runs Homebrew Rust, so it is silently ignored on a bare host build and governs only CI and the containers - verified: the image bundles Rust 1.96.1 but `rustc --version` inside it reports the pinned 1.98.0. Local reproducibility checks must therefore go through `scripts/build-release.sh`, not a host `cargo build`. Neither workflow installs a toolchain of its own, precisely so this file stays the only source of truth.
+- **Every build passes `--locked`**, so a drifted `Cargo.lock` fails the build instead of quietly resolving a different dependency graph.
+- **The release job depends on every build job.** A macOS failure means no release at all, including the Linux binaries. Assets that disagree about which platforms a version supports are worse than no assets.
+
+The reproducibility claim covers the **binary**, not the tarball, and Linux only. tar metadata differs between GNU tar in the container and bsdtar on macOS, and the macOS runner image (Xcode, SDK) drifts on GitHub's schedule and cannot be pinned, so that target is deterministic in practice rather than guaranteed.
 
 ## Architecture
 

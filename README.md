@@ -2,25 +2,63 @@
 
 Helper CLI for operating a Teku/Besu node, run directly on the node over SSH.
 
+## Install
+
+Download the binary for your platform from the [latest release](https://github.com/lucassaldanha/tekops/releases/latest):
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86_64 | `tekops-v<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux arm64 | `tekops-v<version>-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple silicon | `tekops-v<version>-aarch64-apple-darwin.tar.gz` |
+
+    VERSION=0.2.1
+    TARGET=x86_64-unknown-linux-musl
+    curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/tekops-v$VERSION-$TARGET.tar.gz"
+    tar xzf "tekops-v$VERSION-$TARGET.tar.gz"
+    sudo install -m755 tekops /usr/local/bin/tekops
+
+The Linux binaries are statically linked, so there is nothing else to install
+on the node.
+
+Verify what you downloaded against `SHA256SUMS` from the same release:
+
+    curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/SHA256SUMS"
+    sha256sum -c SHA256SUMS --ignore-missing
+
+**macOS:** the binary is not signed or notarized. Downloaded with `curl` as
+above it runs normally. If you download it through a browser instead, macOS
+quarantines it and reports that the developer cannot be verified; clear that
+with:
+
+    xattr -d com.apple.quarantine tekops
+
+While this repository is private, the release assets need an authenticated
+download instead of `curl`:
+
+    gh release download "v$VERSION" -p "tekops-v$VERSION-$TARGET.tar.gz"
+
 ## Build
 
     cargo build --release
 
-## Cross-compile for a Linux node (from macOS)
+## Building a release binary
 
-    docker run --rm --platform linux/amd64 \
-      -v "$(pwd):/volume" clux/muslrust:stable cargo build --release
-    scp target/x86_64-unknown-linux-musl/release/tekops <node>:/usr/local/bin/
+    scripts/build-release.sh x86_64-unknown-linux-musl
 
-(For an `aarch64` node, drop `--platform linux/amd64` on Apple Silicon, or
-add `--target aarch64-unknown-linux-musl` to the `cargo build` on x86_64
-macOS.)
+Writes `dist/tekops-v<version>-<target>.tar.gz` and prints the binary's
+SHA256. Supported targets are `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, and `aarch64-apple-darwin`.
 
-This builds inside a Rust+musl Docker image rather than via `rustup target
-add`, since a plain Homebrew-installed Rust toolchain has no cross-compile
-targets available and `cross` requires `rustup` on the host even though its
-build runs in a container. The resulting binary is a static-PIE ELF with no
+Linux targets build inside a digest-pinned musl container and cross-compile
+from x86_64, so no `rustup target add` is needed on the host (a Homebrew
+Rust has no cross-compile targets available, and `cross` requires `rustup`
+on the host even though its build runs in a container) and the aarch64 build
+does not emulate. The resulting binaries are statically linked with no
 runtime dependencies - nothing but that one file needs to reach the node.
+
+This is the same script CI runs, so a locally built Linux binary hashes
+identically to the published one.
 
 ## Usage
 
