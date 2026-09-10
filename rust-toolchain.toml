@@ -1,0 +1,15 @@
+# Pinned deliberately. A floating "stable" makes the release binaries
+# unreproducible, since the compiler changes underneath the same tag.
+# Bump this file to move Rust; do not rely on the host toolchain.
+#
+# Note: this dev machine's Rust is Homebrew-installed, not rustup, so this
+# file has no effect on a bare host build. It governs CI runners and the
+# musl containers, which is where release binaries actually come from.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy"]
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+]
