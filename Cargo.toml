@@ -15,3 +15,8 @@ tempfile = "3"
 
 [dev-dependencies]
 mockito = "1"
+
+[profile.release]
+# Stripping removes symbol paths that would otherwise vary between build
+# environments, so this serves reproducibility as well as binary size.
+strip = true
