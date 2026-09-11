@@ -13,8 +13,9 @@ use crate::term::sanitize;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 
 const REPO: &str = "lucassaldanha/tekops";
 
@@ -275,10 +276,57 @@ fn smoke_test(binary: &Path, expected_version: &str) -> Result<(), UpdateError> 
     Ok(())
 }
 
+/// Confirms the directory holding the binary can be written, before anything
+/// is downloaded, so a non-root invocation fails in a second rather than after
+/// fetching a megabyte.
+///
+/// It writes a file rather than inspecting permission bits: a path can be
+/// unwritable for reasons the bits do not show (read-only mount, immutable
+/// flag, SELinux).
+fn probe_writable(dir: &Path) -> Result<(), UpdateError> {
+    let probe = dir.join(format!(".tekops-probe-{}", process::id()));
+    fs::write(&probe, b"").map_err(|e| UpdateError::NotWritable {
+        dir: dir.to_path_buf(),
+        source: e.to_string(),
+    })?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Puts the verified binary in place.
+///
+/// The copy lands beside `dest` first so the final step is a rename within one
+/// filesystem, which is atomic: either the old binary or the new one is there,
+/// never a half-written file. Renaming over a running executable is safe on
+/// Linux and macOS - the inode stays alive for the running process. If the
+/// rename fails, the staged file is removed so a failed update leaves nothing
+/// behind in a directory like /usr/local/bin.
+fn install_binary(src: &Path, dest: &Path) -> Result<(), UpdateError> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| UpdateError::Io(format!("{} has no parent directory", dest.display())))?;
+    let staged = dir.join(format!(".tekops-update-{}", process::id()));
+
+    let not_writable = |e: io::Error| UpdateError::NotWritable {
+        dir: dir.to_path_buf(),
+        source: e.to_string(),
+    };
+
+    fs::copy(src, &staged).map_err(not_writable)?;
+    if let Err(e) = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(&staged);
+        return Err(not_writable(e));
+    }
+    if let Err(e) = fs::rename(&staged, dest) {
+        let _ = fs::remove_file(&staged);
+        return Err(not_writable(e));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn no_argument_means_prompt() {
@@ -587,5 +635,76 @@ mod tests {
         let binary = extract_binary(&tarball, dir.path()).unwrap();
         let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
         assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
+    }
+
+    #[test]
+    fn a_writable_directory_passes_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(probe_writable(dir.path()).is_ok());
+    }
+
+    /// The probe writes rather than inspecting permission bits, because a path
+    /// can be unwritable for reasons the bits do not show (read-only mount,
+    /// immutable flag, SELinux).
+    #[test]
+    fn a_read_only_directory_fails_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = probe_writable(dir.path());
+        // Restore before asserting so the TempDir can always clean itself up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("a read-only directory must fail the probe");
+        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+        assert!(err.to_string().contains("sudo"), "no sudo hint in: {err}");
+    }
+
+    #[test]
+    fn the_probe_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        probe_writable(dir.path()).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn install_replaces_the_destination_and_leaves_it_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("new");
+        let dest = dir.path().join("tekops");
+        std::fs::write(&src, b"new binary").unwrap();
+        std::fs::write(&dest, b"old binary").unwrap();
+
+        install_binary(&src, &dest).expect("install should succeed");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new binary");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "mode was {mode:o}");
+    }
+
+    #[test]
+    fn install_into_a_read_only_directory_fails_without_touching_the_destination() {
+        let outer = tempfile::tempdir().unwrap();
+        let src = outer.path().join("new");
+        std::fs::write(&src, b"new binary").unwrap();
+
+        let target_dir = outer.path().join("bin");
+        std::fs::create_dir(&target_dir).unwrap();
+        let dest = target_dir.join("tekops");
+        std::fs::write(&dest, b"old binary").unwrap();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = install_binary(&src, &dest);
+        let contents = std::fs::read(&dest).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&target_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("a read-only directory must fail the install");
+        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+        assert_eq!(contents, b"old binary", "the existing binary was damaged");
+        assert_eq!(leftovers.len(), 1, "staged debris left behind: {leftovers:?}");
     }
 }
