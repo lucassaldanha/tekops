@@ -88,7 +88,7 @@ pub enum UpdateError {
     UnsupportedTarget,
     CurlMissing,
     TarMissing,
-    CurlFailed { url: String, status: String, stderr: String },
+    CurlFailed { url: String, status: String, stderr: String, hint: Option<&'static str> },
     Malformed(String),
     ChecksumMissing { asset: String },
     ChecksumMismatch { expected: String, actual: String },
@@ -113,11 +113,13 @@ impl fmt::Display for UpdateError {
             UpdateError::TarMissing => {
                 write!(f, "tar is required for updates but was not found on PATH")
             }
-            UpdateError::CurlFailed { url, status, stderr } => write!(
-                f,
-                "could not download {url} ({status}): {stderr}\n\
-                 if the version is real, there may be no asset published for this platform"
-            ),
+            UpdateError::CurlFailed { url, status, stderr, hint } => {
+                write!(f, "could not download {url} ({status}): {stderr}")?;
+                match hint {
+                    Some(hint) => write!(f, "\n{hint}"),
+                    None => Ok(()),
+                }
+            }
             UpdateError::Malformed(msg) => write!(f, "GitHub returned malformed data: {msg}"),
             UpdateError::ChecksumMissing { asset } => {
                 write!(f, "SHA256SUMS does not list {asset}; refusing to install an unlisted asset")
@@ -140,13 +142,42 @@ impl fmt::Display for UpdateError {
     }
 }
 
-fn curl_argv(url: &str) -> Vec<String> {
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+const STALL_TIMEOUT_SECS: u64 = 30;
+
+/// The bound that stops a wedged endpoint from hanging the command forever.
+///
+/// curl applies no timeout of its own by default, so without this a host that
+/// accepts the connection and then never answers leaves `tekops update` waiting
+/// with no output at all - `-s` suppresses even the progress meter. That is the
+/// same failure `http::agent` exists to prevent on the ureq side, and it was
+/// reproduced here against a black-hole socket.
+///
+/// It is a stall bound rather than `--max-time` on purpose: a release tarball
+/// is megabytes, and a slow but progressing download over a node's link must
+/// not be killed by a wall clock. `--speed-limit 1 --speed-time N` gives up
+/// only when nothing arrives for N seconds, which covers both a server that
+/// never sends headers and one that dies mid-transfer.
+fn stall_argv(stall_secs: u64) -> Vec<String> {
     vec![
+        "--connect-timeout".to_string(),
+        CONNECT_TIMEOUT_SECS.to_string(),
+        "--speed-limit".to_string(),
+        "1".to_string(),
+        "--speed-time".to_string(),
+        stall_secs.to_string(),
+    ]
+}
+
+fn curl_argv(url: &str) -> Vec<String> {
+    let mut argv = vec![
         "-fsSL".to_string(),
         "--proto".to_string(),
         "=https".to_string(),
-        url.to_string(),
-    ]
+    ];
+    argv.extend(stall_argv(STALL_TIMEOUT_SECS));
+    argv.push(url.to_string());
+    argv
 }
 
 /// The single HTTPS boundary. Every network read in this module goes through
@@ -170,9 +201,33 @@ fn fetch_with(program: &str, url: &str) -> Result<Vec<u8>, UpdateError> {
             url: url.to_string(),
             status: output.status.to_string(),
             stderr: sanitize(String::from_utf8_lossy(&output.stderr).trim()),
+            hint: None,
         });
     }
     Ok(output.stdout)
+}
+
+const ASSET_HINT: &str =
+    "if the version is real, there may be no asset published for this platform";
+const RELEASE_HINT: &str = "the repository may be private, or have no published releases";
+
+/// Attaches the reading that fits the hop that failed.
+///
+/// The same curl failure means different things at different URLs: a 404 on an
+/// asset points at the platform, a 404 on the release API points at the
+/// repository. Hanging one hint off every curl failure - which is what this
+/// used to do - sends the operator looking in the wrong place, and a private
+/// repo is exactly the case that produces the wrong one.
+fn with_hint(err: UpdateError, hint: &'static str) -> UpdateError {
+    match err {
+        UpdateError::CurlFailed { url, status, stderr, .. } => UpdateError::CurlFailed {
+            url,
+            status,
+            stderr,
+            hint: Some(hint),
+        },
+        other => other,
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -311,12 +366,16 @@ fn install_binary(src: &Path, dest: &Path) -> Result<(), UpdateError> {
         source: e.to_string(),
     };
 
-    fs::copy(src, &staged).map_err(not_writable)?;
-    if let Err(e) = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)) {
-        let _ = fs::remove_file(&staged);
-        return Err(not_writable(e));
-    }
-    if let Err(e) = fs::rename(&staged, dest) {
+    // One cleanup path covering all three steps rather than one per step: the
+    // copy itself can fail after creating the file (ENOSPC, a read error on
+    // the source), and cleaning up only in the steps after it left a partial
+    // .tekops-update-<pid> behind in a directory like /usr/local/bin.
+    let staging = (|| {
+        fs::copy(src, &staged)?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+        fs::rename(&staged, dest)
+    })();
+    if let Err(e) = staging {
         let _ = fs::remove_file(&staged);
         return Err(not_writable(e));
     }
@@ -357,7 +416,7 @@ pub fn check<F>(fetch: F) -> Result<CheckResult, UpdateError>
 where
     F: Fn(&str) -> Result<Vec<u8>, UpdateError>,
 {
-    let body = fetch(&latest_release_url())?;
+    let body = fetch(&latest_release_url()).map_err(|e| with_hint(e, RELEASE_HINT))?;
     let latest = tag_from_release_json(&body)?;
     let current = current_version().to_string();
     Ok(CheckResult {
@@ -384,7 +443,11 @@ where
     probe_writable(dir)?;
 
     let asset = asset_name(version, target);
-    let tarball = fetch(&download_url(version, &asset))?;
+    let tarball =
+        fetch(&download_url(version, &asset)).map_err(|e| with_hint(e, ASSET_HINT))?;
+    // No hint on SHA256SUMS: the URL in the message already says what is
+    // missing, and a release that has the tarball but not its checksums is not
+    // a platform problem.
     let sums = fetch(&download_url(version, "SHA256SUMS"))?;
     verify_checksum(&tarball, &sums, &asset)?;
 
@@ -527,8 +590,96 @@ mod tests {
             url: "https://example.invalid/x".into(),
             status: "exit status: 22".into(),
             stderr: crate::term::sanitize("boom\u{1b}[2Jgone"),
+            hint: None,
         };
         assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
+    }
+
+    /// The platform hint belongs to the asset download only. Attached to the
+    /// release-metadata call it points the operator at the wrong cause, which
+    /// is what a private repo produced in practice.
+    #[test]
+    fn each_hop_carries_the_hint_that_fits_it() {
+        let raw = || UpdateError::CurlFailed {
+            url: "https://example.invalid/x".into(),
+            status: "exit status: 22".into(),
+            stderr: "404".into(),
+            hint: None,
+        };
+        let bare = raw().to_string();
+        assert!(!bare.contains("this platform"), "unhinted failure claimed a cause: {bare}");
+
+        let asset = with_hint(raw(), ASSET_HINT).to_string();
+        assert!(asset.contains("no asset published for this platform"), "got {asset}");
+        assert!(!asset.contains("private"), "got {asset}");
+
+        let release = with_hint(raw(), RELEASE_HINT).to_string();
+        assert!(release.contains("private"), "got {release}");
+        assert!(!release.contains("this platform"), "got {release}");
+    }
+
+    /// A failure that is not a curl failure has no hop to describe, so
+    /// `with_hint` must leave it alone rather than reshaping it.
+    #[test]
+    fn with_hint_passes_other_errors_through() {
+        let err = with_hint(UpdateError::CurlMissing, ASSET_HINT);
+        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
+    }
+
+    /// curl applies no timeout of its own, so the argv this binary ships has to
+    /// carry the bound - the same invariant `production_agent_has_a_bounded_timeout`
+    /// asserts for the ureq side.
+    #[test]
+    fn curl_argv_carries_a_stall_bound() {
+        let argv = curl_argv("https://example.invalid/x");
+        let at = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+                .unwrap_or_else(|| panic!("{flag} missing from {argv:?}"))
+        };
+        assert_eq!(at("--connect-timeout"), CONNECT_TIMEOUT_SECS.to_string());
+        assert_eq!(at("--speed-limit"), "1");
+        assert_eq!(at("--speed-time"), STALL_TIMEOUT_SECS.to_string());
+
+        // Read the bound back off the argv rather than off the constant, so a
+        // value that curl would treat as "no bound" cannot ship unnoticed.
+        let stall: u64 = at("--speed-time").parse().expect("speed-time must be a number");
+        assert!(stall > 0 && stall <= 120, "{stall}s is not a useful stall bound");
+    }
+
+    /// The real repro: a host that accepts the connection and then never
+    /// answers. Without the stall bound curl waits forever and `-s` hides even
+    /// the progress meter, so the command looks frozen.
+    ///
+    /// It runs over plain http with a short injected stall, mirroring
+    /// `agent_with_timeout` in `http.rs`. The shipped `--proto =https` would
+    /// make curl reject an http test URL instantly and the deadline below would
+    /// then pass without ever exercising the timeout.
+    #[test]
+    fn a_wedged_endpoint_gives_up_instead_of_hanging() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept() {
+                held.push(conn);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let status = Command::new(CURL)
+            .args(["-fsS", "--proto", "=http"])
+            .args(stall_argv(1))
+            .arg(format!("http://127.0.0.1:{port}/x"))
+            .output()
+            .expect("curl should be on PATH for this suite")
+            .status;
+        let elapsed = started.elapsed();
+
+        assert!(!status.success(), "a silent endpoint must not look like a success");
+        assert!(elapsed.as_secs() < 10, "curl hung on a silent endpoint for {elapsed:?}");
     }
 
     const SUMS: &str = concat!(
@@ -775,7 +926,34 @@ mod tests {
         let err = result.expect_err("a read-only directory must fail the install");
         assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
         assert_eq!(contents, b"old binary", "the existing binary was damaged");
-        assert_eq!(leftovers.len(), 1, "staged debris left behind: {leftovers:?}");
+        assert_eq!(leftovers, ["tekops"], "staged debris left behind: {leftovers:?}");
+    }
+
+    /// The other side of the install: the copy succeeds and the rename fails.
+    /// The read-only case above never gets past the copy, so without this the
+    /// cleanup that runs after a staged file actually exists is never executed.
+    #[test]
+    fn a_failed_rename_removes_the_staged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("new");
+        std::fs::write(&src, b"new binary").unwrap();
+
+        // A non-empty directory where the binary should be: the copy and the
+        // chmod both succeed, then the rename cannot replace it.
+        let dest = dir.path().join("tekops");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("occupied"), b"x").unwrap();
+
+        let err = install_binary(&src, &dest).expect_err("the rename must fail");
+        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+
+        let staged: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tekops-update-"))
+            .collect();
+        assert!(staged.is_empty(), "staged file left behind: {staged:?}");
     }
 
     /// A fetch stand-in that serves a canned release: the API body, the
