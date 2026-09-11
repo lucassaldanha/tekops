@@ -62,7 +62,7 @@ identically to the published one.
 
 ## Usage
 
-    tekops logs [path]           # source defaults to teku
+    tekops logs [path]           # source defaults to teku; a bare path works
     tekops logs teku [path]      # defaults to /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE
     tekops logs besu [path]      # defaults to /var/log/besu/besu.log
     tekops logs -n 2000          # 2000 lines of scrollback instead of the default 500

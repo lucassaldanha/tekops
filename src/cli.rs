@@ -1,6 +1,6 @@
 use crate::beaconapi::{BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
 use crate::http::ApiError;
-use crate::logs::{resolve_log_path, stream_logs, LogSource};
+use crate::logs::{resolve_log_path, resolve_logs_target, stream_logs, LogSource};
 use crate::metrics::MetricsClient;
 use crate::protocol::classify_protocol;
 use crate::output::{
@@ -63,7 +63,8 @@ struct MetricArgs {
 enum Commands {
     /// Tail and colorize a Teku or Besu JSON log file (defaults to teku)
     Logs {
-        source: Option<LogSource>,
+        /// teku, besu, or a path to a log file (defaults to teku)
+        source: Option<String>,
         path: Option<PathBuf>,
         /// Lines of existing log to show before following new output
         #[arg(short = 'n', long = "lines", default_value_t = 500)]
@@ -152,9 +153,13 @@ enum DutiesKind {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Logs { source, path, lines } => {
-            run_logs(source.unwrap_or(LogSource::Teku), path, lines)
-        }
+        Commands::Logs { source, path, lines } => match resolve_logs_target(source, path) {
+            Ok((source, path)) => run_logs(source, path, lines),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::Beacon { command, api } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             run_beacon(client, command, api.json)
@@ -613,10 +618,30 @@ mod tests {
     #[test]
     fn logs_with_explicit_source_still_parses() {
         let cli = Cli::try_parse_from(["tekops", "logs", "besu"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Logs { source: Some(LogSource::Besu), path: None, .. }
-        ));
+        match cli.command {
+            Commands::Logs { source, path, .. } => {
+                assert_eq!(source.as_deref(), Some("besu"));
+                assert_eq!(path, None);
+            }
+            _ => panic!("expected a Logs command"),
+        }
+    }
+
+    // Regression: clap used to type this positional as a LogSource, so a bare
+    // path was rejected outright with "invalid value for [SOURCE]" despite
+    // being the form the README documents. Meaning is assigned by
+    // logs::resolve_logs_target, which is where the behaviour is tested; this
+    // only asserts the parser lets a path through at all.
+    #[test]
+    fn logs_accepts_a_bare_path_as_the_first_positional() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "/var/log/x.log"]).unwrap();
+        match cli.command {
+            Commands::Logs { source, path, .. } => {
+                assert_eq!(source.as_deref(), Some("/var/log/x.log"));
+                assert_eq!(path, None);
+            }
+            _ => panic!("expected a Logs command"),
+        }
     }
 
     // Commands deliberately doesn't derive Debug, so these match rather than
@@ -646,7 +671,7 @@ mod tests {
             Cli::try_parse_from(["tekops", "logs", "besu", "/tmp/x.log", "-n", "7"]).unwrap();
         match cli.command {
             Commands::Logs { source, path, lines } => {
-                assert!(matches!(source, Some(LogSource::Besu)));
+                assert_eq!(source.as_deref(), Some("besu"));
                 assert_eq!(path, Some(PathBuf::from("/tmp/x.log")));
                 assert_eq!(lines, 7);
             }

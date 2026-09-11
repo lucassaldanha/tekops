@@ -64,6 +64,42 @@ impl LogSource {
     }
 }
 
+/// Splits the two positionals of `tekops logs` into a source and an optional
+/// path. The first one is either a source name or a path, which is why `cli`
+/// takes it as a `String` rather than letting clap type it as a `LogSource`:
+/// doing that made `tekops logs /var/log/x.log` fail with "invalid value for
+/// [SOURCE]" even though it is the form the README documents.
+///
+/// A file actually named `teku` or `besu` is read as a source, not a path.
+/// That ambiguity is inherent to the two-meanings-one-slot design; `./teku`
+/// disambiguates it.
+pub fn resolve_logs_target(
+    first: Option<String>,
+    second: Option<PathBuf>,
+) -> Result<(LogSource, Option<PathBuf>), String> {
+    let Some(first) = first else {
+        return Ok((LogSource::Teku, None));
+    };
+
+    // Matched by hand, and case-sensitively, to keep exactly the set of names
+    // the `ValueEnum` accepted before this function existed.
+    let source = match first.as_str() {
+        "teku" => Some(LogSource::Teku),
+        "besu" => Some(LogSource::Besu),
+        _ => None,
+    };
+
+    match (source, second) {
+        (Some(source), second) => Ok((source, second)),
+        (None, None) => Ok((LogSource::Teku, Some(PathBuf::from(first)))),
+        (None, Some(second)) => Err(format!(
+            "expected a source (teku or besu) or a single path, but got two paths: '{}' and '{}'",
+            first,
+            second.display()
+        )),
+    }
+}
+
 /// Resolves the log file path for `tekops logs`: an explicit positional
 /// `path` wins, then `$TEKOPS_LOGS_FILE` (Teku only, since that's the source
 /// this env var's own fallback value describes), then the source's default.
@@ -198,5 +234,63 @@ mod tests {
     fn resolve_log_path_ignores_env_var_for_besu() {
         let path = resolve_log_path(LogSource::Besu, None, Some("/env.log".to_string()));
         assert_eq!(path, PathBuf::from("/var/log/besu/besu.log"));
+    }
+
+    // The first positional of `tekops logs` is either a source name or a
+    // path. Typing it as LogSource made `tekops logs /var/log/x.log` fail
+    // with "invalid value for [SOURCE]" even though the README documented
+    // exactly that form.
+
+    #[test]
+    fn resolve_logs_target_defaults_to_teku_with_no_positionals() {
+        let (source, path) = resolve_logs_target(None, None).unwrap();
+        assert!(matches!(source, LogSource::Teku));
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn resolve_logs_target_reads_a_bare_path_as_a_teku_path() {
+        let (source, path) = resolve_logs_target(Some("/var/log/x.log".into()), None).unwrap();
+        assert!(matches!(source, LogSource::Teku));
+        assert_eq!(path, Some(PathBuf::from("/var/log/x.log")));
+    }
+
+    #[test]
+    fn resolve_logs_target_still_reads_an_explicit_source() {
+        let (source, path) = resolve_logs_target(Some("besu".into()), None).unwrap();
+        assert!(matches!(source, LogSource::Besu));
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn resolve_logs_target_reads_a_source_and_path_pair() {
+        let (source, path) =
+            resolve_logs_target(Some("besu".into()), Some(PathBuf::from("/b.log"))).unwrap();
+        assert!(matches!(source, LogSource::Besu));
+        assert_eq!(path, Some(PathBuf::from("/b.log")));
+    }
+
+    #[test]
+    fn resolve_logs_target_rejects_two_paths() {
+        let err = resolve_logs_target(Some("/a.log".into()), Some(PathBuf::from("/b.log")))
+            .unwrap_err();
+        assert!(err.contains("/a.log"), "got {err:?}");
+        assert!(err.contains("/b.log"), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_logs_target_treats_an_unknown_word_as_a_relative_path() {
+        // Not a source name, so it is a path, even without a leading slash.
+        let (source, path) = resolve_logs_target(Some("teku.log".into()), None).unwrap();
+        assert!(matches!(source, LogSource::Teku));
+        assert_eq!(path, Some(PathBuf::from("teku.log")));
+    }
+
+    #[test]
+    fn resolve_logs_target_is_case_sensitive_like_the_old_value_enum() {
+        // "TEKU" was rejected before this change; it stays a path rather than
+        // silently gaining a case-insensitive match the old parser never had.
+        let (_, path) = resolve_logs_target(Some("TEKU".into()), None).unwrap();
+        assert_eq!(path, Some(PathBuf::from("TEKU")));
     }
 }
