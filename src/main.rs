@@ -7,6 +7,7 @@ mod metrics;
 mod output;
 mod protocol;
 mod term;
+mod update;
 
 use std::process::ExitCode;
 
