@@ -8,9 +8,11 @@ use crate::output::{
     format_peers_table, format_proposer_duties, format_validator_metrics_table,
     format_validators_table, format_version_table, PeerRow,
 };
+use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::env;
+use std::fmt;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -118,6 +120,17 @@ enum Commands {
         #[command(flatten)]
         api: ApiArgs,
     },
+    /// Update the tekops binary itself from GitHub releases
+    Update {
+        /// check, latest, or a version (e.g. 0.3.0); omit to check and confirm
+        target: Option<String>,
+        /// Print a JSON summary instead of a table (applies to `check`)
+        #[arg(long)]
+        json: bool,
+        /// Install without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,6 +205,9 @@ pub fn run() -> ExitCode {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
         }
+        Commands::Update { target, json, yes } => {
+            exit_for(run_update(resolve_update_target(target), json, yes))
+        }
     }
 }
 
@@ -207,7 +223,9 @@ fn resolve_metric_url(metric_url: Option<String>) -> String {
         .unwrap_or_else(|| "http://localhost:8010/metrics".to_string())
 }
 
-fn exit_for(result: Result<(), ApiError>) -> ExitCode {
+/// Generic over the error type so `UpdateError` shares the exit path with
+/// `ApiError` rather than duplicating it.
+fn exit_for<E: fmt::Display>(result: Result<(), E>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -377,6 +395,62 @@ fn beacon_log_level(
             None => println!("log level set to {level} (global)"),
         }
     }
+    Ok(())
+}
+
+fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateError> {
+    match target {
+        UpdateTarget::Check => {
+            let result = update::check(update::fetch)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result)
+                        .map_err(|e| UpdateError::Io(e.to_string()))?
+                );
+            } else if result.update_available {
+                println!("tekops {} is available (running {})", result.latest, result.current);
+            } else {
+                println!("already on {} (latest)", result.current);
+            }
+            Ok(())
+        }
+        UpdateTarget::Prompt | UpdateTarget::Latest => {
+            let prompt = matches!(target, UpdateTarget::Prompt);
+            let result = update::check(update::fetch)?;
+            if !result.update_available {
+                println!("already on {} (latest)", result.current);
+                return Ok(());
+            }
+            if prompt && !yes && !confirm(&result.current, &result.latest)? {
+                println!("aborted");
+                return Ok(());
+            }
+            install_version(&result.latest)
+        }
+        // An explicit tag means "make the binary be exactly this", which is
+        // both the rollback path and the repair path for a corrupt install, so
+        // it neither prompts nor refuses to go backwards.
+        UpdateTarget::Version(version) => install_version(&version),
+    }
+}
+
+fn confirm(current: &str, latest: &str) -> Result<bool, UpdateError> {
+    print!("update tekops {current} -> {latest}? [y/N] ");
+    io::stdout().flush().map_err(|e| UpdateError::Io(e.to_string()))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| UpdateError::Io(e.to_string()))?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
+fn install_version(version: &str) -> Result<(), UpdateError> {
+    let dest = env::current_exe().map_err(|e| UpdateError::Io(e.to_string()))?;
+    println!("downloading tekops {version} for {}...", dest.display());
+    update::install(update::fetch, version, &dest)?;
+    println!("installed tekops {version}");
     Ok(())
 }
 
@@ -985,5 +1059,51 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["level"], "DEBUG");
         assert!(value.get("log_filter").is_none());
+    }
+
+    #[test]
+    fn update_takes_no_argument() {
+        let cli = Cli::try_parse_from(["tekops", "update"]).unwrap();
+        match cli.command {
+            Commands::Update { target, json, yes } => {
+                assert_eq!(target, None);
+                assert!(!json);
+                assert!(!yes);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    /// `check` and `latest` are positional values, not subcommands. Declaring
+    /// them as subcommands alongside an optional positional version is the
+    /// same ambiguity that broke `tekops logs /var/log/x.log`.
+    #[test]
+    fn update_accepts_check_latest_and_a_version() {
+        for arg in ["check", "latest", "0.3.0", "v0.3.0"] {
+            let cli = Cli::try_parse_from(["tekops", "update", arg]).unwrap();
+            match cli.command {
+                Commands::Update { target, .. } => assert_eq!(target.as_deref(), Some(arg)),
+                _ => panic!("expected Update for {arg}"),
+            }
+        }
+    }
+
+    #[test]
+    fn update_accepts_its_flags() {
+        let cli = Cli::try_parse_from(["tekops", "update", "check", "--json"]).unwrap();
+        match cli.command {
+            Commands::Update { json, .. } => assert!(json),
+            _ => panic!("expected Update"),
+        }
+        let cli = Cli::try_parse_from(["tekops", "update", "-y"]).unwrap();
+        match cli.command {
+            Commands::Update { yes, .. } => assert!(yes),
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn update_rejects_a_second_positional() {
+        assert!(Cli::try_parse_from(["tekops", "update", "check", "0.3.0"]).is_err());
     }
 }

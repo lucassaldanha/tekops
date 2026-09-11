@@ -6,8 +6,6 @@
 //! and GitHub is HTTPS-only, so the transport has to come from somewhere that
 //! is not this binary. `curl` is documented as a runtime dependency alongside
 //! `tail`, `less`, and `tar`.
-#![allow(dead_code)]
-// Removed in the final task of the self-update work, once cli.rs consumes every item here.
 
 use crate::term::sanitize;
 use serde::{Deserialize, Serialize};
