@@ -108,6 +108,7 @@ screen, so searching covers all of them from the moment the session starts.
     tekops version
     tekops log-level <LEVEL> [--filter=org.example ...]
     tekops about
+    tekops autocomplete [bash|zsh|fish]
 
 Every `beacon` subcommand, plus `peers`, `health`, `head`, and `log-level`,
 accepts `--json` to print a JSON-serialized version of the parsed response
@@ -191,6 +192,45 @@ The Protocol column is derived from each peer's `last_seen_p2p_address`
 multiaddr (QUIC if it advertises a `/quic` component, TCP otherwise) rather
 than the peer's ENR, which the Beacon API doesn't reliably populate.
 
+## Shell completion
+
+    tekops autocomplete           # detect the shell from $SHELL, show the plan, confirm
+    tekops autocomplete zsh       # install for a named shell (bash, zsh, or fish)
+    tekops autocomplete zsh -y    # skip the confirmation
+    tekops autocomplete zsh --print   # write the script to stdout, install nothing
+
+Nothing is written until you have seen exactly what will be written and said
+yes. Re-running is safe: the completion script is rewritten, and the rc stanza
+is added once and then recognized and left alone.
+
+What lands where, per shell:
+
+| Shell | Completion script | rc file |
+|-------|-------------------|---------|
+| bash  | `~/.local/share/bash-completion/completions/tekops` | one guarded `source` line |
+| zsh   | `~/.zfunc/_tekops` | `fpath` + `compinit` stanza |
+| fish  | `~/.config/fish/completions/tekops.fish` | none needed |
+
+`$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are honoured where they apply. On
+macOS the bash stanza goes to `~/.bash_profile` rather than `~/.bashrc`,
+because Terminal starts bash as a login shell and a login bash never reads
+`.bashrc`.
+
+bash gets a `source` line even though its directory is `bash-completion`'s own
+auto-loading one, because that package is not installed by default on macOS,
+whose system bash is 3.2. The generated script is self-contained, so sourcing
+it directly works either way.
+
+Start a new shell to pick the completions up.
+
+To remove them, delete the completion script and the three marked lines from
+your rc file. There is no uninstall command.
+
+The script is generated from the CLI definition at the moment you run the
+command, so it can never drift from the commands tekops actually has. It is
+still a snapshot on disk, so `tekops update` re-renders any completion script
+you already have installed, using the newly installed binary.
+
 ## Updating
 
     tekops update              # check, show current -> latest, confirm, install
@@ -215,3 +255,9 @@ TLS.
 If tekops lives in a root-owned directory such as `/usr/local/bin`, run the
 update under `sudo`. It checks for write access before downloading anything,
 so the wrong invocation fails immediately.
+
+After a successful install, any shell completion script you already have is
+re-rendered by running the new binary, so a release that adds a command does
+not leave you completing the old set. Nothing is installed that was not there
+before, and no rc file is touched. If that step fails the update still
+succeeded - it prints a warning naming `tekops autocomplete` as the fix.
