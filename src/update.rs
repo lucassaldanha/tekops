@@ -10,6 +10,7 @@
 // Removed in the final task of the self-update work, once cli.rs consumes every item here.
 
 use crate::term::sanitize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -322,6 +323,77 @@ fn install_binary(src: &Path, dest: &Path) -> Result<(), UpdateError> {
         return Err(not_writable(e));
     }
     Ok(())
+}
+
+/// The tekops build that is running, which is a different question from
+/// `tekops version` (the running Teku's version, read from the metrics
+/// endpoint).
+pub fn current_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckResult {
+    pub current: String,
+    pub latest: String,
+    pub update_available: bool,
+}
+
+#[derive(Deserialize)]
+struct ReleaseJson {
+    tag_name: String,
+}
+
+fn tag_from_release_json(body: &[u8]) -> Result<String, UpdateError> {
+    let release: ReleaseJson = serde_json::from_slice(body)
+        .map_err(|e| UpdateError::Malformed(format!("release metadata: {e}")))?;
+    Ok(normalize_version(&release.tag_name))
+}
+
+/// Asks GitHub what the newest release is and compares it to this build.
+///
+/// "Available" means "different from what is running", not "greater than":
+/// tekops has no version-ordering logic and does not need any, since the only
+/// way to end up below the latest release is to be behind it.
+pub fn check<F>(fetch: F) -> Result<CheckResult, UpdateError>
+where
+    F: Fn(&str) -> Result<Vec<u8>, UpdateError>,
+{
+    let body = fetch(&latest_release_url())?;
+    let latest = tag_from_release_json(&body)?;
+    let current = current_version().to_string();
+    Ok(CheckResult {
+        update_available: latest != current,
+        current,
+        latest,
+    })
+}
+
+/// Downloads, verifies, smoke-tests, and installs one specific version.
+///
+/// Ordering is load-bearing: the writability probe runs before any download so
+/// a non-root invocation fails immediately, and every check happens in a
+/// TempDir so `dest` is untouched until the single rename at the end. Every
+/// early return above that rename leaves a working tekops in place.
+pub fn install<F>(fetch: F, version: &str, dest: &Path) -> Result<(), UpdateError>
+where
+    F: Fn(&str) -> Result<Vec<u8>, UpdateError>,
+{
+    let target = TARGET.ok_or(UpdateError::UnsupportedTarget)?;
+    let dir = dest
+        .parent()
+        .ok_or_else(|| UpdateError::Io(format!("{} has no parent directory", dest.display())))?;
+    probe_writable(dir)?;
+
+    let asset = asset_name(version, target);
+    let tarball = fetch(&download_url(version, &asset))?;
+    let sums = fetch(&download_url(version, "SHA256SUMS"))?;
+    verify_checksum(&tarball, &sums, &asset)?;
+
+    let staging = tempfile::tempdir().map_err(|e| UpdateError::Io(e.to_string()))?;
+    let binary = extract_binary(&tarball, staging.path())?;
+    smoke_test(&binary, version)?;
+    install_binary(&binary, dest)
 }
 
 #[cfg(test)]
@@ -706,5 +778,124 @@ mod tests {
         assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
         assert_eq!(contents, b"old binary", "the existing binary was damaged");
         assert_eq!(leftovers.len(), 1, "staged debris left behind: {leftovers:?}");
+    }
+
+    /// A fetch stand-in that serves a canned release: the API body, the
+    /// tarball, and SHA256SUMS, keyed by URL suffix.
+    fn canned_fetch(
+        version: &str,
+        tarball: Vec<u8>,
+        sums: String,
+    ) -> impl Fn(&str) -> Result<Vec<u8>, UpdateError> {
+        let version = version.to_string();
+        move |url: &str| {
+            if url.ends_with("/releases/latest") {
+                Ok(format!(r#"{{"tag_name":"v{version}"}}"#).into_bytes())
+            } else if url.ends_with("SHA256SUMS") {
+                Ok(sums.clone().into_bytes())
+            } else if url.ends_with(".tar.gz") {
+                Ok(tarball.clone())
+            } else {
+                panic!("unexpected url {url}")
+            }
+        }
+    }
+
+    fn canned_release(version: &str) -> (Vec<u8>, String) {
+        let tarball = release_tarball(&version_script(&format!("tekops {version}")));
+        let asset = asset_name(version, TARGET.expect("test host must be a release target"));
+        let sums = format!("{}  {asset}\n", sha256_hex(&tarball));
+        (tarball, sums)
+    }
+
+    #[test]
+    fn check_reports_a_newer_release_as_available() {
+        let fetch = canned_fetch("99.0.0", Vec::new(), String::new());
+        let result = check(fetch).expect("check should succeed");
+        assert_eq!(result.latest, "99.0.0");
+        assert_eq!(result.current, current_version());
+        assert!(result.update_available);
+    }
+
+    #[test]
+    fn check_reports_the_running_version_as_up_to_date() {
+        let fetch = canned_fetch(current_version(), Vec::new(), String::new());
+        let result = check(fetch).expect("check should succeed");
+        assert!(!result.update_available);
+    }
+
+    #[test]
+    fn check_rejects_a_malformed_release_body() {
+        let err = check(|_: &str| Ok(b"not json".to_vec())).expect_err("must reject");
+        assert!(matches!(err, UpdateError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_fetch_failure_propagates() {
+        let err = check(|_: &str| Err(UpdateError::CurlMissing)).expect_err("must propagate");
+        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
+    }
+
+    #[test]
+    fn install_places_the_verified_binary_at_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tekops");
+        std::fs::write(&dest, b"old binary").unwrap();
+        let (tarball, sums) = canned_release("0.3.0");
+
+        install(canned_fetch("0.3.0", tarball, sums), "0.3.0", &dest)
+            .expect("install should succeed");
+
+        let installed = std::fs::read_to_string(&dest).unwrap();
+        assert!(installed.contains("tekops 0.3.0"), "got {installed:?}");
+    }
+
+    #[test]
+    fn install_aborts_on_a_checksum_mismatch_without_touching_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tekops");
+        std::fs::write(&dest, b"old binary").unwrap();
+        let (tarball, _) = canned_release("0.3.0");
+        let asset = asset_name("0.3.0", TARGET.unwrap());
+        let wrong_sums = format!("{}  {asset}\n", "6".repeat(64));
+
+        let err = install(canned_fetch("0.3.0", tarball, wrong_sums), "0.3.0", &dest)
+            .expect_err("a mismatch must abort");
+
+        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }), "got {err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
+    }
+
+    #[test]
+    fn install_aborts_when_the_asset_is_not_listed_in_sha256sums() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tekops");
+        std::fs::write(&dest, b"old binary").unwrap();
+        let (tarball, _) = canned_release("0.3.0");
+        let sums = "7777777777777777777777777777777777777777777777777777777777777777  something-else.tar.gz\n".to_string();
+
+        let err = install(canned_fetch("0.3.0", tarball, sums), "0.3.0", &dest)
+            .expect_err("an unlisted asset must abort");
+
+        assert!(matches!(err, UpdateError::ChecksumMissing { .. }), "got {err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
+    }
+
+    #[test]
+    fn install_aborts_when_the_downloaded_binary_reports_the_wrong_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("tekops");
+        std::fs::write(&dest, b"old binary").unwrap();
+
+        // A tarball built for 9.9.9, offered as if it were 0.3.0.
+        let tarball = release_tarball(&version_script("tekops 9.9.9"));
+        let asset = asset_name("0.3.0", TARGET.unwrap());
+        let sums = format!("{}  {asset}\n", sha256_hex(&tarball));
+
+        let err = install(canned_fetch("0.3.0", tarball, sums), "0.3.0", &dest)
+            .expect_err("a version mismatch must abort");
+
+        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
     }
 }
