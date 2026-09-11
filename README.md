@@ -91,6 +91,13 @@ question from `tekops version` (the running Teku's version, below).
 Every network command gives up after 10 seconds rather than waiting forever
 on a node that accepts the connection but never answers.
 
+`tekops` is built without a TLS backend, so `--api-url` and `--metric-url`
+must be `http://` URLs. It is meant to run on the node against its own local
+endpoints, and dropping TLS removes `rustls` and `ring` (and all C
+compilation) from the build, cutting the binary roughly in half. An `https://`
+URL fails immediately with `cannot make HTTPS request because no TLS backend
+is configured` rather than doing anything surprising.
+
 `duties`, `validators`, and `version` all read the validator client's own
 Prometheus `/metrics` page instead of the Beacon API - they accept `--json`,
 plus `--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default
