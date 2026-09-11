@@ -402,7 +402,7 @@ fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
     // the signal, skipping that cleanup entirely: `tail` (isolated into its own
     // process group above, specifically so Ctrl+C can't reach it) would be
     // orphaned and keep running forever, and the temp file backing `less` would
-    // never be removed — a real leak, one per dropped session, not hypothetical.
+    // never be removed - a real leak, one per dropped session, not hypothetical.
     // Failing to install this is not cosmetic: it silently reverts the process
     // to the exact behaviour the handler exists to prevent - Ctrl+C kills
     // tekops mid-session, leaving `tail` (deliberately in its own process
@@ -433,7 +433,7 @@ fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
     // `less` is fed through a real temp file rather than piped directly into its
     // stdin. A pipe has no knowable end short of reading more of it, so a search
     // for text that isn't in the buffer yet leaves `less` unable to tell "not
-    // found" from "not yet written" — it blocks waiting for more input rather
+    // found" from "not yet written" - it blocks waiting for more input rather
     // than reporting no match, indistinguishable from a hang. A real file has a
     // stat()-able size, so `less` can tell those two cases apart and searches
     // that miss return immediately instead of freezing the pager.
