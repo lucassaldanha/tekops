@@ -11,8 +11,9 @@
 
 use crate::term::sanitize;
 use std::fmt;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REPO: &str = "lucassaldanha/tekops";
@@ -212,9 +213,72 @@ fn verify_checksum(tarball: &[u8], sums: &[u8], asset: &str) -> Result<(), Updat
     Ok(())
 }
 
+/// Unpacks a release tarball into `dir` and returns the path to the binary.
+///
+/// `tar` is shelled out to rather than pulled in as a crate, consistent with
+/// how this binary already depends on `tail`, `less`, and `curl`, and avoiding
+/// a tar plus flate2 stack for one call.
+fn extract_binary(tarball: &[u8], dir: &Path) -> Result<PathBuf, UpdateError> {
+    let archive = dir.join("tekops.tar.gz");
+    fs::write(&archive, tarball).map_err(|e| UpdateError::Io(e.to_string()))?;
+
+    let output = Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(dir)
+        .output()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => UpdateError::TarMissing,
+            _ => UpdateError::Io(e.to_string()),
+        })?;
+
+    if !output.status.success() {
+        return Err(UpdateError::ExtractFailed(sanitize(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+
+    let binary = dir.join("tekops");
+    if !binary.is_file() {
+        return Err(UpdateError::ExtractFailed(
+            "the archive did not contain a tekops binary".to_string(),
+        ));
+    }
+    Ok(binary)
+}
+
+/// Runs the downloaded binary before it replaces the working one, so a corrupt
+/// or wrong-architecture build is caught while the old binary is still in
+/// place. This is not a security control - a hostile asset executes either
+/// way; it is a guard against installing something that cannot run.
+fn smoke_test(binary: &Path, expected_version: &str) -> Result<(), UpdateError> {
+    let output = Command::new(binary)
+        .arg("--version")
+        .output()
+        .map_err(|e| UpdateError::SmokeTestFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(UpdateError::SmokeTestFailed(format!(
+            "`tekops --version` exited with {}",
+            output.status
+        )));
+    }
+
+    let reported = sanitize(String::from_utf8_lossy(&output.stdout).trim());
+    let expected = format!("tekops {expected_version}");
+    if reported != expected {
+        return Err(UpdateError::SmokeTestFailed(format!(
+            "it reports `{reported}`, expected `{expected}`"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn no_argument_means_prompt() {
@@ -425,5 +489,103 @@ mod tests {
         let err = verify_checksum(b"x", SUMS.as_bytes(), "tekops-v9.9.9-nope.tar.gz")
             .expect_err("an unlisted asset must not verify");
         assert!(matches!(err, UpdateError::ChecksumMissing { .. }), "got {err:?}");
+    }
+
+    /// Builds a tarball shaped like a real release asset: `tekops`,
+    /// `README.md`, and `LICENSE` flat at the archive root.
+    fn release_tarball(script: &str) -> Vec<u8> {
+        let stage = tempfile::tempdir().unwrap();
+        let binary = stage.path().join("tekops");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(stage.path().join("README.md"), "readme").unwrap();
+        std::fs::write(stage.path().join("LICENSE"), "license").unwrap();
+
+        let out = stage.path().join("out.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&out)
+            .arg("-C")
+            .arg(stage.path())
+            .args(["tekops", "README.md", "LICENSE"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(&out).unwrap()
+    }
+
+    fn version_script(output: &str) -> String {
+        format!("#!/bin/sh\necho '{output}'\n")
+    }
+
+    #[test]
+    fn the_binary_is_extracted_from_a_release_shaped_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = release_tarball(&version_script("tekops 0.3.0"));
+        let binary = extract_binary(&tarball, dir.path()).expect("extraction should succeed");
+        assert_eq!(binary.file_name().unwrap(), "tekops");
+        assert!(binary.is_file());
+    }
+
+    #[test]
+    fn an_archive_without_a_tekops_binary_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        std::fs::write(stage.path().join("README.md"), "readme").unwrap();
+        let out = stage.path().join("out.tar.gz");
+        std::process::Command::new("tar")
+            .arg("-czf").arg(&out).arg("-C").arg(stage.path()).arg("README.md")
+            .status().unwrap();
+        let tarball = std::fs::read(&out).unwrap();
+
+        let err = extract_binary(&tarball, dir.path()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::ExtractFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn garbage_that_is_not_a_tarball_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_binary(b"not a tarball at all", dir.path()).expect_err("must reject");
+        assert!(matches!(err, UpdateError::ExtractFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_binary_reporting_the_expected_version_passes_the_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = release_tarball(&version_script("tekops 0.3.0"));
+        let binary = extract_binary(&tarball, dir.path()).unwrap();
+        assert!(smoke_test(&binary, "0.3.0").is_ok());
+    }
+
+    /// Catches a corrupt or wrong-architecture build before it replaces a
+    /// working binary. Not a security control: the downloaded binary runs
+    /// either way.
+    #[test]
+    fn a_binary_reporting_the_wrong_version_fails_the_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = release_tarball(&version_script("tekops 9.9.9"));
+        let binary = extract_binary(&tarball, dir.path()).unwrap();
+        let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
+        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_binary_that_exits_nonzero_fails_the_smoke_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = release_tarball("#!/bin/sh\nexit 1\n");
+        let binary = extract_binary(&tarball, dir.path()).unwrap();
+        let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
+        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+    }
+
+    /// The smoke-tested binary's stdout is untrusted and goes into an error
+    /// that gets printed to the terminal.
+    #[test]
+    fn smoke_test_output_is_sanitized_into_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball = release_tarball("#!/bin/sh\nprintf 'tekops \\033[2J9.9.9\\n'\n");
+        let binary = extract_binary(&tarball, dir.path()).unwrap();
+        let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
+        assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
     }
 }
