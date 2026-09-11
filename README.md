@@ -38,6 +38,21 @@ download instead of `curl`:
 
     gh release download "v$VERSION" -p "tekops-v$VERSION-$TARGET.tar.gz"
 
+## Requirements
+
+tekops shells out to a few standard tools rather than reimplementing them.
+All of them are present on a default Debian/Ubuntu install.
+
+| Tool | Needed by | Why |
+| --- | --- | --- |
+| `tail` | `tekops logs` | follows the log file |
+| `less` | `tekops logs` | the pager, with scrollback and search |
+| `curl` | `tekops update` | HTTPS to GitHub - tekops itself is built without a TLS stack |
+| `tar` | `tekops update` | unpacks the release tarball |
+
+Everything else is statically linked into the binary; nothing but that one
+file needs to reach the node.
+
 ## Build
 
     cargo build --release
@@ -165,3 +180,28 @@ the total peer count, rather than one row per peer:
 The Protocol column is derived from each peer's `last_seen_p2p_address`
 multiaddr (QUIC if it advertises a `/quic` component, TCP otherwise) rather
 than the peer's ENR, which the Beacon API doesn't reliably populate.
+
+## Updating
+
+    tekops update              # check, show current -> latest, confirm, install
+    tekops update check        # check only, never installs
+    tekops update latest       # install the latest release, no prompt
+    tekops update 0.3.0        # install that exact release, no prompt
+
+An explicit version installs exactly that, older or newer, so
+`tekops update <previous-version>` is also the rollback.
+
+`tekops update check --json` prints
+`{"current":"0.3.1","latest":"0.4.0","update_available":true}` and exits 0
+whether or not an update exists - 0 means the check succeeded.
+
+The download is verified against the release's `SHA256SUMS` and the new binary
+is run once with `--version` before it replaces anything, so a failed update
+leaves the working binary in place. Note what the checksum proves: it is
+fetched from the same release as the tarball, so it catches corruption and a
+wrong-platform asset, not a compromised repository. The channel guarantee is
+TLS.
+
+If tekops lives in a root-owned directory such as `/usr/local/bin`, run the
+update under `sudo`. It checks for write access before downloading anything,
+so the wrong invocation fails immediately.
