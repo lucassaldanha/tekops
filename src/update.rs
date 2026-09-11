@@ -18,15 +18,26 @@ use std::process::{self, Command};
 
 const REPO: &str = "lucassaldanha/tekops";
 
-/// The release target triple for this build, or `None` on a host tekops does
+/// The release asset suffix for this build, or `None` on a host tekops does
 /// not publish for. Resolved at compile time so an unsupported host fails
 /// before any network call rather than 404-ing on a guessed asset name.
+///
+/// These are `<arch>-<os>`, not cargo target triples: the triple's vendor
+/// field ("unknown") says nothing, and "musl" is implied because every Linux
+/// build is static. The strings must match the `asset_target` values in
+/// `scripts/build-release.sh`, which is the only other place they appear -
+/// disagreement between the two makes `tekops update` 404 while the test
+/// suite stays green, since the tests compare this constant against itself.
+///
+/// Note these differ from the names used by releases up to v0.3.1, so
+/// `tekops update <version>` cannot reach those. That was the cheapest moment
+/// to change it: no released binary had `tekops update` at all.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub const TARGET: Option<&'static str> = Some("x86_64-unknown-linux-musl");
+pub const TARGET: Option<&'static str> = Some("x86_64-linux");
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-pub const TARGET: Option<&'static str> = Some("aarch64-unknown-linux-musl");
+pub const TARGET: Option<&'static str> = Some("aarch64-linux");
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub const TARGET: Option<&'static str> = Some("aarch64-apple-darwin");
+pub const TARGET: Option<&'static str> = Some("aarch64-macos");
 #[cfg(not(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
@@ -513,8 +524,23 @@ mod tests {
     #[test]
     fn asset_name_matches_what_build_release_produces() {
         assert_eq!(
-            asset_name("0.3.1", "aarch64-apple-darwin"),
-            "tekops-v0.3.1-aarch64-apple-darwin.tar.gz"
+            asset_name("0.4.0", "aarch64-macos"),
+            "tekops-v0.4.0-aarch64-macos.tar.gz"
+        );
+    }
+
+    /// Guards the one thing no other test can: that this constant still spells
+    /// the asset name `scripts/build-release.sh` actually publishes. The two
+    /// live in different languages and nothing but this test connects them, so
+    /// a rename on either side that forgets the other lands here rather than in
+    /// a 404 during a real update.
+    #[test]
+    fn target_matches_the_names_build_release_publishes() {
+        let script = include_str!("../scripts/build-release.sh");
+        let target = TARGET.expect("test host must be a release target");
+        assert!(
+            script.contains(&format!("asset_target=\"{target}\"")),
+            "build-release.sh publishes no asset named {target}"
         );
     }
 
@@ -683,8 +709,8 @@ mod tests {
     }
 
     const SUMS: &str = concat!(
-        "1111111111111111111111111111111111111111111111111111111111111111  tekops-v0.3.1-aarch64-apple-darwin.tar.gz\n",
-        "2222222222222222222222222222222222222222222222222222222222222222  tekops-v0.3.1-x86_64-unknown-linux-musl.tar.gz\n",
+        "1111111111111111111111111111111111111111111111111111111111111111  tekops-v0.4.0-aarch64-macos.tar.gz\n",
+        "2222222222222222222222222222222222222222222222222222222222222222  tekops-v0.4.0-x86_64-linux.tar.gz\n",
     );
 
     #[test]
@@ -698,7 +724,7 @@ mod tests {
     #[test]
     fn the_matching_line_is_found() {
         assert_eq!(
-            parse_sha256sums(SUMS, "tekops-v0.3.1-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            parse_sha256sums(SUMS, "tekops-v0.4.0-x86_64-linux.tar.gz").as_deref(),
             Some("2222222222222222222222222222222222222222222222222222222222222222")
         );
     }
@@ -717,8 +743,8 @@ mod tests {
     }
 
     /// Matching must be exact. A prefix match would let
-    /// `tekops-v0.3.1-aarch64-apple-darwin.tar.gz.sig` satisfy a request for
-    /// the tarball.
+    /// `tekops-v0.4.0-aarch64-macos.tar.gz.sig` satisfy a request for the
+    /// tarball.
     #[test]
     fn a_filename_that_merely_starts_with_ours_does_not_match() {
         let text = "3333333333333333333333333333333333333333333333333333333333333333  tekops.tar.gz.sig\n";

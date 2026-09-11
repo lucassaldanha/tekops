@@ -43,14 +43,24 @@ build_in_container() {
     cargo build --locked --release --target "$target"
 }
 
+# Each arm also names the published asset. Release assets are named
+# <arch>-<os> rather than by the cargo target triple: the triple's vendor
+# field ("unknown") carries no information, and "musl" is implied because
+# every Linux build here is static. The mapping lives inside the case that
+# already dispatches per target so a new target cannot be added without
+# choosing its asset name - `src/update.rs`'s TARGET constants must agree
+# with these strings or `tekops update` 404s.
 case "$target" in
   x86_64-unknown-linux-musl)
+    asset_target="x86_64-linux"
     build_in_container "$IMAGE_X86_64"
     ;;
   aarch64-unknown-linux-musl)
+    asset_target="aarch64-linux"
     build_in_container "$IMAGE_AARCH64"
     ;;
   aarch64-apple-darwin)
+    asset_target="aarch64-macos"
     # No macOS containers exist, so this one builds on the host/runner.
     # It gets the same pinned toolchain and locked inputs, but the SDK
     # underneath is whatever the runner ships.
@@ -73,7 +83,7 @@ trap 'rm -rf "$stage"' EXIT
 cp "$binary" "$stage/tekops"
 cp README.md LICENSE "$stage/"
 
-tarball="dist/tekops-v$version-$target.tar.gz"
+tarball="dist/tekops-v$version-$asset_target.tar.gz"
 tar -czf "$tarball" -C "$stage" tekops README.md LICENSE
 
 # The reproducibility claim is about the binary, not the archive: tar

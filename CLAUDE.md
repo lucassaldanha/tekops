@@ -24,7 +24,7 @@ cargo clippy --all-targets   # lint
 
 ```bash
 scripts/build-release.sh x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin
-scp dist/tekops-v*-x86_64-unknown-linux-musl.tar.gz <node>:
+scp dist/tekops-v*-x86_64-linux.tar.gz <node>:
 ```
 
 Don't hand-roll a `docker run` for this any more; the script is what CI runs, and a hand-typed variant produces a binary that won't hash the same. **This dev machine's Rust is Homebrew-installed, not `rustup`** - there is no `rustup target add`, and the `cross` tool doesn't work either (it shells out to `rustup toolchain list` even though the actual build runs in Docker), which is why the Linux targets build inside a container at all. The script forces `--platform linux/amd64` since this machine is Apple Silicon and Docker would otherwise pick an `aarch64` image.
@@ -41,6 +41,8 @@ Four things here are load-bearing and each closes a specific hole:
 - **`rust-toolchain.toml` pins an exact version, never `stable`.** It is a rustup feature, and this dev machine runs Homebrew Rust, so it is silently ignored on a bare host build and governs only CI and the containers - verified: the image bundles Rust 1.96.1 but `rustc --version` inside it reports the pinned 1.98.0. Local reproducibility checks must therefore go through `scripts/build-release.sh`, not a host `cargo build`. Neither workflow installs a toolchain of its own, precisely so this file stays the only source of truth.
 - **Every build passes `--locked`**, so a drifted `Cargo.lock` fails the build instead of quietly resolving a different dependency graph.
 - **The release job depends on every build job.** A macOS failure means no release at all, including the Linux binaries. Assets that disagree about which platforms a version supports are worse than no assets.
+
+**Release assets are named `<arch>-<os>`, not by the cargo target triple.** `scripts/build-release.sh` still *takes* a triple (it has to - it passes it to `cargo build --target`), but each arm of its `case` also sets `asset_target`, so `x86_64-unknown-linux-musl` ships as `tekops-v<version>-x86_64-linux.tar.gz`. The triple's vendor field ("unknown") carries no information, and "musl" is implied because every Linux build here is static. Two consequences worth knowing before touching either side: the strings in that `case` must match `update.rs`'s `TARGET` constants exactly or `tekops update` 404s, which is why `target_matches_the_names_build_release_publishes` reads the script and asserts they agree - without it the unit tests compare the constant against itself and stay green through a rename. And releases up to v0.3.1 used triple names, so `tekops update <those versions>` cannot reach them; the change was made in the same release that introduced `tekops update`, when no shipped binary could do a rollback anyway, because every later moment would strand more releases.
 
 The reproducibility claim covers the **binary**, not the tarball, and Linux only. tar metadata differs between GNU tar in the container and bsdtar on macOS, and the macOS runner image (Xcode, SDK) drifts on GitHub's schedule and cannot be pinned, so that target is deterministic in practice rather than guaranteed.
 

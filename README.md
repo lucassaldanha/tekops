@@ -8,12 +8,15 @@ Download the binary for your platform from the [latest release](https://github.c
 
 | Platform | Asset |
 | --- | --- |
-| Linux x86_64 | `tekops-v<version>-x86_64-unknown-linux-musl.tar.gz` |
-| Linux arm64 | `tekops-v<version>-aarch64-unknown-linux-musl.tar.gz` |
-| macOS Apple silicon | `tekops-v<version>-aarch64-apple-darwin.tar.gz` |
+| Linux x86_64 | `tekops-v<version>-x86_64-linux.tar.gz` |
+| Linux arm64 | `tekops-v<version>-aarch64-linux.tar.gz` |
+| macOS Apple silicon | `tekops-v<version>-aarch64-macos.tar.gz` |
 
-    VERSION=0.2.1
-    TARGET=x86_64-unknown-linux-musl
+Releases up to v0.3.1 used the cargo target triple instead
+(`x86_64-unknown-linux-musl` and friends); the names above start at v0.4.0.
+
+    VERSION=0.4.0
+    TARGET=x86_64-linux
     curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/tekops-v$VERSION-$TARGET.tar.gz"
     tar xzf "tekops-v$VERSION-$TARGET.tar.gz"
     sudo install -m755 tekops /usr/local/bin/tekops
@@ -61,9 +64,13 @@ file needs to reach the node.
 
     scripts/build-release.sh x86_64-unknown-linux-musl
 
-Writes `dist/tekops-v<version>-<target>.tar.gz` and prints the binary's
-SHA256. Supported targets are `x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-musl`, and `aarch64-apple-darwin`.
+The argument is a cargo target triple. Supported targets are
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
+`aarch64-apple-darwin`.
+
+The tarball it writes is named for the platform rather than the triple, so
+the command above produces `dist/tekops-v<version>-x86_64-linux.tar.gz`. It
+also prints the binary's SHA256.
 
 Linux targets build inside a digest-pinned musl container and cross-compile
 from x86_64, so no `rustup target add` is needed on the host (a Homebrew
