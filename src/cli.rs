@@ -1,4 +1,5 @@
 use crate::beaconapi::{BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
+use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
 use crate::http::ApiError;
 use crate::logs::{resolve_log_path, resolve_logs_target, stream_logs, LogSource};
 use crate::metrics::MetricsClient;
@@ -15,7 +16,7 @@ use std::env;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 
@@ -31,6 +32,15 @@ use std::thread;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// The live `clap::Command` for the whole CLI.
+///
+/// Exposed so `completions` can render a shell script from the same definition
+/// that parses arguments, rather than from a second, drift-prone description of
+/// it.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
 }
 
 /// The Beacon API connection flags, shared by every command that talks to it
@@ -120,6 +130,17 @@ enum Commands {
         #[command(flatten)]
         api: ApiArgs,
     },
+    /// Install shell completions for tekops (detects your shell if not named)
+    Autocomplete {
+        /// bash, zsh, or fish; omit to detect from $SHELL
+        shell: Option<completions::Shell>,
+        /// Write the script to stdout and install nothing
+        #[arg(long)]
+        print: bool,
+        /// Install without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Print what tekops is, the build version, and where to find the source
     About,
     /// Update the tekops binary itself from GitHub releases
@@ -206,6 +227,9 @@ pub fn run() -> ExitCode {
         Commands::LogLevel { level, log_filter, api } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
+        }
+        Commands::Autocomplete { shell, print, yes } => {
+            exit_for(run_autocomplete(shell, print, yes))
         }
         Commands::About => {
             println!("{}", format_about());
@@ -441,6 +465,78 @@ fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateE
     }
 }
 
+/// The environment-reading half of `tekops autocomplete`; everything it decides
+/// is computed by `completions`, which stays pure and testable.
+fn run_autocomplete(
+    shell: Option<completions::Shell>,
+    print: bool,
+    yes: bool,
+) -> Result<(), CompletionError> {
+    let shell = match shell {
+        Some(shell) => shell,
+        None => detect_shell(env::var("SHELL").ok().as_deref())
+            .ok_or(CompletionError::UndetectedShell)?,
+    };
+
+    let script = completions::generate(shell, &mut command());
+    if print {
+        print!("{script}");
+        return Ok(());
+    }
+
+    let plan = completions::plan(shell, &dirs_from_env()?);
+
+    println!("shell:        {shell:?}");
+    println!("will write:   {}", plan.script_path.display());
+    if let Some(rc) = &plan.rc {
+        println!("will append to {}:", rc.path.display());
+        for line in rc.stanza.lines().filter(|l| !l.is_empty()) {
+            println!("    {line}");
+        }
+    }
+    if !yes && !confirm_install()? {
+        println!("aborted");
+        return Ok(());
+    }
+
+    let applied = completions::apply(&plan, &script)?;
+    println!("installed {}", applied.script_path.display());
+    match applied.rc {
+        RcOutcome::NotNeeded => {}
+        RcOutcome::Appended(path) => println!("updated {}", path.display()),
+        // Reached on every re-run after the first, which is the common case
+        // once someone reinstalls to pick up a new command.
+        RcOutcome::AlreadyPresent(path) => {
+            println!("{} already set up, left unchanged", path.display())
+        }
+    }
+    println!("restart your shell to pick it up");
+    Ok(())
+}
+
+fn dirs_from_env() -> Result<completions::Dirs, CompletionError> {
+    Ok(completions::Dirs {
+        home: env::var_os("HOME").map(PathBuf::from).ok_or(CompletionError::NoHome)?,
+        xdg_data: env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        xdg_config: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+    })
+}
+
+fn confirm_install() -> Result<bool, CompletionError> {
+    print!("proceed? [y/N] ");
+    io::stdout().flush().map_err(|e| CompletionError::Io {
+        path: PathBuf::from("<stdout>"),
+        message: e.to_string(),
+    })?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).map_err(|e| CompletionError::Io {
+        path: PathBuf::from("<stdin>"),
+        message: e.to_string(),
+    })?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
 fn confirm(current: &str, latest: &str) -> Result<bool, UpdateError> {
     print!("update tekops {current} -> {latest}? [y/N] ");
     io::stdout().flush().map_err(|e| UpdateError::Io(e.to_string()))?;
@@ -457,7 +553,28 @@ fn install_version(version: &str) -> Result<(), UpdateError> {
     println!("downloading tekops {version} for {}...", dest.display());
     update::install(update::fetch, version, &dest)?;
     println!("installed tekops {version}");
+    refresh_completions(&dest);
     Ok(())
+}
+
+/// Re-renders any already-installed completion script against the binary that
+/// was just installed, so a release adding a command does not leave a stale
+/// script behind.
+///
+/// Deliberately not part of `install_version`'s result: the new binary is in
+/// place and working by this point, so reporting the update as failed because a
+/// completion file could not be rewritten would be a lie. A warning names what
+/// to re-run instead.
+fn refresh_completions(binary: &Path) {
+    let refreshed = dirs_from_env().and_then(|dirs| completions::refresh_installed(binary, &dirs));
+    match refreshed {
+        Ok(paths) => {
+            for path in paths {
+                println!("refreshed completions at {}", path.display());
+            }
+        }
+        Err(e) => eprintln!("warning: could not refresh shell completions ({e}); re-run `tekops autocomplete`"),
+    }
 }
 
 fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
@@ -803,6 +920,35 @@ mod tests {
     fn version_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
         assert!(matches!(cli.command, Commands::Version { metrics: MetricArgs { metric_url: None, json: false } }));
+    }
+
+    #[test]
+    fn autocomplete_takes_an_optional_shell_and_defaults_to_detecting_one() {
+        let cli = Cli::try_parse_from(["tekops", "autocomplete"]).unwrap();
+        assert!(matches!(cli.command, Commands::Autocomplete { shell: None, .. }));
+
+        let cli = Cli::try_parse_from(["tekops", "autocomplete", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Autocomplete { shell: Some(completions::Shell::Zsh), .. }
+        ));
+    }
+
+    /// Unlike `logs` and `update`, this positional never doubles as a path or a
+    /// subcommand name, so clap can type it and reject the rest at parse time
+    /// rather than the command failing at runtime.
+    #[test]
+    fn autocomplete_rejects_a_shell_it_cannot_install_for() {
+        assert!(Cli::try_parse_from(["tekops", "autocomplete", "elvish"]).is_err());
+    }
+
+    #[test]
+    fn autocomplete_accepts_print_and_yes() {
+        let cli = Cli::try_parse_from(["tekops", "autocomplete", "bash", "--print"]).unwrap();
+        assert!(matches!(cli.command, Commands::Autocomplete { print: true, .. }));
+
+        let cli = Cli::try_parse_from(["tekops", "autocomplete", "-y"]).unwrap();
+        assert!(matches!(cli.command, Commands::Autocomplete { yes: true, .. }));
     }
 
     #[test]

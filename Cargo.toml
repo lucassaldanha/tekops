@@ -1,6 +1,6 @@
 [package]
 name = "tekops"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -21,6 +21,7 @@ tempfile = "3"
 # step: it is `sha256sum` on Linux and `shasum -a 256` on macOS, and verifying
 # the download should not depend on which coreutils the host ships.
 sha2 = "0.10"
+clap_complete = "4"
 
 [dev-dependencies]
 mockito = "1"
