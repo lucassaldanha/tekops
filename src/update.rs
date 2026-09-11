@@ -9,6 +9,12 @@
 #![allow(dead_code)]
 // Removed in the final task of the self-update work, once cli.rs consumes every item here.
 
+use crate::term::sanitize;
+use std::fmt;
+use std::io;
+use std::path::PathBuf;
+use std::process::Command;
+
 const REPO: &str = "lucassaldanha/tekops";
 
 /// The release target triple for this build, or `None` on a host tekops does
@@ -72,6 +78,100 @@ fn asset_name(version: &str, target: &str) -> String {
 
 fn download_url(version: &str, file: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/v{version}/{file}")
+}
+
+const CURL: &str = "curl";
+
+#[derive(Debug)]
+pub enum UpdateError {
+    UnsupportedTarget,
+    CurlMissing,
+    TarMissing,
+    CurlFailed { url: String, status: String, stderr: String },
+    Malformed(String),
+    ChecksumMissing { asset: String },
+    ChecksumMismatch { expected: String, actual: String },
+    ExtractFailed(String),
+    SmokeTestFailed(String),
+    NotWritable { dir: PathBuf, source: String },
+    Io(String),
+}
+
+impl fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpdateError::UnsupportedTarget => write!(
+                f,
+                "no tekops release is published for this platform ({} {})",
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            ),
+            UpdateError::CurlMissing => {
+                write!(f, "curl is required for updates but was not found on PATH")
+            }
+            UpdateError::TarMissing => {
+                write!(f, "tar is required for updates but was not found on PATH")
+            }
+            UpdateError::CurlFailed { url, status, stderr } => write!(
+                f,
+                "could not download {url} ({status}): {stderr}\n\
+                 if the version is real, there may be no asset published for this platform"
+            ),
+            UpdateError::Malformed(msg) => write!(f, "GitHub returned malformed data: {msg}"),
+            UpdateError::ChecksumMissing { asset } => {
+                write!(f, "SHA256SUMS does not list {asset}; refusing to install an unlisted asset")
+            }
+            UpdateError::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "checksum mismatch: expected {expected}, got {actual}; the download was not installed"
+            ),
+            UpdateError::ExtractFailed(msg) => write!(f, "could not unpack the release: {msg}"),
+            UpdateError::SmokeTestFailed(msg) => {
+                write!(f, "the downloaded binary failed its check, nothing was installed: {msg}")
+            }
+            UpdateError::NotWritable { dir, source } => write!(
+                f,
+                "cannot write to {}: {source}\ntry re-running under sudo",
+                dir.display()
+            ),
+            UpdateError::Io(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn curl_argv(url: &str) -> Vec<String> {
+    vec![
+        "-fsSL".to_string(),
+        "--proto".to_string(),
+        "=https".to_string(),
+        url.to_string(),
+    ]
+}
+
+/// The single HTTPS boundary. Every network read in this module goes through
+/// here, so the transport policy lives in exactly one place - the same reason
+/// `http::agent()` exists for the ureq clients.
+pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, UpdateError> {
+    fetch_with(CURL, url)
+}
+
+fn fetch_with(program: &str, url: &str) -> Result<Vec<u8>, UpdateError> {
+    let output = Command::new(program)
+        .args(curl_argv(url))
+        .output()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => UpdateError::CurlMissing,
+            _ => UpdateError::Io(e.to_string()),
+        })?;
+
+    if !output.status.success() {
+        return Err(UpdateError::CurlFailed {
+            url: url.to_string(),
+            status: output.status.to_string(),
+            stderr: sanitize(String::from_utf8_lossy(&output.stderr).trim()),
+        });
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -159,5 +259,55 @@ mod tests {
         )) {
             assert!(TARGET.is_some());
         }
+    }
+
+    /// `-f` turns an HTTP error status into a nonzero exit instead of a body
+    /// of HTML; `-L` is required because GitHub redirects release downloads to
+    /// objects.githubusercontent.com; `--proto =https` pins every hop of that
+    /// redirect chain to https so a redirect cannot downgrade the transport.
+    #[test]
+    fn curl_argv_pins_the_protocol_and_follows_redirects() {
+        let argv = curl_argv("https://example.invalid/x");
+        assert!(argv.contains(&"-fsSL".to_string()), "argv was {argv:?}");
+        let proto = argv.iter().position(|a| a == "--proto").expect("no --proto");
+        assert_eq!(argv[proto + 1], "=https");
+        assert_eq!(argv.last().unwrap(), "https://example.invalid/x");
+    }
+
+    #[test]
+    fn a_missing_curl_is_reported_as_such() {
+        let err = fetch_with("tekops-no-such-program-exists", "https://example.invalid/x")
+            .expect_err("a missing program must not succeed");
+        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
+        assert!(err.to_string().contains("curl"));
+    }
+
+    /// Stands in for curl to prove the plumbing: the child is spawned with our
+    /// argv and its stdout is what comes back.
+    #[test]
+    fn a_successful_program_returns_its_stdout() {
+        let out = fetch_with("echo", "https://example.invalid/x").expect("echo should succeed");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("https://example.invalid/x"), "got {text:?}");
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_reported_with_the_url() {
+        let err = fetch_with("false", "https://example.invalid/x")
+            .expect_err("a failing program must not succeed");
+        assert!(matches!(err, UpdateError::CurlFailed { .. }), "got {err:?}");
+        assert!(err.to_string().contains("https://example.invalid/x"));
+    }
+
+    /// curl's stderr is untrusted text on its way to the operator's terminal,
+    /// the same class of input `map_ureq_error` sanitizes.
+    #[test]
+    fn curl_stderr_is_sanitized_into_the_error() {
+        let err = UpdateError::CurlFailed {
+            url: "https://example.invalid/x".into(),
+            status: "exit status: 22".into(),
+            stderr: crate::term::sanitize("boom\u{1b}[2Jgone"),
+        };
+        assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
     }
 }
