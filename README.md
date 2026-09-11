@@ -107,6 +107,7 @@ screen, so searching covers all of them from the moment the session starts.
     tekops validators
     tekops version
     tekops log-level <LEVEL> [--filter=org.example ...]
+    tekops about
 
 Every `beacon` subcommand, plus `peers`, `health`, `head`, and `log-level`,
 accepts `--json` to print a JSON-serialized version of the parsed response
@@ -117,6 +118,8 @@ point at a non-default Beacon API (default: `http://localhost:5051`).
 
 `tekops --version` reports the `tekops` build itself, which is a different
 question from `tekops version` (the running Teku's version, below).
+`tekops about` prints the same build version alongside the project link, and
+takes no flags.
 
 Every network command gives up after 10 seconds rather than waiting forever
 on a node that accepts the connection but never answers.

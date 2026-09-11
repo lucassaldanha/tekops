@@ -4,9 +4,9 @@ use crate::logs::{resolve_log_path, resolve_logs_target, stream_logs, LogSource}
 use crate::metrics::MetricsClient;
 use crate::protocol::classify_protocol;
 use crate::output::{
-    format_attester_duties, format_duties_table, format_head_table, format_health_table,
-    format_peers_table, format_proposer_duties, format_validator_metrics_table,
-    format_validators_table, format_version_table, PeerRow,
+    format_about, format_attester_duties, format_duties_table, format_head_table,
+    format_health_table, format_peers_table, format_proposer_duties,
+    format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
 };
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand};
@@ -120,6 +120,8 @@ enum Commands {
         #[command(flatten)]
         api: ApiArgs,
     },
+    /// Print what tekops is, the build version, and where to find the source
+    About,
     /// Update the tekops binary itself from GitHub releases
     Update {
         /// check, latest, or a version (e.g. 0.3.0); omit to check and confirm
@@ -204,6 +206,10 @@ pub fn run() -> ExitCode {
         Commands::LogLevel { level, log_filter, api } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
+        }
+        Commands::About => {
+            println!("{}", format_about());
+            ExitCode::SUCCESS
         }
         Commands::Update { target, json, yes } => {
             exit_for(run_update(resolve_update_target(target), json, yes))
@@ -797,6 +803,12 @@ mod tests {
     fn version_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
         assert!(matches!(cli.command, Commands::Version { metrics: MetricArgs { metric_url: None, json: false } }));
+    }
+
+    #[test]
+    fn about_is_a_top_level_command_taking_no_arguments() {
+        let cli = Cli::try_parse_from(["tekops", "about"]).unwrap();
+        assert!(matches!(cli.command, Commands::About));
     }
 
     #[test]
