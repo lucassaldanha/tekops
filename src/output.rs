@@ -130,10 +130,31 @@ pub fn format_proposer_duties(duties: &[ProposerDuty]) -> String {
     table.to_string()
 }
 
+/// Not a table, unlike every other formatter here: this is the one command
+/// whose output is prose rather than fetched data, so `comfy-table` would only
+/// put a box around three lines a human reads once.
+pub fn format_about() -> String {
+    format!(
+        "tekops {}\nMade with love by Lucas \u{2764}\u{fe0f}\nhttps://github.com/lucassaldanha/tekops",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::beaconapi::{HealthState, SyncingStatus};
+
+    /// The version has to come from `CARGO_PKG_VERSION` rather than a literal,
+    /// so a release bump can't leave `about` reporting a build that no longer
+    /// exists. Hardcoding it back is exactly what this catches.
+    #[test]
+    fn about_reports_the_build_version_the_credit_and_the_source_url() {
+        let about = format_about();
+        assert!(about.contains(&format!("tekops {}", env!("CARGO_PKG_VERSION"))), "{about}");
+        assert!(about.contains("Made with love by Lucas \u{2764}\u{fe0f}"), "{about}");
+        assert!(about.contains("https://github.com/lucassaldanha/tekops"), "{about}");
+    }
 
     #[test]
     fn formats_health_table() {
