@@ -65,6 +65,9 @@ enum Commands {
     Logs {
         source: Option<LogSource>,
         path: Option<PathBuf>,
+        /// Lines of existing log to show before following new output
+        #[arg(short = 'n', long = "lines", default_value_t = 500)]
+        lines: u32,
     },
     /// Query the node's Beacon API
     Beacon {
@@ -149,7 +152,9 @@ enum DutiesKind {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Logs { source, path } => run_logs(source.unwrap_or(LogSource::Teku), path),
+        Commands::Logs { source, path, lines } => {
+            run_logs(source.unwrap_or(LogSource::Teku), path, lines)
+        }
         Commands::Beacon { command, api } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             run_beacon(client, command, api.json)
@@ -370,7 +375,7 @@ fn beacon_log_level(
     Ok(())
 }
 
-fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
+fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
     let path = resolve_log_path(source, path, env::var("TEKOPS_LOGS_FILE").ok());
     if !path.exists() {
         eprintln!("error: log file not found: {}", path.display());
@@ -406,7 +411,8 @@ fn run_logs(source: LogSource, path: Option<PathBuf>) -> ExitCode {
     }
 
     let mut tail = match Command::new("tail")
-        .args(["-F", "-n", "200"])
+        .args(["-F", "-n"])
+        .arg(lines.to_string())
         .arg(&path)
         .stdout(Stdio::piped())
         .process_group(0)
@@ -585,7 +591,7 @@ mod tests {
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(LogSource::Teku, Some(missing));
+        let code = run_logs(LogSource::Teku, Some(missing), 500);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
@@ -598,13 +604,64 @@ mod tests {
     #[test]
     fn logs_without_source_parses_with_source_none() {
         let cli = Cli::try_parse_from(["tekops", "logs"]).unwrap();
-        assert!(matches!(cli.command, Commands::Logs { source: None, path: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Logs { source: None, path: None, .. }
+        ));
     }
 
     #[test]
     fn logs_with_explicit_source_still_parses() {
         let cli = Cli::try_parse_from(["tekops", "logs", "besu"]).unwrap();
-        assert!(matches!(cli.command, Commands::Logs { source: Some(LogSource::Besu), path: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Logs { source: Some(LogSource::Besu), path: None, .. }
+        ));
+    }
+
+    // Commands deliberately doesn't derive Debug, so these match rather than
+    // assert_eq! on the variant and panic with a fixed string.
+    fn parsed_log_lines(args: &[&str]) -> u32 {
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Logs { lines, .. } => lines,
+            _ => panic!("expected a Logs command"),
+        }
+    }
+
+    #[test]
+    fn logs_defaults_to_500_lines_of_scrollback() {
+        assert_eq!(parsed_log_lines(&["tekops", "logs"]), 500);
+    }
+
+    #[test]
+    fn logs_accepts_a_short_and_long_line_count() {
+        assert_eq!(parsed_log_lines(&["tekops", "logs", "-n", "50"]), 50);
+        assert_eq!(parsed_log_lines(&["tekops", "logs", "--lines", "50"]), 50);
+    }
+
+    #[test]
+    fn logs_line_count_combines_with_source_and_path() {
+        let cli =
+            Cli::try_parse_from(["tekops", "logs", "besu", "/tmp/x.log", "-n", "7"]).unwrap();
+        match cli.command {
+            Commands::Logs { source, path, lines } => {
+                assert!(matches!(source, Some(LogSource::Besu)));
+                assert_eq!(path, Some(PathBuf::from("/tmp/x.log")));
+                assert_eq!(lines, 7);
+            }
+            _ => panic!("expected a Logs command"),
+        }
+    }
+
+    #[test]
+    fn logs_rejects_a_negative_line_count() {
+        assert!(Cli::try_parse_from(["tekops", "logs", "-n", "-5"]).is_err());
+    }
+
+    #[test]
+    fn logs_allows_zero_lines_to_follow_only_new_output() {
+        assert_eq!(parsed_log_lines(&["tekops", "logs", "-n", "0"]), 0);
     }
 
     #[test]

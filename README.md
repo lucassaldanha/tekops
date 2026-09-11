@@ -65,6 +65,14 @@ identically to the published one.
     tekops logs [path]           # source defaults to teku
     tekops logs teku [path]      # defaults to /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE
     tekops logs besu [path]      # defaults to /var/log/besu/besu.log
+    tekops logs -n 2000          # 2000 lines of scrollback instead of the default 500
+    tekops logs --lines 0        # skip existing output, follow only new lines
+
+`logs` opens with the last 500 lines already in the buffer and then follows
+new output. `-n`/`--lines` changes that count; it is passed straight to
+`tail -n`, so `0` means "show nothing existing, follow only what arrives
+next". The pre-loaded lines go into the scrollback buffer, not just on
+screen, so searching covers all of them from the moment the session starts.
 
     tekops beacon validators <index-or-pubkey>...
     tekops beacon duties attester --epoch=N <index>...
