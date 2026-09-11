@@ -174,6 +174,44 @@ fn fetch_with(program: &str, url: &str) -> Result<Vec<u8>, UpdateError> {
     Ok(output.stdout)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Finds the hash `SHA256SUMS` lists for exactly `asset`.
+///
+/// Matching is exact rather than by prefix: a prefix match would let a
+/// neighbouring asset whose name merely starts with ours satisfy the lookup.
+fn parse_sha256sums(text: &str, asset: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (hash, name) = line.split_once(char::is_whitespace)?;
+        let name = name.trim_start().trim_start_matches('*');
+        (name == asset && hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| hash.to_string())
+    })
+}
+
+/// Note what this does and does not prove: `SHA256SUMS` is fetched from the
+/// same release as the tarball, so it catches corruption, truncation, and a
+/// wrong-target asset, but not a compromised repository - whoever can replace
+/// the tarball can replace the checksum beside it. The channel guarantee is
+/// TLS, which is what `--proto =https` in `curl_argv` protects. This is not a
+/// signature, and should not be described as one.
+fn verify_checksum(tarball: &[u8], sums: &[u8], asset: &str) -> Result<(), UpdateError> {
+    let text = String::from_utf8_lossy(sums);
+    let expected = parse_sha256sums(&text, asset).ok_or_else(|| UpdateError::ChecksumMissing {
+        asset: asset.to_string(),
+    })?;
+    let actual = sha256_hex(tarball);
+    if actual != expected {
+        return Err(UpdateError::ChecksumMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +347,83 @@ mod tests {
             stderr: crate::term::sanitize("boom\u{1b}[2Jgone"),
         };
         assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
+    }
+
+    const SUMS: &str = concat!(
+        "1111111111111111111111111111111111111111111111111111111111111111  tekops-v0.3.1-aarch64-apple-darwin.tar.gz\n",
+        "2222222222222222222222222222222222222222222222222222222222222222  tekops-v0.3.1-x86_64-unknown-linux-musl.tar.gz\n",
+    );
+
+    #[test]
+    fn sha256_of_the_empty_input_is_the_known_vector() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn the_matching_line_is_found() {
+        assert_eq!(
+            parse_sha256sums(SUMS, "tekops-v0.3.1-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+    }
+
+    #[test]
+    fn an_absent_asset_is_none() {
+        assert_eq!(parse_sha256sums(SUMS, "tekops-v0.9.9-riscv.tar.gz"), None);
+    }
+
+    /// A blank or truncated line must be skipped, not crash and not be
+    /// mistaken for a hash.
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let text = "\n\nnot-a-hash  tekops.tar.gz\nsomething\n";
+        assert_eq!(parse_sha256sums(text, "tekops.tar.gz"), None);
+    }
+
+    /// Matching must be exact. A prefix match would let
+    /// `tekops-v0.3.1-aarch64-apple-darwin.tar.gz.sig` satisfy a request for
+    /// the tarball.
+    #[test]
+    fn a_filename_that_merely_starts_with_ours_does_not_match() {
+        let text = "3333333333333333333333333333333333333333333333333333333333333333  tekops.tar.gz.sig\n";
+        assert_eq!(parse_sha256sums(text, "tekops.tar.gz"), None);
+    }
+
+    /// sha256sum writes binary-mode entries as "<hash> *<name>".
+    #[test]
+    fn a_binary_mode_star_is_tolerated() {
+        let text = "4444444444444444444444444444444444444444444444444444444444444444 *tekops.tar.gz\n";
+        assert_eq!(
+            parse_sha256sums(text, "tekops.tar.gz").as_deref(),
+            Some("4444444444444444444444444444444444444444444444444444444444444444")
+        );
+    }
+
+    #[test]
+    fn a_matching_checksum_verifies() {
+        let body = b"the tarball bytes";
+        let sums = format!("{}  tekops.tar.gz\n", sha256_hex(body));
+        assert!(verify_checksum(body, sums.as_bytes(), "tekops.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn a_mismatched_checksum_is_rejected_with_both_hashes() {
+        let sums = format!("{}  tekops.tar.gz\n", "5".repeat(64));
+        let err = verify_checksum(b"the tarball bytes", sums.as_bytes(), "tekops.tar.gz")
+            .expect_err("a mismatch must not verify");
+        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(&"5".repeat(64)), "expected hash missing from {msg}");
+        assert!(msg.contains(&sha256_hex(b"the tarball bytes")), "actual hash missing from {msg}");
+    }
+
+    #[test]
+    fn an_unlisted_asset_is_rejected() {
+        let err = verify_checksum(b"x", SUMS.as_bytes(), "tekops-v9.9.9-nope.tar.gz")
+            .expect_err("an unlisted asset must not verify");
+        assert!(matches!(err, UpdateError::ChecksumMissing { .. }), "got {err:?}");
     }
 }

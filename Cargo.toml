@@ -16,6 +16,11 @@ ureq = { version = "2", default-features = false, features = ["json", "gzip"] }
 comfy-table = "7"
 ctrlc = { version = "3", features = ["termination"] }
 tempfile = "3"
+# Pure Rust, no C and no transitive C, so it does not reintroduce what
+# dropping ureq's TLS backend removed. Shelling out is not viable for this
+# step: it is `sha256sum` on Linux and `shasum -a 256` on macOS, and verifying
+# the download should not depend on which coreutils the host ships.
+sha2 = "0.10"
 
 [dev-dependencies]
 mockito = "1"
