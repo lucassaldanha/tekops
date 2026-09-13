@@ -78,12 +78,16 @@ mod tests {
 
         let timeout = Duration::from_millis(250);
         let started = Instant::now();
-        let result =
-            agent_with_timeout(timeout).get(&format!("http://{addr}/eth/v1/node/health")).call();
+        let result = agent_with_timeout(timeout)
+            .get(&format!("http://{addr}/eth/v1/node/health"))
+            .call();
         let elapsed = started.elapsed();
 
         assert!(result.is_err(), "expected a timeout error, got a response");
-        assert!(elapsed < timeout * 20, "request should have timed out promptly, took {elapsed:?}");
+        assert!(
+            elapsed < timeout * 20,
+            "request should have timed out promptly, took {elapsed:?}"
+        );
     }
 
     /// Guards the wiring the test above deliberately bypasses: the agent the
@@ -104,7 +108,9 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi").unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .unwrap();
         });
 
         let resp = agent().get(&format!("http://{addr}/")).call().unwrap();
@@ -134,7 +140,9 @@ mod tests {
 
         let err = map_ureq_error(agent().get(&format!("http://{addr}/")).call().unwrap_err());
         match err {
-            ApiError::Status(500, body) => assert!(!body.contains('\u{1b}'), "ESC survived: {body:?}"),
+            ApiError::Status(500, body) => {
+                assert!(!body.contains('\u{1b}'), "ESC survived: {body:?}")
+            }
             other => panic!("expected a 500 status error, got {other:?}"),
         }
     }

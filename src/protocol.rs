@@ -24,7 +24,10 @@ mod tests {
 
     #[test]
     fn classifies_quic_multiaddr() {
-        assert_eq!(classify_protocol("/ip4/1.2.3.4/udp/9001/quic"), Protocol::Quic);
+        assert_eq!(
+            classify_protocol("/ip4/1.2.3.4/udp/9001/quic"),
+            Protocol::Quic
+        );
     }
 
     #[test]

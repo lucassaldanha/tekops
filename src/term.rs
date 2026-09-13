@@ -10,7 +10,9 @@
 /// keeping the text readable while stripping its ability to drive the
 /// terminal.
 pub fn sanitize(raw: &str) -> String {
-    raw.chars().map(|c| if is_safe(c) { c } else { '\u{fffd}' }).collect()
+    raw.chars()
+        .map(|c| if is_safe(c) { c } else { '\u{fffd}' })
+        .collect()
 }
 
 /// Tab and newline are the only control characters worth keeping - they're

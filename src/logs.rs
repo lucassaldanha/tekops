@@ -39,7 +39,10 @@ pub fn stream_logs_capped<R: BufRead, W: Write>(
                 "*** tekops: {} MiB buffer limit reached, stopped following.",
                 max_bytes / (1024 * 1024)
             )?;
-            writeln!(writer, "*** Scrollback and search still work. Quit and rerun to resume.")?;
+            writeln!(
+                writer,
+                "*** Scrollback and search still work. Quit and rerun to resume."
+            )?;
             writer.flush()?;
             return Ok(());
         }
@@ -159,10 +162,19 @@ mod tests {
         stream_logs_capped(Cursor::new(input), &mut output, 200).unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("buffer limit reached"), "no notice emitted: {output:?}");
+        assert!(
+            output.contains("buffer limit reached"),
+            "no notice emitted: {output:?}"
+        );
         assert!(output.contains("Quit and rerun to resume"));
-        assert!(output.contains("line0"), "content before the cap should survive");
-        assert!(!output.contains("line499"), "content past the cap should be dropped");
+        assert!(
+            output.contains("line0"),
+            "content before the cap should survive"
+        );
+        assert!(
+            !output.contains("line499"),
+            "content past the cap should be dropped"
+        );
     }
 
     #[test]
@@ -191,7 +203,10 @@ mod tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("only line"));
-        assert!(!output.contains("buffer limit"), "notice on an under-cap stream: {output:?}");
+        assert!(
+            !output.contains("buffer limit"),
+            "notice on an under-cap stream: {output:?}"
+        );
         assert_eq!(output.lines().count(), 1);
     }
 
@@ -204,8 +219,14 @@ mod tests {
 
     #[test]
     fn default_paths_match_existing_bashrc_function() {
-        assert_eq!(LogSource::Teku.default_path(), PathBuf::from("/var/log/teku/teku.log"));
-        assert_eq!(LogSource::Besu.default_path(), PathBuf::from("/var/log/besu/besu.log"));
+        assert_eq!(
+            LogSource::Teku.default_path(),
+            PathBuf::from("/var/log/teku/teku.log")
+        );
+        assert_eq!(
+            LogSource::Besu.default_path(),
+            PathBuf::from("/var/log/besu/besu.log")
+        );
     }
 
     #[test]
@@ -272,8 +293,8 @@ mod tests {
 
     #[test]
     fn resolve_logs_target_rejects_two_paths() {
-        let err = resolve_logs_target(Some("/a.log".into()), Some(PathBuf::from("/b.log")))
-            .unwrap_err();
+        let err =
+            resolve_logs_target(Some("/a.log".into()), Some(PathBuf::from("/b.log"))).unwrap_err();
         assert!(err.contains("/a.log"), "got {err:?}");
         assert!(err.contains("/b.log"), "got {err:?}");
     }
