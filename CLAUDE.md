@@ -20,7 +20,30 @@ cargo test                   # full suite
 cargo test beaconapi::       # one module's tests (also: logfmt::, logs::, output::, protocol::, metrics::, http::, term::, cli::, completions::)
 cargo test health_ready_on_200  # a single test by name
 cargo clippy --all-targets   # lint
+scripts/check.sh             # every CI gate, in CI's order - what pre-push runs
 ```
+
+### The local gate
+
+Work happens directly on `master` pre-1.0 (worktrees to keep parallel work
+separate, not branches-plus-PRs), so nothing between the editor and `origin`
+reviews a change. `scripts/check.sh` is that review: it runs the same three
+gates as `.github/workflows/ci.yml`, in the same order, and `.githooks/pre-push`
+runs it on every push. `git push --no-verify` skips it.
+
+The hook is versioned in `.githooks/` rather than living in `.git/hooks/`, so
+it travels with the repo; `git config core.hooksPath .githooks` is what
+activates it and has to be run once per clone. A push that only deletes refs
+exits early rather than building anything.
+
+`tests/ci_gates.rs` is what keeps the promise honest. `scripts/check.sh` is
+only useful if passing it locally means CI passes too, and the two files are in
+different languages with nothing reading the other, so the test parses the
+cargo invocations out of both and asserts they are the same list in the same
+order. A gate added, removed, or reworded on one side fails there rather than
+as a surprise red build after a push that was supposed to be pre-verified. Its
+failure message prints both lists, so the drift is visible without opening
+either file.
 
 ### Cross-compiling for deployment
 

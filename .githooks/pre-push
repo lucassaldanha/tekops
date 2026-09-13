@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Runs the CI gates before anything leaves this machine.
+#
+# Lives in .githooks/ rather than .git/hooks/ so it is versioned with the repo;
+# `git config core.hooksPath .githooks` is what activates it, once per clone.
+# `git push --no-verify` skips it.
+set -euo pipefail
+
+# Nothing to check when the push only deletes refs.
+only_deletes=true
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] || only_deletes=false
+done
+$only_deletes && exit 0
+
+echo "pre-push: running CI gates (skip with --no-verify)"
+exec "$(dirname "${BASH_SOURCE[0]}")/../scripts/check.sh"
