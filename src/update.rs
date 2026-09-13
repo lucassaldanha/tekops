@@ -99,13 +99,26 @@ pub enum UpdateError {
     UnsupportedTarget,
     CurlMissing,
     TarMissing,
-    CurlFailed { url: String, status: String, stderr: String, hint: Option<&'static str> },
+    CurlFailed {
+        url: String,
+        status: String,
+        stderr: String,
+        hint: Option<&'static str>,
+    },
     Malformed(String),
-    ChecksumMissing { asset: String },
-    ChecksumMismatch { expected: String, actual: String },
+    ChecksumMissing {
+        asset: String,
+    },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
     ExtractFailed(String),
     SmokeTestFailed(String),
-    NotWritable { dir: PathBuf, source: String },
+    NotWritable {
+        dir: PathBuf,
+        source: String,
+    },
     Io(String),
 }
 
@@ -231,7 +244,12 @@ const RELEASE_HINT: &str = "the repository may be private, or have no published 
 /// repo is exactly the case that produces the wrong one.
 fn with_hint(err: UpdateError, hint: &'static str) -> UpdateError {
     match err {
-        UpdateError::CurlFailed { url, status, stderr, .. } => UpdateError::CurlFailed {
+        UpdateError::CurlFailed {
+            url,
+            status,
+            stderr,
+            ..
+        } => UpdateError::CurlFailed {
             url,
             status,
             stderr,
@@ -454,8 +472,7 @@ where
     probe_writable(dir)?;
 
     let asset = asset_name(version, target);
-    let tarball =
-        fetch(&download_url(version, &asset)).map_err(|e| with_hint(e, ASSET_HINT))?;
+    let tarball = fetch(&download_url(version, &asset)).map_err(|e| with_hint(e, ASSET_HINT))?;
     // No hint on SHA256SUMS: the URL in the message already says what is
     // missing, and a release that has the tarball but not its checksums is not
     // a platform problem.
@@ -479,8 +496,14 @@ mod tests {
 
     #[test]
     fn check_and_latest_are_reserved_words() {
-        assert_eq!(resolve_update_target(Some("check".into())), UpdateTarget::Check);
-        assert_eq!(resolve_update_target(Some("latest".into())), UpdateTarget::Latest);
+        assert_eq!(
+            resolve_update_target(Some("check".into())),
+            UpdateTarget::Check
+        );
+        assert_eq!(
+            resolve_update_target(Some("latest".into())),
+            UpdateTarget::Latest
+        );
     }
 
     #[test]
@@ -578,7 +601,10 @@ mod tests {
     fn curl_argv_pins_the_protocol_and_follows_redirects() {
         let argv = curl_argv("https://example.invalid/x");
         assert!(argv.contains(&"-fsSL".to_string()), "argv was {argv:?}");
-        let proto = argv.iter().position(|a| a == "--proto").expect("no --proto");
+        let proto = argv
+            .iter()
+            .position(|a| a == "--proto")
+            .expect("no --proto");
         assert_eq!(argv[proto + 1], "=https");
         assert_eq!(argv.last().unwrap(), "https://example.invalid/x");
     }
@@ -618,7 +644,10 @@ mod tests {
             stderr: crate::term::sanitize("boom\u{1b}[2Jgone"),
             hint: None,
         };
-        assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
+        assert!(
+            !err.to_string().contains('\u{1b}'),
+            "escape survived: {err}"
+        );
     }
 
     /// The platform hint belongs to the asset download only. Attached to the
@@ -633,10 +662,16 @@ mod tests {
             hint: None,
         };
         let bare = raw().to_string();
-        assert!(!bare.contains("this platform"), "unhinted failure claimed a cause: {bare}");
+        assert!(
+            !bare.contains("this platform"),
+            "unhinted failure claimed a cause: {bare}"
+        );
 
         let asset = with_hint(raw(), ASSET_HINT).to_string();
-        assert!(asset.contains("no asset published for this platform"), "got {asset}");
+        assert!(
+            asset.contains("no asset published for this platform"),
+            "got {asset}"
+        );
         assert!(!asset.contains("private"), "got {asset}");
 
         let release = with_hint(raw(), RELEASE_HINT).to_string();
@@ -670,8 +705,13 @@ mod tests {
 
         // Read the bound back off the argv rather than off the constant, so a
         // value that curl would treat as "no bound" cannot ship unnoticed.
-        let stall: u64 = at("--speed-time").parse().expect("speed-time must be a number");
-        assert!(stall > 0 && stall <= 120, "{stall}s is not a useful stall bound");
+        let stall: u64 = at("--speed-time")
+            .parse()
+            .expect("speed-time must be a number");
+        assert!(
+            stall > 0 && stall <= 120,
+            "{stall}s is not a useful stall bound"
+        );
     }
 
     /// The real repro: a host that accepts the connection and then never
@@ -704,8 +744,14 @@ mod tests {
             .status;
         let elapsed = started.elapsed();
 
-        assert!(!status.success(), "a silent endpoint must not look like a success");
-        assert!(elapsed.as_secs() < 10, "curl hung on a silent endpoint for {elapsed:?}");
+        assert!(
+            !status.success(),
+            "a silent endpoint must not look like a success"
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "curl hung on a silent endpoint for {elapsed:?}"
+        );
     }
 
     const SUMS: &str = concat!(
@@ -747,14 +793,16 @@ mod tests {
     /// tarball.
     #[test]
     fn a_filename_that_merely_starts_with_ours_does_not_match() {
-        let text = "3333333333333333333333333333333333333333333333333333333333333333  tekops.tar.gz.sig\n";
+        let text =
+            "3333333333333333333333333333333333333333333333333333333333333333  tekops.tar.gz.sig\n";
         assert_eq!(parse_sha256sums(text, "tekops.tar.gz"), None);
     }
 
     /// sha256sum writes binary-mode entries as "<hash> *<name>".
     #[test]
     fn a_binary_mode_star_is_tolerated() {
-        let text = "4444444444444444444444444444444444444444444444444444444444444444 *tekops.tar.gz\n";
+        let text =
+            "4444444444444444444444444444444444444444444444444444444444444444 *tekops.tar.gz\n";
         assert_eq!(
             parse_sha256sums(text, "tekops.tar.gz").as_deref(),
             Some("4444444444444444444444444444444444444444444444444444444444444444")
@@ -773,17 +821,29 @@ mod tests {
         let sums = format!("{}  tekops.tar.gz\n", "5".repeat(64));
         let err = verify_checksum(b"the tarball bytes", sums.as_bytes(), "tekops.tar.gz")
             .expect_err("a mismatch must not verify");
-        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::ChecksumMismatch { .. }),
+            "got {err:?}"
+        );
         let msg = err.to_string();
-        assert!(msg.contains(&"5".repeat(64)), "expected hash missing from {msg}");
-        assert!(msg.contains(&sha256_hex(b"the tarball bytes")), "actual hash missing from {msg}");
+        assert!(
+            msg.contains(&"5".repeat(64)),
+            "expected hash missing from {msg}"
+        );
+        assert!(
+            msg.contains(&sha256_hex(b"the tarball bytes")),
+            "actual hash missing from {msg}"
+        );
     }
 
     #[test]
     fn an_unlisted_asset_is_rejected() {
         let err = verify_checksum(b"x", SUMS.as_bytes(), "tekops-v9.9.9-nope.tar.gz")
             .expect_err("an unlisted asset must not verify");
-        assert!(matches!(err, UpdateError::ChecksumMissing { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::ChecksumMissing { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Builds a tarball shaped like a real release asset: `tekops`,
@@ -829,8 +889,13 @@ mod tests {
         std::fs::write(stage.path().join("README.md"), "readme").unwrap();
         let out = stage.path().join("out.tar.gz");
         std::process::Command::new("tar")
-            .arg("-czf").arg(&out).arg("-C").arg(stage.path()).arg("README.md")
-            .status().unwrap();
+            .arg("-czf")
+            .arg(&out)
+            .arg("-C")
+            .arg(stage.path())
+            .arg("README.md")
+            .status()
+            .unwrap();
         let tarball = std::fs::read(&out).unwrap();
 
         let err = extract_binary(&tarball, dir.path()).expect_err("must reject");
@@ -861,7 +926,10 @@ mod tests {
         let tarball = release_tarball(&version_script("tekops 9.9.9"));
         let binary = extract_binary(&tarball, dir.path()).unwrap();
         let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
-        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::SmokeTestFailed(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -870,7 +938,10 @@ mod tests {
         let tarball = release_tarball("#!/bin/sh\nexit 1\n");
         let binary = extract_binary(&tarball, dir.path()).unwrap();
         let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
-        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::SmokeTestFailed(_)),
+            "got {err:?}"
+        );
     }
 
     /// The smoke-tested binary's stdout is untrusted and goes into an error
@@ -881,7 +952,10 @@ mod tests {
         let tarball = release_tarball("#!/bin/sh\nprintf 'tekops \\033[2J9.9.9\\n'\n");
         let binary = extract_binary(&tarball, dir.path()).unwrap();
         let err = smoke_test(&binary, "0.3.0").expect_err("must reject");
-        assert!(!err.to_string().contains('\u{1b}'), "escape survived: {err}");
+        assert!(
+            !err.to_string().contains('\u{1b}'),
+            "escape survived: {err}"
+        );
     }
 
     #[test]
@@ -902,7 +976,10 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let err = result.expect_err("a read-only directory must fail the probe");
-        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::NotWritable { .. }),
+            "got {err:?}"
+        );
         assert!(err.to_string().contains("sudo"), "no sudo hint in: {err}");
     }
 
@@ -950,9 +1027,16 @@ mod tests {
         std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let err = result.expect_err("a read-only directory must fail the install");
-        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::NotWritable { .. }),
+            "got {err:?}"
+        );
         assert_eq!(contents, b"old binary", "the existing binary was damaged");
-        assert_eq!(leftovers, ["tekops"], "staged debris left behind: {leftovers:?}");
+        assert_eq!(
+            leftovers,
+            ["tekops"],
+            "staged debris left behind: {leftovers:?}"
+        );
     }
 
     /// The other side of the install: the copy succeeds and the rename fails.
@@ -971,7 +1055,10 @@ mod tests {
         std::fs::write(dest.join("occupied"), b"x").unwrap();
 
         let err = install_binary(&src, &dest).expect_err("the rename must fail");
-        assert!(matches!(err, UpdateError::NotWritable { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::NotWritable { .. }),
+            "got {err:?}"
+        );
 
         let staged: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1064,7 +1151,10 @@ mod tests {
         let err = install(canned_fetch("0.3.0", tarball, wrong_sums), "0.3.0", &dest)
             .expect_err("a mismatch must abort");
 
-        assert!(matches!(err, UpdateError::ChecksumMismatch { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::ChecksumMismatch { .. }),
+            "got {err:?}"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
     }
 
@@ -1079,7 +1169,10 @@ mod tests {
         let err = install(canned_fetch("0.3.0", tarball, sums), "0.3.0", &dest)
             .expect_err("an unlisted asset must abort");
 
-        assert!(matches!(err, UpdateError::ChecksumMissing { .. }), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::ChecksumMissing { .. }),
+            "got {err:?}"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
     }
 
@@ -1097,7 +1190,10 @@ mod tests {
         let err = install(canned_fetch("0.3.0", tarball, sums), "0.3.0", &dest)
             .expect_err("a version mismatch must abort");
 
-        assert!(matches!(err, UpdateError::SmokeTestFailed(_)), "got {err:?}");
+        assert!(
+            matches!(err, UpdateError::SmokeTestFailed(_)),
+            "got {err:?}"
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"old binary");
     }
 }

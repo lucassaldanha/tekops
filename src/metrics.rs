@@ -55,7 +55,11 @@ fn parse_line(line: &str) -> Option<Sample> {
     if !value.is_finite() {
         return None;
     }
-    Some(Sample { name, labels, value })
+    Some(Sample {
+        name,
+        labels,
+        value,
+    })
 }
 
 /// Finds the `}` that closes the label set, ignoring any that appear inside a
@@ -154,7 +158,9 @@ fn matching_value(samples: &[Sample], name: &str, matchers: &[(&str, &str)]) -> 
         .iter()
         .filter(|s| {
             s.name == name
-                && matchers.iter().all(|(k, v)| s.labels.get(*k).map(|actual| actual == v).unwrap_or(false))
+                && matchers
+                    .iter()
+                    .all(|(k, v)| s.labels.get(*k).map(|actual| actual == v).unwrap_or(false))
         })
         .map(|s| s.value)
         .sum()
@@ -176,7 +182,11 @@ fn sum_by_label(samples: &[Sample], name: &str, group_label: &str) -> BTreeMap<S
 /// Sums every sample matching `name`, ignoring labels entirely - mirroring a
 /// plain PromQL `sum(metric{...})` with no `by`/label matchers.
 fn sum_all(samples: &[Sample], name: &str) -> f64 {
-    samples.iter().filter(|s| s.name == name).map(|s| s.value).sum()
+    samples
+        .iter()
+        .filter(|s| s.name == name)
+        .map(|s| s.value)
+        .sum()
 }
 
 /// Whether the scrape carries any sample for `name` at all, regardless of
@@ -194,8 +204,11 @@ fn has_metric(samples: &[Sample], name: &str) -> bool {
 /// exactly one matching series, but more than one shouldn't be silently
 /// dropped (e.g. mid-upgrade, briefly both the old and new version report).
 fn distinct_label_values(samples: &[Sample], name: &str, label: &str) -> Vec<String> {
-    let mut values: Vec<String> =
-        samples.iter().filter(|s| s.name == name).filter_map(|s| s.labels.get(label).cloned()).collect();
+    let mut values: Vec<String> = samples
+        .iter()
+        .filter(|s| s.name == name)
+        .filter_map(|s| s.labels.get(label).cloned())
+        .collect();
     values.sort();
     values.dedup();
     values
@@ -229,13 +242,17 @@ const VALIDATOR_VERSION_METRIC: &str = "validator_teku_version_total";
 
 impl MetricsClient {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), agent: agent() }
+        Self {
+            url: url.into(),
+            agent: agent(),
+        }
     }
 
     fn fetch(&self) -> Result<Vec<Sample>, ApiError> {
         let resp = self.agent.get(&self.url).call().map_err(map_ureq_error)?;
-        let body =
-            resp.into_string().map_err(|e| ApiError::Malformed(format!("invalid response body: {e}")))?;
+        let body = resp
+            .into_string()
+            .map_err(|e| ApiError::Malformed(format!("invalid response body: {e}")))?;
         Ok(parse_exposition(&body))
     }
 
@@ -243,8 +260,12 @@ impl MetricsClient {
         let samples = self.fetch()?;
         self.require_metric(&samples, VALIDATOR_REQUESTS_METRIC)?;
         let published = |method: &str| {
-            matching_value(&samples, VALIDATOR_REQUESTS_METRIC, &[("method", method), ("outcome", "success")])
-                .round() as u64
+            matching_value(
+                &samples,
+                VALIDATOR_REQUESTS_METRIC,
+                &[("method", method), ("outcome", "success")],
+            )
+            .round() as u64
         };
         Ok(DutiesMetrics {
             published_blocks: published("publish_block"),
@@ -262,7 +283,10 @@ impl MetricsClient {
             .map(|(status, value)| (status, value.round() as u64))
             .collect();
         let total_eth = sum_all(&samples, VALIDATOR_BALANCES_METRIC) / GWEI_PER_ETH;
-        Ok(ValidatorMetrics { counts_by_status, total_eth })
+        Ok(ValidatorMetrics {
+            counts_by_status,
+            total_eth,
+        })
     }
 
     /// Reads the running Teku version from whichever of the beacon-node or
@@ -308,11 +332,15 @@ mod tests {
 
     #[test]
     fn parses_counter_line_with_labels() {
-        let body = r#"validator_beacon_node_requests_total{method="publish_block",outcome="success"} 42"#;
+        let body =
+            r#"validator_beacon_node_requests_total{method="publish_block",outcome="success"} 42"#;
         let samples = parse_exposition(body);
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "validator_beacon_node_requests_total");
-        assert_eq!(samples[0].labels.get("method"), Some(&"publish_block".to_string()));
+        assert_eq!(
+            samples[0].labels.get("method"),
+            Some(&"publish_block".to_string())
+        );
         assert_eq!(samples[0].value, 42.0);
     }
 
@@ -347,14 +375,22 @@ requests_total{method="publish_block",outcome="failure"} 3
 requests_total{method="publish_attestation",outcome="success"} 99
 "#;
         let samples = parse_exposition(body);
-        let value = matching_value(&samples, "requests_total", &[("method", "publish_block"), ("outcome", "success")]);
+        let value = matching_value(
+            &samples,
+            "requests_total",
+            &[("method", "publish_block"), ("outcome", "success")],
+        );
         assert_eq!(value, 10.0);
     }
 
     #[test]
     fn matching_value_is_zero_when_series_absent() {
         let samples = parse_exposition(r#"requests_total{method="other",outcome="success"} 5"#);
-        let value = matching_value(&samples, "requests_total", &[("method", "publish_block"), ("outcome", "success")]);
+        let value = matching_value(
+            &samples,
+            "requests_total",
+            &[("method", "publish_block"), ("outcome", "success")],
+        );
         assert_eq!(value, 0.0);
     }
 
@@ -368,8 +404,12 @@ validator_beacon_node_requests_total{method="publish_aggregate_and_proofs",outco
 "#;
         let samples = parse_exposition(body);
         let published = |method: &str| {
-            matching_value(&samples, VALIDATOR_REQUESTS_METRIC, &[("method", method), ("outcome", "success")]).round()
-                as u64
+            matching_value(
+                &samples,
+                VALIDATOR_REQUESTS_METRIC,
+                &[("method", method), ("outcome", "success")],
+            )
+            .round() as u64
         };
         assert_eq!(published("publish_block"), 1);
         assert_eq!(published("publish_attestation"), 2);
@@ -386,7 +426,11 @@ validator_beacon_node_requests_total{method="publish_attestation",outcome="succe
 validator_beacon_node_requests_total{method="send_sync_committee_messages",outcome="success"} 7
 validator_beacon_node_requests_total{method="publish_aggregate_and_proofs",outcome="success"} 8
 "#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let duties = client.duties().unwrap();
         assert_eq!(duties.published_blocks, 5);
@@ -430,7 +474,10 @@ validator_local_validator_balances{pubkey="0x1"} 32000000000
 validator_local_validator_balances{pubkey="0x2"} 31900000000
 "#;
         let samples = parse_exposition(body);
-        assert_eq!(sum_all(&samples, "validator_local_validator_balances"), 63900000000.0);
+        assert_eq!(
+            sum_all(&samples, "validator_local_validator_balances"),
+            63900000000.0
+        );
     }
 
     #[test]
@@ -442,7 +489,11 @@ validator_local_validator_counts{status="pending_queued"} 1
 validator_local_validator_balances{pubkey="0x1"} 32000000000
 validator_local_validator_balances{pubkey="0x2"} 31500000000
 "#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let metrics = client.validators().unwrap();
         assert_eq!(metrics.counts_by_status.get("active_ongoing"), Some(&2));
@@ -466,14 +517,21 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
 "#;
         let samples = parse_exposition(body);
         let values = distinct_label_values(&samples, "beacon_teku_version_total", "version");
-        assert_eq!(values, vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()]);
+        assert_eq!(
+            values,
+            vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()]
+        );
     }
 
     #[test]
     fn version_reads_beacon_metric_when_present() {
         let mut server = mockito::Server::new();
         let body = r#"beacon_teku_version_total{version="teku/v24.9.0"} 1"#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let info = client.version().unwrap();
         assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
@@ -483,7 +541,11 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
     fn version_falls_back_to_validator_metric_when_beacon_metric_absent() {
         let mut server = mockito::Server::new();
         let body = r#"validator_teku_version_total{version="teku/v24.9.0"} 1"#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let info = client.version().unwrap();
         assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
@@ -492,7 +554,11 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
     #[test]
     fn version_errors_when_neither_metric_present() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body("jvm_threads_current 1")
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let err = client.version().unwrap_err();
         assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
@@ -503,7 +569,10 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
         let body = r#"beacon_teku_version_total{version="teku/v25.1.0 {dev}"} 1"#;
         let samples = parse_exposition(body);
         assert_eq!(samples.len(), 1, "sample was dropped: {samples:?}");
-        assert_eq!(samples[0].labels.get("version"), Some(&"teku/v25.1.0 {dev}".to_string()));
+        assert_eq!(
+            samples[0].labels.get("version"),
+            Some(&"teku/v25.1.0 {dev}".to_string())
+        );
         assert_eq!(samples[0].value, 1.0);
     }
 
@@ -526,7 +595,10 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
     #[test]
     fn drops_non_finite_sample_values() {
         for body in ["m NaN", "m +Inf", "m -Inf", "m inf"] {
-            assert!(parse_exposition(body).is_empty(), "{body} should have been dropped");
+            assert!(
+                parse_exposition(body).is_empty(),
+                "{body} should have been dropped"
+            );
         }
     }
 
@@ -538,16 +610,27 @@ validator_local_validator_counts{status="active_ongoing"} 2
 validator_local_validator_balances{pubkey="0x1"} NaN
 validator_local_validator_balances{pubkey="0x2"} 32000000000
 "#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let metrics = client.validators().unwrap();
-        assert_eq!(metrics.total_eth, 32.0, "the real balance must survive the NaN");
+        assert_eq!(
+            metrics.total_eth, 32.0,
+            "the real balance must survive the NaN"
+        );
     }
 
     #[test]
     fn duties_errors_when_the_metric_family_is_absent() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body("jvm_threads_current 1")
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let err = client.duties().unwrap_err();
         assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
@@ -556,17 +639,29 @@ validator_local_validator_balances{pubkey="0x2"} 32000000000
     #[test]
     fn duties_still_reports_a_genuine_zero_when_the_metric_is_present() {
         let mut server = mockito::Server::new();
-        let body = r#"validator_beacon_node_requests_total{method="publish_block",outcome="failure"} 3"#;
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body(body).create();
+        let body =
+            r#"validator_beacon_node_requests_total{method="publish_block",outcome="failure"} 3"#;
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let duties = client.duties().unwrap();
-        assert_eq!(duties.published_blocks, 0, "present-but-zero must not be an error");
+        assert_eq!(
+            duties.published_blocks, 0,
+            "present-but-zero must not be an error"
+        );
     }
 
     #[test]
     fn validators_errors_when_the_metric_family_is_absent() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/metrics").with_status(200).with_body("jvm_threads_current 1").create();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body("jvm_threads_current 1")
+            .create();
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let err = client.validators().unwrap_err();
         assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");

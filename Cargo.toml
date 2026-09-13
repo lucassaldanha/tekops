@@ -6,22 +6,22 @@ license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# default-features = false drops ureq's TLS backend (rustls, and ring's C and
-# assembly with it). Deliberate, not an oversight: every endpoint tekops talks
-# to is a node-local http:// URL. Re-enabling it is a one-word change if a
-# remote HTTPS node ever becomes a real case.
-ureq = { version = "2", default-features = false, features = ["json", "gzip"] }
+clap_complete = "4"
 comfy-table = "7"
 ctrlc = { version = "3", features = ["termination"] }
-tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Pure Rust, no C and no transitive C, so it does not reintroduce what
 # dropping ureq's TLS backend removed. Shelling out is not viable for this
 # step: it is `sha256sum` on Linux and `shasum -a 256` on macOS, and verifying
 # the download should not depend on which coreutils the host ships.
 sha2 = "0.10"
-clap_complete = "4"
+tempfile = "3"
+# default-features = false drops ureq's TLS backend (rustls, and ring's C and
+# assembly with it). Deliberate, not an oversight: every endpoint tekops talks
+# to is a node-local http:// URL. Re-enabling it is a one-word change if a
+# remote HTTPS node ever becomes a real case.
+ureq = { version = "2", default-features = false, features = ["json", "gzip"] }
 
 [dev-dependencies]
 mockito = "1"

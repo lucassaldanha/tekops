@@ -25,7 +25,11 @@ pub fn format_log_line(raw: &str) -> String {
     // the terminal, or forge a red ERROR line that appears to come from tekops
     // itself. Strip control characters before they reach the format string.
     let get = |key: &str| {
-        value.get(key).and_then(Value::as_str).map(sanitize).unwrap_or_default()
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(sanitize)
+            .unwrap_or_default()
     };
     let timestamp = get("@timestamp");
     let level = get("level");
@@ -54,7 +58,10 @@ mod tests {
     fn formats_info_line_green() {
         let raw = r#"{"@timestamp":"2026-09-01T10:00:00.000Z","level":"INFO","thread":"main","class":"Node","message":"Started"}"#;
         let out = format_log_line(raw);
-        assert!(out.starts_with("\u{1b}[32m"), "expected green color code, got: {out}");
+        assert!(
+            out.starts_with("\u{1b}[32m"),
+            "expected green color code, got: {out}"
+        );
         assert!(out.contains("2026-09-01T10:00:00.000Z INFO [main] Node - Started"));
         assert!(out.ends_with("\u{1b}[0m"));
     }
@@ -107,17 +114,27 @@ mod tests {
         let out = format_log_line(raw);
 
         // Exactly two escapes survive: the ones tekops itself wraps the line in.
-        assert_eq!(out.matches('\u{1b}').count(), 2, "field escapes leaked: {out:?}");
+        assert_eq!(
+            out.matches('\u{1b}').count(),
+            2,
+            "field escapes leaked: {out:?}"
+        );
         assert!(out.starts_with("\u{1b}[32m"));
         assert!(out.ends_with("\u{1b}[0m"));
         assert!(!out.contains('\u{7}'), "BEL leaked: {out:?}");
-        assert!(out.contains("FAKE ERROR"), "text should survive, only control chars go");
+        assert!(
+            out.contains("FAKE ERROR"),
+            "text should survive, only control chars go"
+        );
     }
 
     #[test]
     fn strips_terminal_escapes_from_malformed_lines_too() {
         let out = format_log_line("garbage \u{1b}[2J more");
-        assert!(!out.contains('\u{1b}'), "escape leaked via the passthrough path: {out:?}");
+        assert!(
+            !out.contains('\u{1b}'),
+            "escape leaked via the passthrough path: {out:?}"
+        );
     }
 
     #[test]

@@ -9,7 +9,11 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 fn yes_no(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 pub fn format_health_table(health: &HealthState, syncing: &SyncingStatus) -> String {
@@ -21,10 +25,19 @@ pub fn format_health_table(health: &HealthState, syncing: &SyncingStatus) -> Str
     let mut table = Table::new();
     table.set_header(vec!["Field", "Value"]);
     table.add_row(vec!["Health".to_string(), health_str.to_string()]);
-    table.add_row(vec!["Syncing".to_string(), yes_no(syncing.is_syncing).to_string()]);
+    table.add_row(vec![
+        "Syncing".to_string(),
+        yes_no(syncing.is_syncing).to_string(),
+    ]);
     table.add_row(vec!["Head Slot".to_string(), syncing.head_slot.clone()]);
-    table.add_row(vec!["Sync Distance".to_string(), syncing.sync_distance.clone()]);
-    table.add_row(vec!["Optimistic".to_string(), yes_no(syncing.is_optimistic).to_string()]);
+    table.add_row(vec![
+        "Sync Distance".to_string(),
+        syncing.sync_distance.clone(),
+    ]);
+    table.add_row(vec![
+        "Optimistic".to_string(),
+        yes_no(syncing.is_optimistic).to_string(),
+    ]);
     table.to_string()
 }
 
@@ -33,21 +46,36 @@ pub fn format_head_table(header: &BlockHeader, finality: &FinalityCheckpoints) -
     table.set_header(vec!["Field", "Value"]);
     table.add_row(vec!["Head Slot".to_string(), header.slot.clone()]);
     table.add_row(vec!["Head Root".to_string(), header.root.clone()]);
-    table.add_row(vec!["Justified Epoch".to_string(), finality.current_justified_epoch.clone()]);
-    table.add_row(vec!["Finalized Epoch".to_string(), finality.finalized_epoch.clone()]);
+    table.add_row(vec![
+        "Justified Epoch".to_string(),
+        finality.current_justified_epoch.clone(),
+    ]);
+    table.add_row(vec![
+        "Finalized Epoch".to_string(),
+        finality.finalized_epoch.clone(),
+    ]);
     table.to_string()
 }
 
 pub fn format_duties_table(metrics: &DutiesMetrics) -> String {
     let mut table = Table::new();
     table.set_header(vec!["Metric", "Value"]);
-    table.add_row(vec!["Published Blocks".to_string(), metrics.published_blocks.to_string()]);
-    table.add_row(vec!["Published Attestations".to_string(), metrics.published_attestations.to_string()]);
+    table.add_row(vec![
+        "Published Blocks".to_string(),
+        metrics.published_blocks.to_string(),
+    ]);
+    table.add_row(vec![
+        "Published Attestations".to_string(),
+        metrics.published_attestations.to_string(),
+    ]);
     table.add_row(vec![
         "Published Sync Committee Messages".to_string(),
         metrics.published_sync_committee_messages.to_string(),
     ]);
-    table.add_row(vec!["Published Aggregates".to_string(), metrics.published_aggregates.to_string()]);
+    table.add_row(vec![
+        "Published Aggregates".to_string(),
+        metrics.published_aggregates.to_string(),
+    ]);
     table.to_string()
 }
 
@@ -60,7 +88,10 @@ pub fn format_validator_metrics_table(metrics: &ValidatorMetrics) -> String {
 
     let mut total_table = Table::new();
     total_table.set_header(vec!["Field", "Value"]);
-    total_table.add_row(vec!["Total ETH".to_string(), format!("{:.4}", metrics.total_eth)]);
+    total_table.add_row(vec![
+        "Total ETH".to_string(),
+        format!("{:.4}", metrics.total_eth),
+    ]);
 
     format!("{counts_table}\n\n{total_table}")
 }
@@ -93,12 +124,19 @@ pub fn format_peers_table(rows: &[PeerRow]) -> String {
     let total = rows.len();
     let mut counts: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     for row in rows {
-        *counts.entry((row.direction.clone(), protocol_label(row.protocol))).or_insert(0) += 1;
+        *counts
+            .entry((row.direction.clone(), protocol_label(row.protocol)))
+            .or_insert(0) += 1;
     }
     let mut table = Table::new();
     table.set_header(vec!["Direction", "Protocol", "Count", "Total"]);
     for ((direction, protocol), count) in counts {
-        table.add_row(vec![direction, protocol.to_string(), count.to_string(), total.to_string()]);
+        table.add_row(vec![
+            direction,
+            protocol.to_string(),
+            count.to_string(),
+            total.to_string(),
+        ]);
     }
     table.to_string()
 }
@@ -107,7 +145,12 @@ pub fn format_validators_table(validators: &[ValidatorInfo]) -> String {
     let mut table = Table::new();
     table.set_header(vec!["Index", "Pubkey", "Balance", "Status"]);
     for v in validators {
-        table.add_row(vec![v.index.clone(), v.pubkey.clone(), v.balance.clone(), v.status.clone()]);
+        table.add_row(vec![
+            v.index.clone(),
+            v.pubkey.clone(),
+            v.balance.clone(),
+            v.status.clone(),
+        ]);
     }
     table.to_string()
 }
@@ -116,7 +159,12 @@ pub fn format_attester_duties(duties: &[AttesterDuty]) -> String {
     let mut table = Table::new();
     table.set_header(vec!["Slot", "Validator Index", "Committee Index", "Pubkey"]);
     for d in duties {
-        table.add_row(vec![d.slot.clone(), d.validator_index.clone(), d.committee_index.clone(), d.pubkey.clone()]);
+        table.add_row(vec![
+            d.slot.clone(),
+            d.validator_index.clone(),
+            d.committee_index.clone(),
+            d.pubkey.clone(),
+        ]);
     }
     table.to_string()
 }
@@ -125,7 +173,11 @@ pub fn format_proposer_duties(duties: &[ProposerDuty]) -> String {
     let mut table = Table::new();
     table.set_header(vec!["Slot", "Validator Index", "Pubkey"]);
     for d in duties {
-        table.add_row(vec![d.slot.clone(), d.validator_index.clone(), d.pubkey.clone()]);
+        table.add_row(vec![
+            d.slot.clone(),
+            d.validator_index.clone(),
+            d.pubkey.clone(),
+        ]);
     }
     table.to_string()
 }
@@ -151,9 +203,18 @@ mod tests {
     #[test]
     fn about_reports_the_build_version_the_credit_and_the_source_url() {
         let about = format_about();
-        assert!(about.contains(&format!("tekops {}", env!("CARGO_PKG_VERSION"))), "{about}");
-        assert!(about.contains("Made with love by Lucas \u{2764}\u{fe0f}"), "{about}");
-        assert!(about.contains("https://github.com/lucassaldanha/tekops"), "{about}");
+        assert!(
+            about.contains(&format!("tekops {}", env!("CARGO_PKG_VERSION"))),
+            "{about}"
+        );
+        assert!(
+            about.contains("Made with love by Lucas \u{2764}\u{fe0f}"),
+            "{about}"
+        );
+        assert!(
+            about.contains("https://github.com/lucassaldanha/tekops"),
+            "{about}"
+        );
     }
 
     #[test]
@@ -189,9 +250,24 @@ mod tests {
     fn formats_peers_table_grouped_by_direction_and_protocol() {
         use crate::protocol::Protocol;
         let rows = vec![
-            PeerRow { peer_id: "p1".to_string(), direction: "inbound".to_string(), state: "connected".to_string(), protocol: Protocol::Tcp },
-            PeerRow { peer_id: "p2".to_string(), direction: "inbound".to_string(), state: "connected".to_string(), protocol: Protocol::Tcp },
-            PeerRow { peer_id: "p3".to_string(), direction: "outbound".to_string(), state: "connected".to_string(), protocol: Protocol::Quic },
+            PeerRow {
+                peer_id: "p1".to_string(),
+                direction: "inbound".to_string(),
+                state: "connected".to_string(),
+                protocol: Protocol::Tcp,
+            },
+            PeerRow {
+                peer_id: "p2".to_string(),
+                direction: "inbound".to_string(),
+                state: "connected".to_string(),
+                protocol: Protocol::Tcp,
+            },
+            PeerRow {
+                peer_id: "p3".to_string(),
+                direction: "outbound".to_string(),
+                state: "connected".to_string(),
+                protocol: Protocol::Quic,
+            },
         ];
         let table = format_peers_table(&rows);
         assert!(table.contains("inbound"));
@@ -251,7 +327,10 @@ mod tests {
     #[test]
     fn formats_head_table() {
         use crate::beaconapi::{BlockHeader, FinalityCheckpoints};
-        let header = BlockHeader { slot: "999".to_string(), root: "0xabc".to_string() };
+        let header = BlockHeader {
+            slot: "999".to_string(),
+            root: "0xabc".to_string(),
+        };
         let finality = FinalityCheckpoints {
             previous_justified_epoch: "10".to_string(),
             current_justified_epoch: "11".to_string(),
@@ -288,7 +367,10 @@ mod tests {
         let mut counts_by_status = BTreeMap::new();
         counts_by_status.insert("active_ongoing".to_string(), 100);
         counts_by_status.insert("pending_queued".to_string(), 3);
-        let metrics = ValidatorMetrics { counts_by_status, total_eth: 63.5 };
+        let metrics = ValidatorMetrics {
+            counts_by_status,
+            total_eth: 63.5,
+        };
         let table = format_validator_metrics_table(&metrics);
         assert!(table.contains("active_ongoing"));
         assert!(table.contains("100"));
@@ -299,14 +381,18 @@ mod tests {
 
     #[test]
     fn formats_version_table() {
-        let info = VersionInfo { versions: vec!["teku/v24.9.0".to_string()] };
+        let info = VersionInfo {
+            versions: vec!["teku/v24.9.0".to_string()],
+        };
         let table = format_version_table(&info);
         assert!(table.contains("teku/v24.9.0"));
     }
 
     #[test]
     fn formats_version_table_with_multiple_versions() {
-        let info = VersionInfo { versions: vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()] };
+        let info = VersionInfo {
+            versions: vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()],
+        };
         let table = format_version_table(&info);
         assert!(table.contains("teku/v24.10.0"));
         assert!(table.contains("teku/v24.9.0"));

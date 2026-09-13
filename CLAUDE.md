@@ -35,7 +35,7 @@ Both Linux binaries are statically linked with no runtime deps on the node (`fil
 
 ### Releases
 
-A `v*` tag triggers `.github/workflows/release.yml`, which verifies the tag against `Cargo.toml`, runs the suite, builds three targets, and publishes tarballs plus `SHA256SUMS`. `.github/workflows/ci.yml` runs tests and clippy on every push and PR.
+A `v*` tag triggers `.github/workflows/release.yml`, which verifies the tag against `Cargo.toml`, runs the suite, builds three targets, and publishes tarballs plus `SHA256SUMS`. `.github/workflows/ci.yml` runs `cargo fmt --all -- --check`, then tests, then clippy on every push and PR. The formatting gate goes first because it is the cheapest to fail, and it exists because without it the tree silently drifted to 166 rustfmt hunks across 11 files; `rustfmt` is listed in `rust-toolchain.toml`'s components so that step does not depend on the runner image happening to ship it.
 
 Four things here are load-bearing and each closes a specific hole:
 

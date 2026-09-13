@@ -1,14 +1,16 @@
-use crate::beaconapi::{BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
+use crate::beaconapi::{
+    BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus,
+};
 use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
 use crate::http::ApiError;
 use crate::logs::{resolve_log_path, resolve_logs_target, stream_logs, LogSource};
 use crate::metrics::MetricsClient;
-use crate::protocol::classify_protocol;
 use crate::output::{
     format_about, format_attester_duties, format_duties_table, format_head_table,
     format_health_table, format_peers_table, format_proposer_duties,
     format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
 };
+use crate::protocol::classify_protocol;
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -124,7 +126,8 @@ enum Commands {
     LogLevel {
         /// Log level to set (e.g. INFO, DEBUG, WARN, TRACE)
         level: String,
-        /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu); omit to change the global level
+        /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu);
+        /// omit to change the global level
         #[arg(long = "filter")]
         log_filter: Vec<String>,
         #[command(flatten)]
@@ -189,7 +192,11 @@ enum DutiesKind {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Logs { source, path, lines } => match resolve_logs_target(source, path) {
+        Commands::Logs {
+            source,
+            path,
+            lines,
+        } => match resolve_logs_target(source, path) {
             Ok((source, path)) => run_logs(source, path, lines),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -224,7 +231,11 @@ pub fn run() -> ExitCode {
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
             exit_for(metrics_version(&client, metrics.json))
         }
-        Commands::LogLevel { level, log_filter, api } => {
+        Commands::LogLevel {
+            level,
+            log_filter,
+            api,
+        } => {
             let client = BeaconClient::new(resolve_base_url(api.api_url));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
         }
@@ -304,8 +315,14 @@ fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
     let syncing = client.syncing()?;
     let health = client.health()?;
     if json {
-        let payload = HealthJson { health: &health, syncing: &syncing };
-        println!("{}", serde_json::to_string(&payload).expect("serialize health json"));
+        let payload = HealthJson {
+            health: &health,
+            syncing: &syncing,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&payload).expect("serialize health json")
+        );
     } else {
         println!("{}", format_health_table(&health, &syncing));
     }
@@ -316,8 +333,14 @@ fn beacon_head(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
     let header = client.header_head()?;
     let finality = client.finality_checkpoints()?;
     if json {
-        let payload = HeadJson { header: &header, finality: &finality };
-        println!("{}", serde_json::to_string(&payload).expect("serialize head json"));
+        let payload = HeadJson {
+            header: &header,
+            finality: &finality,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&payload).expect("serialize head json")
+        );
     } else {
         println!("{}", format_head_table(&header, &finality));
     }
@@ -327,7 +350,10 @@ fn beacon_head(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
 fn metrics_duties(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
     let metrics = client.duties()?;
     if json {
-        println!("{}", serde_json::to_string(&metrics).expect("serialize duties metrics json"));
+        println!(
+            "{}",
+            serde_json::to_string(&metrics).expect("serialize duties metrics json")
+        );
     } else {
         println!("{}", format_duties_table(&metrics));
     }
@@ -337,7 +363,10 @@ fn metrics_duties(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
 fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
     let metrics = client.validators()?;
     if json {
-        println!("{}", serde_json::to_string(&metrics).expect("serialize validator metrics json"));
+        println!(
+            "{}",
+            serde_json::to_string(&metrics).expect("serialize validator metrics json")
+        );
     } else {
         println!("{}", format_validator_metrics_table(&metrics));
     }
@@ -347,7 +376,10 @@ fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError
 fn metrics_version(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
     let info = client.version()?;
     if json {
-        println!("{}", serde_json::to_string(&info).expect("serialize version json"));
+        println!(
+            "{}",
+            serde_json::to_string(&info).expect("serialize version json")
+        );
     } else {
         println!("{}", format_version_table(&info));
     }
@@ -366,7 +398,10 @@ fn beacon_peers(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
         })
         .collect();
     if json {
-        println!("{}", serde_json::to_string(&rows).expect("serialize peers json"));
+        println!(
+            "{}",
+            serde_json::to_string(&rows).expect("serialize peers json")
+        );
     } else {
         println!("{}", format_peers_table(&rows));
     }
@@ -376,7 +411,10 @@ fn beacon_peers(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
 fn beacon_validators(client: &BeaconClient, ids: &[String], json: bool) -> Result<(), ApiError> {
     let validators = client.validators(ids)?;
     if json {
-        println!("{}", serde_json::to_string(&validators).expect("serialize validators json"));
+        println!(
+            "{}",
+            serde_json::to_string(&validators).expect("serialize validators json")
+        );
     } else {
         println!("{}", format_validators_table(&validators));
     }
@@ -391,7 +429,10 @@ fn beacon_duties_attester(
 ) -> Result<(), ApiError> {
     let duties = client.duties_attester(epoch, indices)?;
     if json {
-        println!("{}", serde_json::to_string(&duties).expect("serialize attester duties json"));
+        println!(
+            "{}",
+            serde_json::to_string(&duties).expect("serialize attester duties json")
+        );
     } else {
         println!("{}", format_attester_duties(&duties));
     }
@@ -401,7 +442,10 @@ fn beacon_duties_attester(
 fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Result<(), ApiError> {
     let duties = client.duties_proposer(epoch)?;
     if json {
-        println!("{}", serde_json::to_string(&duties).expect("serialize proposer duties json"));
+        println!(
+            "{}",
+            serde_json::to_string(&duties).expect("serialize proposer duties json")
+        );
     } else {
         println!("{}", format_proposer_duties(&duties));
     }
@@ -414,11 +458,18 @@ fn beacon_log_level(
     log_filter: Vec<String>,
     json: bool,
 ) -> Result<(), ApiError> {
-    let log_filter = if log_filter.is_empty() { None } else { Some(log_filter) };
+    let log_filter = if log_filter.is_empty() {
+        None
+    } else {
+        Some(log_filter)
+    };
     client.set_log_level(level, log_filter.clone())?;
     if json {
         let payload = LogLevelJson { level, log_filter };
-        println!("{}", serde_json::to_string(&payload).expect("serialize log level json"));
+        println!(
+            "{}",
+            serde_json::to_string(&payload).expect("serialize log level json")
+        );
     } else {
         match &log_filter {
             Some(loggers) => println!("log level set to {level} for: {}", loggers.join(", ")),
@@ -435,11 +486,13 @@ fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateE
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string(&result)
-                        .map_err(|e| UpdateError::Io(e.to_string()))?
+                    serde_json::to_string(&result).map_err(|e| UpdateError::Io(e.to_string()))?
                 );
             } else if result.update_available {
-                println!("tekops {} is available (running {})", result.latest, result.current);
+                println!(
+                    "tekops {} is available (running {})",
+                    result.latest, result.current
+                );
             } else {
                 println!("already on {} (latest)", result.current);
             }
@@ -516,7 +569,9 @@ fn run_autocomplete(
 
 fn dirs_from_env() -> Result<completions::Dirs, CompletionError> {
     Ok(completions::Dirs {
-        home: env::var_os("HOME").map(PathBuf::from).ok_or(CompletionError::NoHome)?,
+        home: env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or(CompletionError::NoHome)?,
         xdg_data: env::var_os("XDG_DATA_HOME").map(PathBuf::from),
         xdg_config: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
     })
@@ -529,17 +584,21 @@ fn confirm_install() -> Result<bool, CompletionError> {
         message: e.to_string(),
     })?;
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).map_err(|e| CompletionError::Io {
-        path: PathBuf::from("<stdin>"),
-        message: e.to_string(),
-    })?;
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| CompletionError::Io {
+            path: PathBuf::from("<stdin>"),
+            message: e.to_string(),
+        })?;
     let answer = answer.trim().to_ascii_lowercase();
     Ok(answer == "y" || answer == "yes")
 }
 
 fn confirm(current: &str, latest: &str) -> Result<bool, UpdateError> {
     print!("update tekops {current} -> {latest}? [y/N] ");
-    io::stdout().flush().map_err(|e| UpdateError::Io(e.to_string()))?;
+    io::stdout()
+        .flush()
+        .map_err(|e| UpdateError::Io(e.to_string()))?;
     let mut answer = String::new();
     io::stdin()
         .read_line(&mut answer)
@@ -573,7 +632,9 @@ fn refresh_completions(binary: &Path) {
                 println!("refreshed completions at {}", path.display());
             }
         }
-        Err(e) => eprintln!("warning: could not refresh shell completions ({e}); re-run `tekops autocomplete`"),
+        Err(e) => eprintln!(
+            "warning: could not refresh shell completions ({e}); re-run `tekops autocomplete`"
+        ),
     }
 }
 
@@ -643,7 +704,11 @@ fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
         }
     };
 
-    let mut pager = match Command::new("less").args(["-R", "+F"]).arg(sink.path()).spawn() {
+    let mut pager = match Command::new("less")
+        .args(["-R", "+F"])
+        .arg(sink.path())
+        .spawn()
+    {
         Ok(child) => child,
         Err(e) => {
             eprintln!("error: failed to spawn less: {e}");
@@ -720,7 +785,11 @@ mod tests {
     /// which is precisely the condition that makes the ordering in
     /// `supervise_pager` load-bearing.
     fn never_ending_child() -> Child {
-        Command::new("sleep").arg("300").stdout(Stdio::piped()).spawn().expect("spawn sleep")
+        Command::new("sleep")
+            .arg("300")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep")
     }
 
     /// The documented regression: with `tail -F` never reaching EOF, quitting
@@ -734,7 +803,10 @@ mod tests {
             let mut tail = never_ending_child();
             let stdout = tail.stdout.take().expect("piped");
             // A pager that exits promptly, as if the user pressed `q`.
-            let pager = Command::new("sleep").arg("0.2").spawn().expect("spawn pager stand-in");
+            let pager = Command::new("sleep")
+                .arg("0.2")
+                .spawn()
+                .expect("spawn pager stand-in");
             let result = supervise_pager(pager, tail, BufReader::new(stdout), io::sink());
             let _ = done_tx.send(result.is_ok());
         });
@@ -755,7 +827,10 @@ mod tests {
         let mut tail = never_ending_child();
         let pid = tail.id();
         let stdout = tail.stdout.take().expect("piped");
-        let pager = Command::new("sleep").arg("0.2").spawn().expect("spawn pager stand-in");
+        let pager = Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("spawn pager stand-in");
 
         supervise_pager(pager, tail, BufReader::new(stdout), io::sink()).unwrap();
 
@@ -774,14 +849,22 @@ mod tests {
     #[test]
     fn supervise_pager_streams_log_lines_into_the_sink() {
         let mut source = Command::new("printf")
-            .arg(r#"{"@timestamp":"t","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#)
+            .arg(
+                r#"{"@timestamp":"t","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#,
+            )
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn printf");
         let stdout = source.stdout.take().expect("piped");
-        let pager = Command::new("sleep").arg("0.3").spawn().expect("spawn pager stand-in");
+        let pager = Command::new("sleep")
+            .arg("0.3")
+            .spawn()
+            .expect("spawn pager stand-in");
 
-        let sink = tempfile::Builder::new().prefix("tekops-test-").tempfile().unwrap();
+        let sink = tempfile::Builder::new()
+            .prefix("tekops-test-")
+            .tempfile()
+            .unwrap();
         let writer = LineWriter::new(sink.reopen().unwrap());
         supervise_pager(pager, source, BufReader::new(stdout), writer).unwrap();
 
@@ -808,7 +891,11 @@ mod tests {
         let cli = Cli::try_parse_from(["tekops", "logs"]).unwrap();
         assert!(matches!(
             cli.command,
-            Commands::Logs { source: None, path: None, .. }
+            Commands::Logs {
+                source: None,
+                path: None,
+                ..
+            }
         ));
     }
 
@@ -864,10 +951,13 @@ mod tests {
 
     #[test]
     fn logs_line_count_combines_with_source_and_path() {
-        let cli =
-            Cli::try_parse_from(["tekops", "logs", "besu", "/tmp/x.log", "-n", "7"]).unwrap();
+        let cli = Cli::try_parse_from(["tekops", "logs", "besu", "/tmp/x.log", "-n", "7"]).unwrap();
         match cli.command {
-            Commands::Logs { source, path, lines } => {
+            Commands::Logs {
+                source,
+                path,
+                lines,
+            } => {
                 assert_eq!(source.as_deref(), Some("besu"));
                 assert_eq!(path, Some(PathBuf::from("/tmp/x.log")));
                 assert_eq!(lines, 7);
@@ -889,48 +979,102 @@ mod tests {
     #[test]
     fn peers_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "peers"]).unwrap();
-        assert!(matches!(cli.command, Commands::Peers { api: ApiArgs { api_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Peers {
+                api: ApiArgs {
+                    api_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn health_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "health"]).unwrap();
-        assert!(matches!(cli.command, Commands::Health { api: ApiArgs { api_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Health {
+                api: ApiArgs {
+                    api_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn head_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "head"]).unwrap();
-        assert!(matches!(cli.command, Commands::Head { api: ApiArgs { api_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Head {
+                api: ApiArgs {
+                    api_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn duties_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "duties"]).unwrap();
-        assert!(matches!(cli.command, Commands::Duties { metrics: MetricArgs { metric_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Duties {
+                metrics: MetricArgs {
+                    metric_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn validators_is_a_top_level_command_distinct_from_beacon_validators() {
         let cli = Cli::try_parse_from(["tekops", "validators"]).unwrap();
-        assert!(matches!(cli.command, Commands::Validators { metrics: MetricArgs { metric_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Validators {
+                metrics: MetricArgs {
+                    metric_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn version_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "version"]).unwrap();
-        assert!(matches!(cli.command, Commands::Version { metrics: MetricArgs { metric_url: None, json: false } }));
+        assert!(matches!(
+            cli.command,
+            Commands::Version {
+                metrics: MetricArgs {
+                    metric_url: None,
+                    json: false
+                }
+            }
+        ));
     }
 
     #[test]
     fn autocomplete_takes_an_optional_shell_and_defaults_to_detecting_one() {
         let cli = Cli::try_parse_from(["tekops", "autocomplete"]).unwrap();
-        assert!(matches!(cli.command, Commands::Autocomplete { shell: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Commands::Autocomplete { shell: None, .. }
+        ));
 
         let cli = Cli::try_parse_from(["tekops", "autocomplete", "zsh"]).unwrap();
         assert!(matches!(
             cli.command,
-            Commands::Autocomplete { shell: Some(completions::Shell::Zsh), .. }
+            Commands::Autocomplete {
+                shell: Some(completions::Shell::Zsh),
+                ..
+            }
         ));
     }
 
@@ -945,10 +1089,16 @@ mod tests {
     #[test]
     fn autocomplete_accepts_print_and_yes() {
         let cli = Cli::try_parse_from(["tekops", "autocomplete", "bash", "--print"]).unwrap();
-        assert!(matches!(cli.command, Commands::Autocomplete { print: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Commands::Autocomplete { print: true, .. }
+        ));
 
         let cli = Cli::try_parse_from(["tekops", "autocomplete", "-y"]).unwrap();
-        assert!(matches!(cli.command, Commands::Autocomplete { yes: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Commands::Autocomplete { yes: true, .. }
+        ));
     }
 
     #[test]
@@ -959,7 +1109,8 @@ mod tests {
 
     #[test]
     fn duties_attester_requires_at_least_one_index() {
-        let result = Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
+        let result =
+            Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
         assert!(result.is_err());
     }
 
@@ -973,7 +1124,11 @@ mod tests {
     fn log_level_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "log-level", "DEBUG"]).unwrap();
         match cli.command {
-            Commands::LogLevel { level, log_filter, api } => {
+            Commands::LogLevel {
+                level,
+                log_filter,
+                api,
+            } => {
                 assert_eq!(level, "DEBUG");
                 assert!(log_filter.is_empty());
                 assert_eq!(api.api_url, None);
@@ -996,7 +1151,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::LogLevel { level, log_filter, .. } => {
+            Commands::LogLevel {
+                level, log_filter, ..
+            } => {
                 assert_eq!(level, "DEBUG");
                 assert_eq!(log_filter, vec!["org.a".to_string(), "org.b".to_string()]);
             }
@@ -1017,8 +1174,7 @@ mod tests {
 
     #[test]
     fn beacon_subcommand_accepts_flags_before_the_subcommand() {
-        let cli =
-            Cli::try_parse_from(["tekops", "beacon", "--json", "validators", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["tekops", "beacon", "--json", "validators", "1"]).unwrap();
         match cli.command {
             Commands::Beacon { api, .. } => assert!(api.json),
             _ => panic!("expected Beacon command"),
@@ -1027,8 +1183,7 @@ mod tests {
 
     #[test]
     fn api_url_flag_still_reaches_each_top_level_command() {
-        let cli =
-            Cli::try_parse_from(["tekops", "health", "--api-url", "http://x:1/"]).unwrap();
+        let cli = Cli::try_parse_from(["tekops", "health", "--api-url", "http://x:1/"]).unwrap();
         match cli.command {
             Commands::Health { api } => assert_eq!(api.api_url.as_deref(), Some("http://x:1/")),
             _ => panic!("expected Health command"),
@@ -1057,7 +1212,10 @@ mod tests {
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         let rendered = err.to_string();
-        assert!(rendered.contains(env!("CARGO_PKG_VERSION")), "got {rendered:?}");
+        assert!(
+            rendered.contains(env!("CARGO_PKG_VERSION")),
+            "got {rendered:?}"
+        );
     }
 
     #[test]
@@ -1075,7 +1233,10 @@ mod tests {
             sync_distance: "4".to_string(),
         };
         let health = HealthState::Ready;
-        let payload = HealthJson { health: &health, syncing: &syncing };
+        let payload = HealthJson {
+            health: &health,
+            syncing: &syncing,
+        };
         let json = serde_json::to_string(&payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["health"], "ready");
@@ -1085,13 +1246,19 @@ mod tests {
 
     #[test]
     fn head_json_output_is_valid_json() {
-        let header = BlockHeader { slot: "999".to_string(), root: "0xabc".to_string() };
+        let header = BlockHeader {
+            slot: "999".to_string(),
+            root: "0xabc".to_string(),
+        };
         let finality = FinalityCheckpoints {
             previous_justified_epoch: "10".to_string(),
             current_justified_epoch: "11".to_string(),
             finalized_epoch: "9".to_string(),
         };
-        let payload = HeadJson { header: &header, finality: &finality };
+        let payload = HeadJson {
+            header: &header,
+            finality: &finality,
+        };
         let json = serde_json::to_string(&payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["slot"], "999");
@@ -1173,7 +1340,10 @@ mod tests {
         use std::collections::BTreeMap;
         let mut counts_by_status = BTreeMap::new();
         counts_by_status.insert("active_ongoing".to_string(), 100);
-        let metrics = ValidatorMetrics { counts_by_status, total_eth: 63.5 };
+        let metrics = ValidatorMetrics {
+            counts_by_status,
+            total_eth: 63.5,
+        };
         let json = serde_json::to_string(&metrics).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["counts_by_status"]["active_ongoing"], 100);
@@ -1183,7 +1353,9 @@ mod tests {
     #[test]
     fn version_json_output_is_valid_json() {
         use crate::metrics::VersionInfo;
-        let info = VersionInfo { versions: vec!["teku/v24.9.0".to_string()] };
+        let info = VersionInfo {
+            versions: vec!["teku/v24.9.0".to_string()],
+        };
         let json = serde_json::to_string(&info).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["versions"][0], "teku/v24.9.0");
@@ -1203,7 +1375,10 @@ mod tests {
 
     #[test]
     fn log_level_json_output_includes_filter_when_scoped() {
-        let payload = LogLevelJson { level: "DEBUG", log_filter: Some(vec!["org.example".to_string()]) };
+        let payload = LogLevelJson {
+            level: "DEBUG",
+            log_filter: Some(vec!["org.example".to_string()]),
+        };
         let json = serde_json::to_string(&payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["level"], "DEBUG");
@@ -1212,7 +1387,10 @@ mod tests {
 
     #[test]
     fn log_level_json_output_omits_filter_when_global() {
-        let payload = LogLevelJson { level: "DEBUG", log_filter: None };
+        let payload = LogLevelJson {
+            level: "DEBUG",
+            log_filter: None,
+        };
         let json = serde_json::to_string(&payload).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["level"], "DEBUG");

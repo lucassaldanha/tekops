@@ -69,8 +69,14 @@ pub struct Plan {
 /// anything, has to be added to an rc file for the shell to find it.
 pub fn plan(shell: Shell, dirs: &Dirs) -> Plan {
     let home = &dirs.home;
-    let xdg_data = dirs.xdg_data.clone().unwrap_or_else(|| home.join(".local/share"));
-    let xdg_config = dirs.xdg_config.clone().unwrap_or_else(|| home.join(".config"));
+    let xdg_data = dirs
+        .xdg_data
+        .clone()
+        .unwrap_or_else(|| home.join(".local/share"));
+    let xdg_config = dirs
+        .xdg_config
+        .clone()
+        .unwrap_or_else(|| home.join(".config"));
 
     match shell {
         // fish scans its completions directory on every invocation, so the
@@ -91,9 +97,7 @@ pub fn plan(shell: Shell, dirs: &Dirs) -> Plan {
             Plan {
                 rc: Some(RcEdit {
                     path: home.join(bash_rc_name(cfg!(target_os = "macos"))),
-                    stanza: format!(
-                        "\n{MARKER}\n[ -f \"{rendered}\" ] && . \"{rendered}\"\n"
-                    ),
+                    stanza: format!("\n{MARKER}\n[ -f \"{rendered}\" ] && . \"{rendered}\"\n"),
                 }),
                 script_path,
             }
@@ -154,7 +158,11 @@ pub fn refresh_installed(binary: &Path, dirs: &Dirs) -> Result<Vec<PathBuf>, Com
 /// thing the user cares about when a refresh fails. The whole output is
 /// buffered before anything is written, so a binary that fails partway through
 /// cannot leave a truncated completion script on disk.
-fn render_with(binary: &Path, shell: Shell, script_path: &Path) -> Result<Vec<u8>, CompletionError> {
+fn render_with(
+    binary: &Path,
+    shell: Shell,
+    script_path: &Path,
+) -> Result<Vec<u8>, CompletionError> {
     // Taken from clap rather than a second hand-written mapping, so the name
     // passed here is by construction the one the CLI accepts.
     let name = shell
@@ -273,10 +281,11 @@ pub fn apply(plan: &Plan, script: &str) -> Result<Applied, CompletionError> {
                         path: edit.path.clone(),
                         message: e.to_string(),
                     })?;
-                file.write_all(edit.stanza.as_bytes()).map_err(|e| CompletionError::Io {
-                    path: edit.path.clone(),
-                    message: e.to_string(),
-                })?;
+                file.write_all(edit.stanza.as_bytes())
+                    .map_err(|e| CompletionError::Io {
+                        path: edit.path.clone(),
+                        message: e.to_string(),
+                    })?;
                 RcOutcome::Appended(edit.path.clone())
             }
         }
@@ -297,9 +306,13 @@ pub fn apply(plan: &Plan, script: &str) -> Result<Applied, CompletionError> {
 pub fn generate(shell: Shell, cmd: &mut clap::Command) -> String {
     let mut out = Vec::new();
     match shell {
-        Shell::Bash => clap_complete::generate(clap_complete::shells::Bash, cmd, "tekops", &mut out),
+        Shell::Bash => {
+            clap_complete::generate(clap_complete::shells::Bash, cmd, "tekops", &mut out)
+        }
         Shell::Zsh => clap_complete::generate(clap_complete::shells::Zsh, cmd, "tekops", &mut out),
-        Shell::Fish => clap_complete::generate(clap_complete::shells::Fish, cmd, "tekops", &mut out),
+        Shell::Fish => {
+            clap_complete::generate(clap_complete::shells::Fish, cmd, "tekops", &mut out)
+        }
     }
     // The generators write only what they rendered from the command
     // definition, which is ASCII shell source by construction.
@@ -356,7 +369,10 @@ mod tests {
     fn zsh_installs_into_zfunc_and_puts_it_on_fpath_before_compinit() {
         let plan = plan(Shell::Zsh, &dirs());
 
-        assert_eq!(plan.script_path, PathBuf::from("/home/lucas/.zfunc/_tekops"));
+        assert_eq!(
+            plan.script_path,
+            PathBuf::from("/home/lucas/.zfunc/_tekops")
+        );
         let rc = plan.rc.expect("zsh needs an rc edit");
         assert_eq!(rc.path, PathBuf::from("/home/lucas/.zshrc"));
         assert!(rc.stanza.contains(MARKER));
@@ -386,7 +402,9 @@ mod tests {
         assert!(rc
             .stanza
             .contains("[ -f \"$HOME/xdg-data/bash-completion/completions/tekops\" ]"));
-        assert!(rc.stanza.contains(". \"$HOME/xdg-data/bash-completion/completions/tekops\""));
+        assert!(rc
+            .stanza
+            .contains(". \"$HOME/xdg-data/bash-completion/completions/tekops\""));
     }
 
     #[test]
@@ -424,7 +442,10 @@ mod tests {
 
         let applied = apply(&plan, "# script").unwrap();
 
-        assert_eq!(std::fs::read_to_string(&plan.script_path).unwrap(), "# script");
+        assert_eq!(
+            std::fs::read_to_string(&plan.script_path).unwrap(),
+            "# script"
+        );
         assert_eq!(applied.rc, RcOutcome::NotNeeded);
     }
 
@@ -464,7 +485,10 @@ mod tests {
         let applied = apply(&plan, "new script").unwrap();
 
         // The script is a snapshot of the CLI, so a second run must replace it.
-        assert_eq!(std::fs::read_to_string(&plan.script_path).unwrap(), "new script");
+        assert_eq!(
+            std::fs::read_to_string(&plan.script_path).unwrap(),
+            "new script"
+        );
         assert_eq!(applied.rc, RcOutcome::AlreadyPresent(rc.clone()));
         let contents = std::fs::read_to_string(&rc).unwrap();
         assert_eq!(contents.matches(MARKER).count(), 1);
@@ -508,7 +532,10 @@ mod tests {
         let refreshed = refresh_installed(&binary, &dirs).unwrap();
 
         assert_eq!(refreshed, vec![zsh.script_path.clone()]);
-        assert_eq!(std::fs::read_to_string(&zsh.script_path).unwrap(), "fresh zsh\n");
+        assert_eq!(
+            std::fs::read_to_string(&zsh.script_path).unwrap(),
+            "fresh zsh\n"
+        );
         // Never installs for a shell the user did not already opt into.
         assert!(!fish.script_path.exists());
     }
@@ -539,7 +566,10 @@ mod tests {
 
         assert!(err.to_string().contains("_tekops"));
         // A failed refresh must not leave a truncated script behind.
-        assert_eq!(std::fs::read_to_string(&zsh.script_path).unwrap(), "stale script");
+        assert_eq!(
+            std::fs::read_to_string(&zsh.script_path).unwrap(),
+            "stale script"
+        );
     }
 
     #[test]
@@ -587,7 +617,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 0, "no supported shell was available to parse-check");
+        assert!(
+            checked > 0,
+            "no supported shell was available to parse-check"
+        );
     }
 
     #[test]
@@ -599,13 +632,19 @@ mod tests {
     #[test]
     fn paths_under_home_are_rendered_relative_to_home() {
         let home = Path::new("/Users/lucas");
-        assert_eq!(home_relative(Path::new("/Users/lucas/.zfunc"), home), "$HOME/.zfunc");
+        assert_eq!(
+            home_relative(Path::new("/Users/lucas/.zfunc"), home),
+            "$HOME/.zfunc"
+        );
     }
 
     #[test]
     fn paths_outside_home_are_rendered_absolute() {
         let home = Path::new("/Users/lucas");
-        assert_eq!(home_relative(Path::new("/opt/share/tekops"), home), "/opt/share/tekops");
+        assert_eq!(
+            home_relative(Path::new("/opt/share/tekops"), home),
+            "/opt/share/tekops"
+        );
     }
 
     #[test]

@@ -188,7 +188,10 @@ fn percent_encode(value: &str) -> String {
 
 impl BeaconClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into(), agent: agent() }
+        Self {
+            base_url: base_url.into(),
+            agent: agent(),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -204,7 +207,11 @@ impl BeaconClient {
     }
 
     fn get_json<T: for<'de> serde::Deserialize<'de>>(&self, path: &str) -> Result<T, ApiError> {
-        let resp = self.agent.get(&self.url(path)).call().map_err(map_ureq_error)?;
+        let resp = self
+            .agent
+            .get(&self.url(path))
+            .call()
+            .map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
@@ -214,13 +221,20 @@ impl BeaconClient {
         path: &str,
         body: impl serde::Serialize,
     ) -> Result<T, ApiError> {
-        let resp = self.agent.post(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
+        let resp = self
+            .agent
+            .post(&self.url(path))
+            .send_json(body)
+            .map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
     }
 
     fn put_json(&self, path: &str, body: impl serde::Serialize) -> Result<(), ApiError> {
-        self.agent.put(&self.url(path)).send_json(body).map_err(map_ureq_error)?;
+        self.agent
+            .put(&self.url(path))
+            .send_json(body)
+            .map_err(map_ureq_error)?;
         Ok(())
     }
 
@@ -229,7 +243,10 @@ impl BeaconClient {
             200 => Ok(HealthState::Ready),
             206 => Ok(HealthState::Syncing),
             503 => Ok(HealthState::NotReady),
-            other => Err(ApiError::Status(other, "unexpected health status".to_string())),
+            other => Err(ApiError::Status(
+                other,
+                "unexpected health status".to_string(),
+            )),
         }
     }
 
@@ -281,7 +298,11 @@ impl BeaconClient {
         // itself be encoded). Interpolating them raw lets an id containing `&`
         // or `#` split into extra query parameters and silently query
         // something other than what was asked for.
-        let query = ids.iter().map(|id| percent_encode(id)).collect::<Vec<_>>().join(",");
+        let query = ids
+            .iter()
+            .map(|id| percent_encode(id))
+            .collect::<Vec<_>>()
+            .join(",");
         let path = format!("/eth/v1/beacon/states/head/validators?id={query}");
         let parsed: ValidatorsResponse = self.get_json(&path)?;
         Ok(parsed
@@ -296,7 +317,11 @@ impl BeaconClient {
             .collect())
     }
 
-    pub fn duties_attester(&self, epoch: u64, indices: &[String]) -> Result<Vec<AttesterDuty>, ApiError> {
+    pub fn duties_attester(
+        &self,
+        epoch: u64,
+        indices: &[String],
+    ) -> Result<Vec<AttesterDuty>, ApiError> {
         let path = format!("/eth/v1/validator/duties/attester/{epoch}");
         let parsed: AttesterDutiesResponse = self.post_json(&path, indices)?;
         Ok(parsed
@@ -317,7 +342,11 @@ impl BeaconClient {
         Ok(parsed
             .data
             .into_iter()
-            .map(|d| ProposerDuty { pubkey: d.pubkey, validator_index: d.validator_index, slot: d.slot })
+            .map(|d| ProposerDuty {
+                pubkey: d.pubkey,
+                validator_index: d.validator_index,
+                slot: d.slot,
+            })
             .collect())
     }
 
@@ -325,8 +354,15 @@ impl BeaconClient {
     /// specific logger names (e.g. `org.hyperledger.besu`); `None` changes
     /// the global level, and must be omitted from the request body entirely
     /// rather than sent as `null` or `[]`.
-    pub fn set_log_level(&self, level: &str, log_filter: Option<Vec<String>>) -> Result<(), ApiError> {
-        let body = LogLevelRequest { level: level.to_string(), log_filter };
+    pub fn set_log_level(
+        &self,
+        level: &str,
+        log_filter: Option<Vec<String>>,
+    ) -> Result<(), ApiError> {
+        let body = LogLevelRequest {
+            level: level.to_string(),
+            log_filter,
+        };
         self.put_json("/teku/v1/admin/log_level", body)
     }
 }
@@ -338,7 +374,10 @@ mod tests {
     #[test]
     fn health_ready_on_200() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/eth/v1/node/health").with_status(200).create();
+        let _m = server
+            .mock("GET", "/eth/v1/node/health")
+            .with_status(200)
+            .create();
         let client = BeaconClient::new(server.url());
         assert!(matches!(client.health().unwrap(), HealthState::Ready));
     }
@@ -346,7 +385,10 @@ mod tests {
     #[test]
     fn health_syncing_on_206() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/eth/v1/node/health").with_status(206).create();
+        let _m = server
+            .mock("GET", "/eth/v1/node/health")
+            .with_status(206)
+            .create();
         let client = BeaconClient::new(server.url());
         assert!(matches!(client.health().unwrap(), HealthState::Syncing));
     }
@@ -354,7 +396,10 @@ mod tests {
     #[test]
     fn health_not_ready_on_503() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/eth/v1/node/health").with_status(503).create();
+        let _m = server
+            .mock("GET", "/eth/v1/node/health")
+            .with_status(503)
+            .create();
         let client = BeaconClient::new(server.url());
         assert!(matches!(client.health().unwrap(), HealthState::NotReady));
     }
@@ -405,7 +450,11 @@ mod tests {
             {"peer_id":"p1","last_seen_p2p_address":"/ip4/1.2.3.4/udp/9001/quic","state":"connected","direction":"inbound"},
             {"peer_id":"p2","last_seen_p2p_address":"/ip4/5.6.7.8/tcp/9000","state":"connected","direction":"outbound"}
         ]}"#;
-        let _m = server.mock("GET", "/eth/v1/node/peers").with_status(200).with_body(body).create();
+        let _m = server
+            .mock("GET", "/eth/v1/node/peers")
+            .with_status(200)
+            .with_body(body)
+            .create();
         let client = BeaconClient::new(server.url());
         let peers = client.peers().unwrap();
         assert_eq!(peers.len(), 2);
@@ -453,7 +502,10 @@ mod tests {
         // Matching on the encoded form asserts the whole hostile id arrived as
         // a single `id` value rather than splitting into a second parameter.
         let _m = server
-            .mock("GET", "/eth/v1/beacon/states/head/validators?id=1%26injected%3Dyes")
+            .mock(
+                "GET",
+                "/eth/v1/beacon/states/head/validators?id=1%26injected%3Dyes",
+            )
             .with_status(200)
             .with_body(r#"{"data":[]}"#)
             .create();
@@ -471,7 +523,9 @@ mod tests {
             .with_body(r#"{"data":[]}"#)
             .create();
         let client = BeaconClient::new(server.url());
-        client.validators(&["1".to_string(), "2".to_string()]).unwrap();
+        client
+            .validators(&["1".to_string(), "2".to_string()])
+            .unwrap();
         _m.assert();
     }
 
@@ -531,7 +585,9 @@ mod tests {
         let mut server = mockito::Server::new();
         let _m = server
             .mock("PUT", "/teku/v1/admin/log_level")
-            .match_body(mockito::Matcher::Json(serde_json::json!({"level": "DEBUG"})))
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({"level": "DEBUG"}),
+            ))
             .with_status(200)
             .create();
         let client = BeaconClient::new(server.url());
@@ -549,13 +605,18 @@ mod tests {
             .with_status(200)
             .create();
         let client = BeaconClient::new(server.url());
-        client.set_log_level("DEBUG", Some(vec!["org.example".to_string()])).unwrap();
+        client
+            .set_log_level("DEBUG", Some(vec!["org.example".to_string()]))
+            .unwrap();
     }
 
     #[test]
     fn set_log_level_errors_on_non_2xx_status() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("PUT", "/teku/v1/admin/log_level").with_status(400).create();
+        let _m = server
+            .mock("PUT", "/teku/v1/admin/log_level")
+            .with_status(400)
+            .create();
         let client = BeaconClient::new(server.url());
         let err = client.set_log_level("NOT_A_LEVEL", None).unwrap_err();
         assert!(matches!(err, ApiError::Status(400, _)));
