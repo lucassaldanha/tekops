@@ -281,37 +281,37 @@ pub fn run() -> ExitCode {
         Commands::Beacon { command, api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            run_beacon(client, command, api.json)
+            run_beacon(client, command, api.json, stack)
         }
         Commands::Peers { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for_api(beacon_peers(&client, api.json))
+            exit_for_api(beacon_peers(&client, api.json), stack)
         }
         Commands::Health { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for_api(beacon_health(&client, api.json))
+            exit_for_api(beacon_health(&client, api.json), stack)
         }
         Commands::Head { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for_api(beacon_head(&client, api.json))
+            exit_for_api(beacon_head(&client, api.json), stack)
         }
         Commands::Duties { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for_api(metrics_duties(&client, metrics.json))
+            exit_for_api(metrics_duties(&client, metrics.json), stack)
         }
         Commands::Validators { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for_api(metrics_validators(&client, metrics.json))
+            exit_for_api(metrics_validators(&client, metrics.json), stack)
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for_api(metrics_version(&client, metrics.json))
+            exit_for_api(metrics_version(&client, metrics.json), stack)
         }
         Commands::LogLevel {
             level,
@@ -320,7 +320,10 @@ pub fn run() -> ExitCode {
         } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for_api(beacon_log_level(&client, &level, log_filter, api.json))
+            exit_for_api(
+                beacon_log_level(&client, &level, log_filter, api.json),
+                stack,
+            )
         }
         Commands::Autocomplete { shell, print, yes } => {
             exit_for(run_autocomplete(shell, print, yes))
@@ -399,7 +402,7 @@ fn hint_from_ps(ps: &str) -> Option<String> {
     let (stack, _) = detect_stack(ps, None).ok()?;
     let name = stack.to_possible_value()?;
     Some(format!(
-        "hint: detected a {} stack; try --stack {} or set $TEKOPS_STACK",
+        "hint: detected {} containers; try --stack {} or set $TEKOPS_STACK",
         name.get_name(),
         name.get_name()
     ))
@@ -419,13 +422,17 @@ fn docker_stack_hint() -> Option<String> {
 ///
 /// Identical to `exit_for` except that an unreachable endpoint gets a stack
 /// hint appended, since "could not reach endpoint" on a Docker host almost
-/// always means the ports are the default bare-metal ones.
-fn exit_for_api(result: Result<(), ApiError>) -> ExitCode {
+/// always means the ports are the default bare-metal ones. `stack` is the
+/// profile already resolved for this invocation (flag, then $TEKOPS_STACK) -
+/// when the operator has named one, the hint would just be telling them to do
+/// what they already did, so it is skipped: if their explicitly chosen
+/// profile still cannot connect, the stack name was never the problem.
+fn exit_for_api(result: Result<(), ApiError>, stack: Option<Stack>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
-            if matches!(e, ApiError::Unreachable(_)) {
+            if stack.is_none() && matches!(e, ApiError::Unreachable(_)) {
                 if let Some(hint) = docker_stack_hint() {
                     eprintln!("{hint}");
                 }
@@ -457,7 +464,12 @@ struct LogLevelJson<'a> {
     log_filter: Option<Vec<String>>,
 }
 
-fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitCode {
+fn run_beacon(
+    client: BeaconClient,
+    command: BeaconCommand,
+    json: bool,
+    stack: Option<Stack>,
+) -> ExitCode {
     let result = match command {
         BeaconCommand::Validators { ids } => beacon_validators(&client, &ids, json),
         BeaconCommand::Duties { kind } => match kind {
@@ -467,7 +479,7 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
             DutiesKind::Proposer { epoch } => beacon_duties_proposer(&client, epoch, json),
         },
     };
-    exit_for_api(result)
+    exit_for_api(result, stack)
 }
 
 fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
@@ -1486,6 +1498,20 @@ mod tests {
         let hint = hint_from_ps(ps).expect("expected a hint");
         assert!(hint.contains("rocketpool"), "got: {hint}");
         assert!(hint.contains("--stack"), "got: {hint}");
+    }
+
+    /// "a eth-docker stack" / "a rocketpool stack" both read wrong - the
+    /// wording was changed to "detected <name> containers" specifically to
+    /// avoid ever needing an article in front of a stack name.
+    #[test]
+    fn hint_wording_never_puts_an_article_before_the_stack_name() {
+        for ps in [
+            "rocketpool_node\nrocketpool_eth2\n",
+            "eth-docker-consensus-1\n",
+        ] {
+            let hint = hint_from_ps(ps).expect("expected a hint");
+            assert!(!hint.contains(" a "), "got: {hint}");
+        }
     }
 
     #[test]
