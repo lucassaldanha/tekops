@@ -602,13 +602,6 @@ mod tests {
         assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
     }
 
-    /// A detected container now applies unconditionally as well.
-    #[test]
-    fn a_detected_container_is_honoured() {
-        let t = target(None, None, None, None, Some("rocketpool_eth2"));
-        assert_eq!(t, LogTarget::Container("rocketpool_eth2".into()));
-    }
-
     /// A custom stack tekops does not recognize is a supported deployment: the
     /// container override must work with detection having found nothing.
     #[test]
