@@ -346,7 +346,8 @@ pub fn run() -> ExitCode {
             // Unlike `logs`, which only ever wants the container name, the
             // header reports which stack this came from. Detection already
             // knows, so a detected stack beats "unknown" - the same
-            // flag > env > detection ladder the rest of the command uses.
+            // flag > env > config > detection ladder the rest of the command
+            // uses.
             let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
             let target = crate::logs::resolve_log_target(
                 path,
@@ -438,12 +439,13 @@ pub fn run() -> ExitCode {
 
 /// Doctor's stack ladder, which differs from every other API command's.
 ///
-/// The others read only the flag and the env var, then suggest `--stack` in a
-/// hint when the endpoint turns out to be unreachable. Doctor is already
-/// running `docker ps` for the container checks, so detection costs nothing
-/// and is applied to the URLs as well: `flags > env > detection > default`, the
-/// same ladder `logs` uses. Because detection has already been applied, doctor
-/// does not print the hint; there would be nothing left for it to suggest.
+/// The others read the flag, the env var, and the config file, then suggest
+/// `--stack` in a hint when the endpoint turns out to be unreachable. Doctor
+/// is already running `docker ps` for the container checks, so it adds a
+/// detection rung the others lack, applied to the URLs as well:
+/// `flag > env > config > detection > default`, the same ladder `logs` uses.
+/// Because detection has already been applied, doctor does not print the
+/// hint; there would be nothing left for it to suggest.
 ///
 /// The ladder terminates in `Stack::BareMetal` rather than `None`:
 /// `resolve_base_url`/`resolve_metric_url` already default to bare-metal
