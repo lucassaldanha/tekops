@@ -106,14 +106,30 @@ pub fn resolve_log_target(
     LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
 }
 
+/// Whether a producer follows the log forever or stops at the end of it.
+///
+/// `Follow` is what `tekops logs` needs, and `run_logs`'s whole
+/// process-lifetime design rests on it: the producer never reaches EOF, so the
+/// streaming loop cannot be what ends the session, which is why the main
+/// thread blocks on the pager instead. `Once` is what `tekops dump-logs`
+/// needs and has the opposite property - the process ends by itself, so none
+/// of the pager, signal-handler or temp-file machinery applies to it at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Follow,
+    Once,
+}
+
 /// The command that produces raw log lines for one session.
 ///
 /// Returned as data rather than a built `Command` so the argv shape is
 /// testable, which matters because of the shell on the container path.
 ///
-/// Both producers share the property the whole process-lifetime design in
-/// `run_logs` depends on: neither ever reaches EOF on its own, so the streaming
-/// loop cannot be what ends the session.
+/// In `Mode::Follow`, both producers share the property the whole
+/// process-lifetime design in `run_logs` depends on: neither ever reaches EOF
+/// on its own, so the streaming loop cannot be what ends the session. In
+/// `Mode::Once` that is deliberately inverted - both end at EOF, which is what
+/// lets `dump.rs` read them to completion with no pager to supervise.
 ///
 /// The container path goes through `sh` for exactly one reason: `docker logs`
 /// writes the container's stderr to *its* stderr, and an uncaptured stderr
@@ -129,27 +145,39 @@ pub fn resolve_log_target(
 /// autodetected or operator-supplied, and interpolating it would turn it into
 /// shell code. `exec` keeps the process count the same as the `tail` path, so
 /// the kill in `supervise_pager` still reaches the process that matters.
-pub fn producer_argv(target: &LogTarget, lines: u32) -> (String, Vec<String>) {
+///
+/// `mode` decides only whether the follow flag is present. Everything else,
+/// and in particular the container arm's positional-argument shape, is
+/// identical between the two - which is the reason this is one function with a
+/// mode rather than two functions.
+pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec<String>) {
     match target {
-        LogTarget::File(path) => (
-            "tail".to_string(),
-            vec![
-                "-F".to_string(),
-                "-n".to_string(),
-                lines.to_string(),
-                path.display().to_string(),
-            ],
-        ),
-        LogTarget::Container(name) => (
-            "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                "exec docker logs -f --tail \"$1\" \"$2\" 2>&1".to_string(),
+        LogTarget::File(path) => {
+            let mut argv = Vec::new();
+            if mode == Mode::Follow {
+                argv.push("-F".to_string());
+            }
+            argv.push("-n".to_string());
+            argv.push(lines.to_string());
+            argv.push(path.display().to_string());
+            ("tail".to_string(), argv)
+        }
+        LogTarget::Container(name) => {
+            let script = match mode {
+                Mode::Follow => "exec docker logs -f --tail \"$1\" \"$2\" 2>&1",
+                Mode::Once => "exec docker logs --tail \"$1\" \"$2\" 2>&1",
+            };
+            (
                 "sh".to_string(),
-                lines.to_string(),
-                name.clone(),
-            ],
-        ),
+                vec![
+                    "-c".to_string(),
+                    script.to_string(),
+                    "sh".to_string(),
+                    lines.to_string(),
+                    name.clone(),
+                ],
+            )
+        }
     }
 }
 
@@ -207,7 +235,7 @@ pub fn run_logs(
         return ExitCode::FAILURE;
     }
 
-    let (prog, args) = producer_argv(&target, lines);
+    let (prog, args) = producer_argv(&target, lines, Mode::Follow);
     let mut producer = match Command::new(&prog)
         .args(&args)
         .stdout(Stdio::piped())
@@ -612,14 +640,19 @@ mod tests {
 
     #[test]
     fn file_targets_still_spawn_tail_exactly_as_before() {
-        let (prog, args) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 500);
+        let (prog, args) =
+            producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 500, Mode::Follow);
         assert_eq!(prog, "tail");
         assert_eq!(args, vec!["-F", "-n", "500", "/a.log"]);
     }
 
     #[test]
     fn container_targets_spawn_docker_logs_with_stderr_merged() {
-        let (prog, args) = producer_argv(&LogTarget::Container("rocketpool_eth2".into()), 500);
+        let (prog, args) = producer_argv(
+            &LogTarget::Container("rocketpool_eth2".into()),
+            500,
+            Mode::Follow,
+        );
         assert_eq!(prog, "sh");
         assert_eq!(args[0], "-c");
         assert!(
@@ -645,7 +678,7 @@ mod tests {
     #[test]
     fn a_hostile_container_name_stays_data_not_code() {
         let hostile = "x\"; touch /tmp/pwned; echo \"";
-        let (_, args) = producer_argv(&LogTarget::Container(hostile.into()), 500);
+        let (_, args) = producer_argv(&LogTarget::Container(hostile.into()), 500, Mode::Follow);
         assert!(
             !args[1].contains("pwned"),
             "container name leaked into the script: {}",
@@ -661,9 +694,38 @@ mod tests {
     /// is docker's spelling of the same thing. The two must agree.
     #[test]
     fn zero_lines_is_passed_through_on_both_paths() {
-        let (_, file) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 0);
+        let (_, file) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 0, Mode::Follow);
         assert_eq!(file[2], "0");
-        let (_, container) = producer_argv(&LogTarget::Container("c".into()), 0);
+        let (_, container) = producer_argv(&LogTarget::Container("c".into()), 0, Mode::Follow);
         assert_eq!(container[3], "0");
+    }
+
+    /// `dump-logs` needs a producer that ends on its own. Everything else
+    /// about the argv must be identical to the follow case.
+    #[test]
+    fn once_mode_drops_the_follow_flag_for_a_file() {
+        let (prog, args) =
+            producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 1000, Mode::Once);
+        assert_eq!(prog, "tail");
+        assert!(!args.contains(&"-F".to_string()));
+        assert_eq!(args, vec!["-n", "1000", "/a.log"]);
+    }
+
+    /// The container arm's positional-argument shape is the injection guard,
+    /// so it has to survive the mode change intact.
+    #[test]
+    fn once_mode_drops_the_follow_flag_for_a_container() {
+        let (prog, args) = producer_argv(
+            &LogTarget::Container("eth-docker-consensus-1".into()),
+            1000,
+            Mode::Once,
+        );
+        assert_eq!(prog, "sh");
+        assert_eq!(args[1], "exec docker logs --tail \"$1\" \"$2\" 2>&1");
+        assert!(!args[1].contains("-f"));
+        assert!(args[1].contains("2>&1"));
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "1000");
+        assert_eq!(args[4], "eth-docker-consensus-1");
     }
 }

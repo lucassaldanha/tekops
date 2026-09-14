@@ -4,6 +4,8 @@ mod completions;
 mod curl;
 mod docker;
 mod doctor;
+mod dump;
+mod gist;
 mod host;
 mod http;
 mod logfmt;

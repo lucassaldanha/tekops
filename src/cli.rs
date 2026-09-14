@@ -104,6 +104,36 @@ enum Commands {
         #[arg(long)]
         stack: Option<Stack>,
     },
+    /// Write the last N log lines to a shareable file or gist, anonymised
+    DumpLogs {
+        /// Path to a log file (defaults to the Teku log, or a detected container)
+        #[arg(conflicts_with = "container")]
+        path: Option<PathBuf>,
+        /// How many lines to dump
+        #[arg(short = 'n', long = "lines", default_value_t = 1000)]
+        lines: u32,
+        /// Write the dump here (default: ./tekops-dump-<timestamp>.txt)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Upload to a secret GitHub gist (needs $GITHUB_TOKEN or $GH_TOKEN)
+        #[arg(long)]
+        gist: bool,
+        /// Upload without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Prepend a provenance block naming the build, stack and source
+        #[arg(long)]
+        header: bool,
+        /// Run the doctor checks and embed the report above the logs
+        #[arg(long)]
+        doctor: bool,
+        /// Docker container to read logs from (or $TEKOPS_CONTAINER)
+        #[arg(long)]
+        container: Option<String>,
+        /// Deployment to narrow container detection to (or $TEKOPS_STACK)
+        #[arg(long)]
+        stack: Option<Stack>,
+    },
     /// Query the node's Beacon API
     Beacon {
         #[command(subcommand)]
@@ -263,6 +293,66 @@ pub fn run() -> ExitCode {
             };
             run_logs(path, lines, container, detected)
         }
+        Commands::DumpLogs {
+            path,
+            lines,
+            output,
+            gist,
+            yes,
+            header,
+            doctor,
+            container,
+            stack,
+        } => {
+            // The same detection gate `logs` uses, and it must stay the
+            // logical negation of every branch in `resolve_log_target` that
+            // fires before its `detected` parameter.
+            let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
+            let container_env = env::var("TEKOPS_CONTAINER").ok();
+            let needs_detection = container.is_none()
+                && path.is_none()
+                && container_env.is_none()
+                && logs_file_env.is_none();
+            let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
+            let detected: Option<(Stack, String)> = if needs_detection {
+                docker_ps_names().and_then(|ps| detect_or_note(&ps, given_stack))
+            } else {
+                None
+            };
+            // Unlike `logs`, which only ever wants the container name, the
+            // header reports which stack this came from. Detection already
+            // knows, so a detected stack beats "unknown" - the same
+            // flag > env > detection ladder the rest of the command uses.
+            let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
+            let target = crate::logs::resolve_log_target(
+                path,
+                container,
+                container_env,
+                logs_file_env,
+                detected.map(|(_, name)| name),
+            );
+            // `--doctor` runs its own `docker ps` through `doctor_probe_config`
+            // rather than reusing the detection above: doctor's ladder also
+            // needs the container name and the two URLs, and duplicating that
+            // here would be a second approximation of the config `doctor`
+            // itself builds. The extra spawn is paid only with `--doctor`.
+            let probe = doctor.then(|| doctor_probe_config(stack, None, None, None));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            exit_for(crate::dump::run_dump(crate::dump::DumpConfig {
+                target,
+                lines,
+                output,
+                gist,
+                yes,
+                header,
+                stack: resolved_stack,
+                doctor: probe,
+                now,
+            }))
+        }
         Commands::Beacon { command, api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
@@ -381,7 +471,20 @@ fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
     }
 }
 
-fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf>) -> ExitCode {
+/// Doctor's full probe configuration, `docker ps` detection included.
+///
+/// Lifted out of `run_doctor` so `dump-logs --doctor` builds the identical
+/// config rather than a second approximation of it. Doctor's stack ladder is
+/// deliberately different from every other API command's - it applies
+/// detection to the URLs too, because it is already running `docker ps` for
+/// the container checks and detection costs nothing at that point. Two callers
+/// now depend on that being true in exactly one place.
+fn doctor_probe_config(
+    stack_flag: Option<Stack>,
+    api_url: Option<String>,
+    metric_url: Option<String>,
+    data_dir: Option<PathBuf>,
+) -> crate::doctor::ProbeConfig {
     // Read once, used for both `given` (below) and `resolve_doctor_stack`.
     let stack_env = env::var("TEKOPS_STACK").ok();
 
@@ -394,7 +497,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     // by neither `false` here nor the lookup below, whose gate has since
     // resolved to bare-metal. That is issue #16: the two together are what
     // keep a node with no containers from hearing about Docker.
-    let given = resolve_stack(api.stack, stack_env.clone());
+    let given = resolve_stack(stack_flag, stack_env.clone());
     let detected: Option<(Stack, String)> = if given.is_none() {
         docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
     } else {
@@ -402,7 +505,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     };
     // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
     // consuming it would leave nothing for the container lookup below.
-    let stack = resolve_doctor_stack(api.stack, stack_env, detected.as_ref().map(|(s, _)| *s));
+    let stack = resolve_doctor_stack(stack_flag, stack_env, detected.as_ref().map(|(s, _)| *s));
 
     // The container name: from detection when it ran, otherwise from a fresh
     // `docker ps` narrowed to the named stack.
@@ -417,13 +520,17 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
             .map(|(_, name)| name),
     };
 
-    let cfg = crate::doctor::ProbeConfig {
+    crate::doctor::ProbeConfig {
         stack,
-        api_url: resolve_base_url(api.api_url, stack),
+        api_url: resolve_base_url(api_url, stack),
         metric_url: resolve_metric_url(metric_url, stack),
         container,
         data_dir: resolve_doctor_data_dir(data_dir, env::var("TEKOPS_DATA_DIR").ok(), stack),
-    };
+    }
+}
+
+fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf>) -> ExitCode {
+    let cfg = doctor_probe_config(api.stack, api.api_url, metric_url, data_dir);
 
     let facts = crate::doctor::probe(&cfg);
     let findings = crate::doctor::evaluate(&facts);
@@ -1084,6 +1191,94 @@ mod tests {
             }
             _ => panic!("expected a Logs command"),
         }
+    }
+
+    #[test]
+    fn dump_logs_defaults_to_a_thousand_lines() {
+        let cli = Cli::try_parse_from(["tekops", "dump-logs"]).unwrap();
+        match cli.command {
+            Commands::DumpLogs { lines, .. } => assert_eq!(lines, 1000),
+            _ => panic!("expected a DumpLogs command"),
+        }
+    }
+
+    #[test]
+    fn dump_logs_takes_a_path_positional_like_logs_does() {
+        let cli = Cli::try_parse_from(["tekops", "dump-logs", "/var/log/x.log"]).unwrap();
+        match cli.command {
+            Commands::DumpLogs { path, .. } => {
+                assert_eq!(path, Some(PathBuf::from("/var/log/x.log")))
+            }
+            _ => panic!("expected a DumpLogs command"),
+        }
+    }
+
+    /// Naming a container fully determines what gets read, which makes a path
+    /// alongside it meaningless rather than merely redundant - the same rule
+    /// `logs` applies.
+    #[test]
+    fn dump_logs_rejects_a_path_alongside_a_container() {
+        assert!(
+            Cli::try_parse_from(["tekops", "dump-logs", "/x.log", "--container", "c"]).is_err()
+        );
+    }
+
+    #[test]
+    fn dump_logs_accepts_its_flags() {
+        let cli = Cli::try_parse_from([
+            "tekops",
+            "dump-logs",
+            "-n",
+            "50",
+            "-o",
+            "out.txt",
+            "--gist",
+            "--yes",
+            "--header",
+            "--doctor",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::DumpLogs {
+                lines,
+                output,
+                gist,
+                yes,
+                header,
+                doctor,
+                ..
+            } => {
+                assert_eq!(lines, 50);
+                assert_eq!(output, Some(PathBuf::from("out.txt")));
+                assert!(gist && yes && header && doctor);
+            }
+            _ => panic!("expected a DumpLogs command"),
+        }
+    }
+
+    /// `dump-logs --doctor` must probe with exactly the config `doctor` itself
+    /// would build, not a second approximation of it. The bare-metal case is
+    /// enough to catch the helper being wired up wrong, and needs no Docker.
+    #[test]
+    fn doctor_probe_config_applies_the_stack_to_both_urls() {
+        let cfg = doctor_probe_config(Some(Stack::BareMetal), None, None, None);
+        assert_eq!(cfg.stack, Some(Stack::BareMetal));
+        assert_eq!(cfg.api_url, resolve_base_url(None, Some(Stack::BareMetal)));
+        assert_eq!(
+            cfg.metric_url,
+            resolve_metric_url(None, Some(Stack::BareMetal))
+        );
+    }
+
+    #[test]
+    fn doctor_probe_config_prefers_an_explicit_url_over_the_stack_default() {
+        let cfg = doctor_probe_config(
+            Some(Stack::BareMetal),
+            Some("http://example.invalid:1234".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(cfg.api_url, "http://example.invalid:1234");
     }
 
     // Commands deliberately doesn't derive Debug, so these match rather than
