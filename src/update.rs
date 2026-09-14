@@ -1,12 +1,11 @@
 //! Self-update: replaces the running tekops binary with a build published to
 //! GitHub Releases.
 //!
-//! All HTTPS goes through `curl` rather than through `ureq`. tekops drops
-//! ureq's TLS backend on purpose (see the dependency comment in Cargo.toml),
-//! and GitHub is HTTPS-only, so the transport has to come from somewhere that
-//! is not this binary. `curl` is documented as a runtime dependency alongside
-//! `tail`, `less`, and `tar`.
+//! All HTTPS goes through `curl` rather than through `ureq`, for the reasons
+//! `curl.rs` documents; this module owns only what is specific to fetching a
+//! release, not the transport itself.
 
+use crate::curl::{self, CurlError};
 use crate::term::sanitize;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -95,33 +94,17 @@ fn download_url(version: &str, file: &str) -> String {
     format!("https://github.com/{REPO}/releases/download/v{version}/{file}")
 }
 
-const CURL: &str = "curl";
-
 #[derive(Debug)]
 pub enum UpdateError {
     UnsupportedTarget,
-    CurlMissing,
     TarMissing,
-    CurlFailed {
-        url: String,
-        status: String,
-        stderr: String,
-        hint: Option<&'static str>,
-    },
+    Curl(CurlError),
     Malformed(String),
-    ChecksumMissing {
-        asset: String,
-    },
-    ChecksumMismatch {
-        expected: String,
-        actual: String,
-    },
+    ChecksumMissing { asset: String },
+    ChecksumMismatch { expected: String, actual: String },
     ExtractFailed(String),
     SmokeTestFailed(String),
-    NotWritable {
-        dir: PathBuf,
-        source: String,
-    },
+    NotWritable { dir: PathBuf, source: String },
     Io(String),
 }
 
@@ -134,19 +117,10 @@ impl fmt::Display for UpdateError {
                 std::env::consts::ARCH,
                 std::env::consts::OS
             ),
-            UpdateError::CurlMissing => {
-                write!(f, "curl is required for updates but was not found on PATH")
-            }
             UpdateError::TarMissing => {
                 write!(f, "tar is required for updates but was not found on PATH")
             }
-            UpdateError::CurlFailed { url, status, stderr, hint } => {
-                write!(f, "could not download {url} ({status}): {stderr}")?;
-                match hint {
-                    Some(hint) => write!(f, "\n{hint}"),
-                    None => Ok(()),
-                }
-            }
+            UpdateError::Curl(e) => write!(f, "{e}"),
             UpdateError::Malformed(msg) => write!(f, "GitHub returned malformed data: {msg}"),
             UpdateError::ChecksumMissing { asset } => {
                 write!(f, "SHA256SUMS does not list {asset}; refusing to install an unlisted asset")
@@ -169,98 +143,15 @@ impl fmt::Display for UpdateError {
     }
 }
 
-const CONNECT_TIMEOUT_SECS: u64 = 10;
-const STALL_TIMEOUT_SECS: u64 = 30;
-
-/// The bound that stops a wedged endpoint from hanging the command forever.
-///
-/// curl applies no timeout of its own by default, so without this a host that
-/// accepts the connection and then never answers leaves `tekops update` waiting
-/// with no output at all - `-s` suppresses even the progress meter. That is the
-/// same failure `http::agent` exists to prevent on the ureq side, and it was
-/// reproduced here against a black-hole socket.
-///
-/// It is a stall bound rather than `--max-time` on purpose: a release tarball
-/// is megabytes, and a slow but progressing download over a node's link must
-/// not be killed by a wall clock. `--speed-limit 1 --speed-time N` gives up
-/// only when nothing arrives for N seconds, which covers both a server that
-/// never sends headers and one that dies mid-transfer.
-fn stall_argv(stall_secs: u64) -> Vec<String> {
-    vec![
-        "--connect-timeout".to_string(),
-        CONNECT_TIMEOUT_SECS.to_string(),
-        "--speed-limit".to_string(),
-        "1".to_string(),
-        "--speed-time".to_string(),
-        stall_secs.to_string(),
-    ]
-}
-
-fn curl_argv(url: &str) -> Vec<String> {
-    let mut argv = vec![
-        "-fsSL".to_string(),
-        "--proto".to_string(),
-        "=https".to_string(),
-    ];
-    argv.extend(stall_argv(STALL_TIMEOUT_SECS));
-    argv.push(url.to_string());
-    argv
-}
-
-/// The single HTTPS boundary. Every network read in this module goes through
-/// here, so the transport policy lives in exactly one place - the same reason
-/// `http::agent()` exists for the ureq clients.
-pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, UpdateError> {
-    fetch_with(CURL, url)
-}
-
-fn fetch_with(program: &str, url: &str) -> Result<Vec<u8>, UpdateError> {
-    let output = Command::new(program)
-        .args(curl_argv(url))
-        .output()
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => UpdateError::CurlMissing,
-            _ => UpdateError::Io(e.to_string()),
-        })?;
-
-    if !output.status.success() {
-        return Err(UpdateError::CurlFailed {
-            url: url.to_string(),
-            status: output.status.to_string(),
-            stderr: sanitize(String::from_utf8_lossy(&output.stderr).trim()),
-            hint: None,
-        });
+impl From<CurlError> for UpdateError {
+    fn from(e: CurlError) -> Self {
+        UpdateError::Curl(e)
     }
-    Ok(output.stdout)
 }
 
 const ASSET_HINT: &str =
     "if the version is real, there may be no asset published for this platform";
 const RELEASE_HINT: &str = "the repository may be private, or have no published releases";
-
-/// Attaches the reading that fits the hop that failed.
-///
-/// The same curl failure means different things at different URLs: a 404 on an
-/// asset points at the platform, a 404 on the release API points at the
-/// repository. Hanging one hint off every curl failure - which is what this
-/// used to do - sends the operator looking in the wrong place, and a private
-/// repo is exactly the case that produces the wrong one.
-fn with_hint(err: UpdateError, hint: &'static str) -> UpdateError {
-    match err {
-        UpdateError::CurlFailed {
-            url,
-            status,
-            stderr,
-            ..
-        } => UpdateError::CurlFailed {
-            url,
-            status,
-            stderr,
-            hint: Some(hint),
-        },
-        other => other,
-    }
-}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -446,9 +337,9 @@ fn tag_from_release_json(body: &[u8]) -> Result<String, UpdateError> {
 /// way to end up below the latest release is to be behind it.
 pub fn check<F>(fetch: F) -> Result<CheckResult, UpdateError>
 where
-    F: Fn(&str) -> Result<Vec<u8>, UpdateError>,
+    F: Fn(&str) -> Result<Vec<u8>, CurlError>,
 {
-    let body = fetch(&latest_release_url()).map_err(|e| with_hint(e, RELEASE_HINT))?;
+    let body = fetch(&latest_release_url()).map_err(|e| curl::with_hint(e, RELEASE_HINT))?;
     let latest = tag_from_release_json(&body)?;
     let current = current_version().to_string();
     Ok(CheckResult {
@@ -466,7 +357,7 @@ where
 /// early return above that rename leaves a working tekops in place.
 pub fn install<F>(fetch: F, version: &str, dest: &Path) -> Result<(), UpdateError>
 where
-    F: Fn(&str) -> Result<Vec<u8>, UpdateError>,
+    F: Fn(&str) -> Result<Vec<u8>, CurlError>,
 {
     let target = TARGET.ok_or(UpdateError::UnsupportedTarget)?;
     let dir = dest
@@ -475,7 +366,8 @@ where
     probe_writable(dir)?;
 
     let asset = asset_name(version, target);
-    let tarball = fetch(&download_url(version, &asset)).map_err(|e| with_hint(e, ASSET_HINT))?;
+    let tarball =
+        fetch(&download_url(version, &asset)).map_err(|e| curl::with_hint(e, ASSET_HINT))?;
     // No hint on SHA256SUMS: the URL in the message already says what is
     // missing, and a release that has the tarball but not its checksums is not
     // a platform problem.
@@ -598,69 +490,12 @@ mod tests {
         }
     }
 
-    /// `-f` turns an HTTP error status into a nonzero exit instead of a body
-    /// of HTML; `-L` is required because GitHub redirects release downloads to
-    /// objects.githubusercontent.com; `--proto =https` pins every hop of that
-    /// redirect chain to https so a redirect cannot downgrade the transport.
-    #[test]
-    fn curl_argv_pins_the_protocol_and_follows_redirects() {
-        let argv = curl_argv("https://example.invalid/x");
-        assert!(argv.contains(&"-fsSL".to_string()), "argv was {argv:?}");
-        let proto = argv
-            .iter()
-            .position(|a| a == "--proto")
-            .expect("no --proto");
-        assert_eq!(argv[proto + 1], "=https");
-        assert_eq!(argv.last().unwrap(), "https://example.invalid/x");
-    }
-
-    #[test]
-    fn a_missing_curl_is_reported_as_such() {
-        let err = fetch_with("tekops-no-such-program-exists", "https://example.invalid/x")
-            .expect_err("a missing program must not succeed");
-        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
-        assert!(err.to_string().contains("curl"));
-    }
-
-    /// Stands in for curl to prove the plumbing: the child is spawned with our
-    /// argv and its stdout is what comes back.
-    #[test]
-    fn a_successful_program_returns_its_stdout() {
-        let out = fetch_with("echo", "https://example.invalid/x").expect("echo should succeed");
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("https://example.invalid/x"), "got {text:?}");
-    }
-
-    #[test]
-    fn a_nonzero_exit_is_reported_with_the_url() {
-        let err = fetch_with("false", "https://example.invalid/x")
-            .expect_err("a failing program must not succeed");
-        assert!(matches!(err, UpdateError::CurlFailed { .. }), "got {err:?}");
-        assert!(err.to_string().contains("https://example.invalid/x"));
-    }
-
-    /// curl's stderr is untrusted text on its way to the operator's terminal,
-    /// the same class of input `map_ureq_error` sanitizes.
-    #[test]
-    fn curl_stderr_is_sanitized_into_the_error() {
-        let err = UpdateError::CurlFailed {
-            url: "https://example.invalid/x".into(),
-            status: "exit status: 22".into(),
-            stderr: crate::term::sanitize("boom\u{1b}[2Jgone"),
-            hint: None,
-        };
-        assert!(
-            !err.to_string().contains('\u{1b}'),
-            "escape survived: {err}"
-        );
-    }
-
     /// The platform hint belongs to the asset download only. Attached to the
     /// release-metadata call it points the operator at the wrong cause, which
     /// is what a private repo produced in practice.
     #[test]
     fn each_hop_carries_the_hint_that_fits_it() {
-        let raw = || UpdateError::CurlFailed {
+        let raw = || CurlError::Failed {
             url: "https://example.invalid/x".into(),
             status: "exit status: 22".into(),
             stderr: "404".into(),
@@ -672,91 +507,16 @@ mod tests {
             "unhinted failure claimed a cause: {bare}"
         );
 
-        let asset = with_hint(raw(), ASSET_HINT).to_string();
+        let asset = curl::with_hint(raw(), ASSET_HINT).to_string();
         assert!(
             asset.contains("no asset published for this platform"),
             "got {asset}"
         );
         assert!(!asset.contains("private"), "got {asset}");
 
-        let release = with_hint(raw(), RELEASE_HINT).to_string();
+        let release = curl::with_hint(raw(), RELEASE_HINT).to_string();
         assert!(release.contains("private"), "got {release}");
         assert!(!release.contains("this platform"), "got {release}");
-    }
-
-    /// A failure that is not a curl failure has no hop to describe, so
-    /// `with_hint` must leave it alone rather than reshaping it.
-    #[test]
-    fn with_hint_passes_other_errors_through() {
-        let err = with_hint(UpdateError::CurlMissing, ASSET_HINT);
-        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
-    }
-
-    /// curl applies no timeout of its own, so the argv this binary ships has to
-    /// carry the bound - the same invariant `production_agent_has_a_bounded_timeout`
-    /// asserts for the ureq side.
-    #[test]
-    fn curl_argv_carries_a_stall_bound() {
-        let argv = curl_argv("https://example.invalid/x");
-        let at = |flag: &str| {
-            argv.iter()
-                .position(|a| a == flag)
-                .map(|i| argv[i + 1].clone())
-                .unwrap_or_else(|| panic!("{flag} missing from {argv:?}"))
-        };
-        assert_eq!(at("--connect-timeout"), CONNECT_TIMEOUT_SECS.to_string());
-        assert_eq!(at("--speed-limit"), "1");
-        assert_eq!(at("--speed-time"), STALL_TIMEOUT_SECS.to_string());
-
-        // Read the bound back off the argv rather than off the constant, so a
-        // value that curl would treat as "no bound" cannot ship unnoticed.
-        let stall: u64 = at("--speed-time")
-            .parse()
-            .expect("speed-time must be a number");
-        assert!(
-            stall > 0 && stall <= 120,
-            "{stall}s is not a useful stall bound"
-        );
-    }
-
-    /// The real repro: a host that accepts the connection and then never
-    /// answers. Without the stall bound curl waits forever and `-s` hides even
-    /// the progress meter, so the command looks frozen.
-    ///
-    /// It runs over plain http with a short injected stall, mirroring
-    /// `agent_with_timeout` in `http.rs`. The shipped `--proto =https` would
-    /// make curl reject an http test URL instantly and the deadline below would
-    /// then pass without ever exercising the timeout.
-    #[test]
-    fn a_wedged_endpoint_gives_up_instead_of_hanging() {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let mut held = Vec::new();
-            while let Ok((conn, _)) = listener.accept() {
-                held.push(conn);
-            }
-        });
-
-        let started = std::time::Instant::now();
-        let status = Command::new(CURL)
-            .args(["-fsS", "--proto", "=http"])
-            .args(stall_argv(1))
-            .arg(format!("http://127.0.0.1:{port}/x"))
-            .output()
-            .expect("curl should be on PATH for this suite")
-            .status;
-        let elapsed = started.elapsed();
-
-        assert!(
-            !status.success(),
-            "a silent endpoint must not look like a success"
-        );
-        assert!(
-            elapsed.as_secs() < 10,
-            "curl hung on a silent endpoint for {elapsed:?}"
-        );
     }
 
     const SUMS: &str = concat!(
@@ -1080,7 +840,7 @@ mod tests {
         version: &str,
         tarball: Vec<u8>,
         sums: String,
-    ) -> impl Fn(&str) -> Result<Vec<u8>, UpdateError> {
+    ) -> impl Fn(&str) -> Result<Vec<u8>, CurlError> {
         let version = version.to_string();
         move |url: &str| {
             if url.ends_with("/releases/latest") {
@@ -1126,8 +886,11 @@ mod tests {
 
     #[test]
     fn a_fetch_failure_propagates() {
-        let err = check(|_: &str| Err(UpdateError::CurlMissing)).expect_err("must propagate");
-        assert!(matches!(err, UpdateError::CurlMissing), "got {err:?}");
+        let err = check(|_: &str| Err(CurlError::Missing)).expect_err("must propagate");
+        assert!(
+            matches!(err, UpdateError::Curl(CurlError::Missing)),
+            "got {err:?}"
+        );
     }
 
     #[test]

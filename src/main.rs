@@ -1,6 +1,7 @@
 mod beaconapi;
 mod cli;
 mod completions;
+mod curl;
 mod docker;
 mod doctor;
 mod host;
