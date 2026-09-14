@@ -1,0 +1,41 @@
+# tekops configuration
+#
+# Copy to ~/.config/tekops/config.toml (or $XDG_CONFIG_HOME/tekops/config.toml)
+# and delete whatever you do not need: every key below is optional, and an
+# absent file is not an error.
+#
+# Precedence is: flag > environment variable > this file > detection >
+# built-in default. Anything here is overridden by the matching $TEKOPS_*
+# variable, and both are overridden by a flag on the command line.
+#
+# A typo is fatal rather than ignored. An unknown key, or a bad value, fails
+# the next command you run and names this file - which is the point, since a
+# silently dropped setting would otherwise surface as a confusing connection
+# error against a port you thought you had changed.
+
+# Deployment profile: "bare-metal", "eth-docker", or "rocketpool".
+# Sets the default ports for every URL below, and narrows container detection
+# to one stack's naming.  ($TEKOPS_STACK)
+stack = "eth-docker"
+
+# Beacon API base URL. Bare-metal nodes default to port 5051; both Docker
+# stacks put the REST API on 5052.  ($TEKOPS_API_URL)
+api_url = "http://localhost:5052"
+
+# Prometheus scrape URL. Point this at the validator client, not the beacon
+# node: it is the endpoint that answers `duties`, `validators` and `version`,
+# while the beacon node's answers only `version`.  ($TEKOPS_METRIC_URL)
+metric_url = "http://localhost:8009/metrics"
+
+# Docker container to read logs from. Overrides `docker ps` detection, so set
+# it if detection finds more than one candidate.  ($TEKOPS_CONTAINER)
+container = "eth-docker-consensus-1"
+
+# Log file to tail, used when no container applies. Only reached when
+# `container` above is unset.  ($TEKOPS_LOGS_FILE)
+logs_file = "/var/log/teku/teku.log"
+
+# Filesystem `tekops doctor` checks for free space. On a Docker stack the
+# container's own mounts answer this, so set it only to override them.
+# ($TEKOPS_DATA_DIR)
+data_dir = "/var/lib/teku"

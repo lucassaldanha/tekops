@@ -246,4 +246,67 @@ data_dir = "/var/lib/teku"
         let err = load(Some(dir.path())).unwrap_err();
         assert!(err.to_string().contains(&dir.path().display().to_string()));
     }
+
+    /// The committed sample must stay in step with the struct it documents.
+    ///
+    /// A sample kept in sync by discipline drifts. This repo already solves that
+    /// class of problem by having a test read the other artifact - see
+    /// `ci_gates.rs`, which parses both `check.sh` and `ci.yml`, and
+    /// `target_matches_the_names_build_release_publishes`, which reads
+    /// `build-release.sh`. This is the same trade for `config.example.toml`.
+    ///
+    /// The field list comes from serializing a fully populated `Config` rather
+    /// than from a list written out here, so the struct itself is what the sample
+    /// is checked against. A hand-written list would just move the drift problem
+    /// into this file.
+    ///
+    /// The assertion is set *equality*, in both directions: adding a field to
+    /// `Config` without documenting it fails here, and so does leaving a removed
+    /// one behind in the sample.
+    #[test]
+    fn the_sample_documents_exactly_the_configurable_keys() {
+        use std::collections::BTreeSet;
+
+        // Every field Some, so none is skipped by serialization.
+        let populated = Config {
+            stack: Some(Stack::EthDocker),
+            api_url: Some("http://x".into()),
+            metric_url: Some("http://y".into()),
+            container: Some("c".into()),
+            logs_file: Some(PathBuf::from("/a")),
+            data_dir: Some(PathBuf::from("/b")),
+        };
+        let rendered = toml::to_string(&populated).expect("Config must serialize");
+        let from_struct: BTreeSet<String> = rendered
+            .parse::<toml::Table>()
+            .expect("serialized Config must be valid TOML")
+            .keys()
+            .cloned()
+            .collect();
+
+        let sample_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let text = std::fs::read_to_string(&sample_path)
+            .expect("config.example.toml must exist at the repo root");
+        let from_sample: BTreeSet<String> = text
+            .parse::<toml::Table>()
+            .expect("config.example.toml must be valid TOML")
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            from_sample, from_struct,
+            "config.example.toml and Config have drifted apart"
+        );
+    }
+
+    /// The sample is not merely key-correct: every value in it is of the type the
+    /// real parser accepts.
+    #[test]
+    fn the_sample_parses_into_a_config() {
+        let sample_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let text = std::fs::read_to_string(&sample_path).unwrap();
+        let cfg = parse(&text, &sample_path).expect("the shipped sample must parse");
+        assert_eq!(cfg.stack, Some(Stack::EthDocker));
+    }
 }

@@ -82,12 +82,13 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 cp "$binary" "$stage/tekops"
 # USAGE.md ships alongside README.md because the command documentation lives
-# there now. Without it the on-node copy would carry install instructions for
-# a binary that is already installed, and nothing about how to use it.
-cp README.md USAGE.md LICENSE "$stage/"
+# there and the on-node copy is the one an operator reads over SSH.
+# config.example.toml ships for the same reason: it is meant to be copied to
+# ~/.config/tekops/config.toml on the node itself.
+cp README.md USAGE.md LICENSE config.example.toml "$stage/"
 
 tarball="dist/tekops-v$version-$asset_target.tar.gz"
-tar -czf "$tarball" -C "$stage" tekops README.md USAGE.md LICENSE
+tar -czf "$tarball" -C "$stage" tekops README.md USAGE.md LICENSE config.example.toml
 
 # The reproducibility claim is about the binary, not the archive: tar
 # metadata differs between GNU tar in the container and bsdtar on macOS.
