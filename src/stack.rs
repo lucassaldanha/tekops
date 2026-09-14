@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use std::fmt;
 
 /// Which deployment tekops is pointed at.
 ///
@@ -69,6 +70,84 @@ impl Stack {
     }
 }
 
+/// Why `detect_stack` could not name exactly one container.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DetectError {
+    NotFound,
+    Ambiguous(Vec<String>),
+}
+
+impl fmt::Display for DetectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DetectError::NotFound => write!(
+                f,
+                "no Eth Docker or Rocket Pool consensus container found; \
+                 name one with --container or $TEKOPS_CONTAINER"
+            ),
+            DetectError::Ambiguous(names) => write!(
+                f,
+                "found more than one consensus container ({}); \
+                 pick one with --container or narrow with --stack",
+                names.join(", ")
+            ),
+        }
+    }
+}
+
+/// Identifies the stack from the output of `docker ps --format '{{.Names}}'`.
+///
+/// Takes the output as a parameter rather than running `docker` itself, so the
+/// whole matching rule is unit-testable on a machine with no Docker installed -
+/// the same shape, and for the same reason, as `logs::resolve_log_path`.
+///
+/// `only` narrows the search to a single stack's naming, which is what
+/// `--stack` contributes to detection. Note it contributes a *filter*, never a
+/// container name: deriving one from the profile would hand an Eth Docker user
+/// in a differently named directory `eth-docker-consensus-1`, a container that
+/// does not exist on their machine, in preference to the correct name this
+/// function was about to find.
+///
+/// Exactly one match is required. Zero is an error rather than a fallback, and
+/// two is an error rather than a guess, because tailing the wrong node's logs
+/// looks exactly like tailing the right one until it matters.
+#[allow(dead_code)]
+pub fn detect_stack(
+    ps_output: &str,
+    only: Option<Stack>,
+) -> Result<(Stack, String), DetectError> {
+    let candidates = [Stack::EthDocker, Stack::RocketPool];
+    let mut matches: Vec<(Stack, String)> = Vec::new();
+
+    for line in ps_output.lines() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        for stack in candidates {
+            if only.is_some_and(|s| s != stack) {
+                continue;
+            }
+            if let Some(suffix) = stack.container_suffix() {
+                if name.ends_with(suffix) {
+                    matches.push((stack, name.to_string()));
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(DetectError::NotFound),
+        _ => {
+            let mut names: Vec<String> = matches.into_iter().map(|(_, n)| n).collect();
+            names.sort();
+            Err(DetectError::Ambiguous(names))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +189,87 @@ mod tests {
     fn container_suffixes_match_each_stacks_service_naming() {
         assert_eq!(Stack::EthDocker.container_suffix(), Some("-consensus-1"));
         assert_eq!(Stack::RocketPool.container_suffix(), Some("_eth2"));
+    }
+
+    #[test]
+    fn detects_rocket_pool_from_a_default_install() {
+        let ps = "rocketpool_node\nrocketpool_eth1\nrocketpool_eth2\nrocketpool_validator\n";
+        let (stack, name) = detect_stack(ps, None).unwrap();
+        assert_eq!(stack, Stack::RocketPool);
+        assert_eq!(name, "rocketpool_eth2");
+    }
+
+    #[test]
+    fn detects_eth_docker_from_a_default_install() {
+        let ps = "eth-docker-execution-1\neth-docker-consensus-1\neth-docker-validator-1\n";
+        let (stack, name) = detect_stack(ps, None).unwrap();
+        assert_eq!(stack, Stack::EthDocker);
+        assert_eq!(name, "eth-docker-consensus-1");
+    }
+
+    /// The whole reason detection matches on a suffix: both stacks let the
+    /// operator rename the prefix, and Eth Docker's is just whatever directory
+    /// the repo was cloned into.
+    #[test]
+    fn detects_both_stacks_under_non_default_project_names() {
+        let (stack, name) = detect_stack("my-node-consensus-1\n", None).unwrap();
+        assert_eq!(stack, Stack::EthDocker);
+        assert_eq!(name, "my-node-consensus-1");
+
+        let (stack, name) = detect_stack("hoodi_eth2\n", None).unwrap();
+        assert_eq!(stack, Stack::RocketPool);
+        assert_eq!(name, "hoodi_eth2");
+    }
+
+    #[test]
+    fn reports_not_found_when_nothing_matches() {
+        let err = detect_stack("postgres\nredis\n", None).unwrap_err();
+        assert!(matches!(err, DetectError::NotFound));
+    }
+
+    #[test]
+    fn refuses_to_guess_between_two_matching_stacks() {
+        let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
+        let err = detect_stack(ps, None).unwrap_err();
+        let DetectError::Ambiguous(names) = err else {
+            panic!("expected Ambiguous, got {err:?}");
+        };
+        assert_eq!(names, vec!["eth-docker-consensus-1", "rocketpool_eth2"]);
+    }
+
+    /// The message has to name the candidates, because "ambiguous" without
+    /// them leaves the operator no way to pick one short of running `docker ps`
+    /// themselves.
+    #[test]
+    fn ambiguous_error_message_lists_the_candidates() {
+        let err = detect_stack("eth-docker-consensus-1\nrocketpool_eth2\n", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("eth-docker-consensus-1"), "got: {msg}");
+        assert!(msg.contains("rocketpool_eth2"), "got: {msg}");
+        assert!(msg.contains("--container"), "should name the escape hatch: {msg}");
+    }
+
+    #[test]
+    fn narrowing_to_one_stack_ignores_the_others_containers() {
+        let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
+        let (stack, name) = detect_stack(ps, Some(Stack::RocketPool)).unwrap();
+        assert_eq!(stack, Stack::RocketPool);
+        assert_eq!(name, "rocketpool_eth2");
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_surrounding_whitespace() {
+        let ps = "\n  rocketpool_eth2  \n\n";
+        let (_, name) = detect_stack(ps, None).unwrap();
+        assert_eq!(name, "rocketpool_eth2");
+    }
+
+    /// Rocket Pool's execution container is `_eth1`, one character from the
+    /// consensus one. Matching it would point `tekops logs` at Besu while
+    /// claiming to show Teku.
+    #[test]
+    fn does_not_match_rocket_pools_execution_container() {
+        let err = detect_stack("rocketpool_eth1\n", None).unwrap_err();
+        assert!(matches!(err, DetectError::NotFound));
     }
 }
