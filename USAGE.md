@@ -6,6 +6,7 @@ Every command. See the [README](README.md) for installing and building.
     tekops peers
     tekops health
     tekops head
+    tekops doctor
     tekops duties
     tekops validators
     tekops version
@@ -98,6 +99,109 @@ than the peer's ENR, which the Beacon API doesn't reliably populate.
 
 `health` reports health and sync status. `head` reports the chain head slot
 and root plus the finality checkpoints.
+
+### doctor
+
+    tekops doctor
+    tekops doctor --stack eth-docker
+    tekops doctor --data-dir /mnt/teku-data
+    tekops doctor --json
+
+`health` answers one narrow question - what does `/eth/v1/node/health` say,
+plus the syncing endpoint. `doctor` is the comprehensive pass: it runs a
+series of checks across the Beacon API, the Prometheus metrics page, Docker
+container state, and host resources (disk, memory, load), then prints a
+pass/warn/fail report. It's built for two situations: an operator
+self-assessing a node, and an operator pasting the output into a chat when
+asking for help - which is why the report is plain aligned text rather than a
+boxed table.
+
+It accepts `--api-url` and `--metric-url` (or `$TEKOPS_API_URL` /
+`$TEKOPS_METRIC_URL`), `--stack` (or `$TEKOPS_STACK`), `--data-dir` (or
+`$TEKOPS_DATA_DIR`), and `--json`, the same as the commands above and below
+it.
+
+**`doctor` applies `docker ps` detection to the port defaults; the other API
+commands don't.** Every other command here reads only `--stack`/`$TEKOPS_STACK`
+and, if the endpoint turns out to be unreachable, suggests `--stack` in a hint
+afterward. `doctor` is already running `docker ps` for the container checks, so
+it applies that detection up front to `--api-url` and `--metric-url` as well -
+on an Eth Docker host with no flags given, it probes `:5052` and `:8009`
+straight away rather than failing against the bare-metal defaults first. One
+consequence: `doctor` never prints the `--stack` hint, because detection has
+already had its say by the time an endpoint would be judged unreachable.
+
+`--data-dir` only matters on bare-metal. The disk-free check resolves its
+target as `--data-dir` > `$TEKOPS_DATA_DIR` > `/var/lib/teku`. On the two
+Docker stacks it ignores that default entirely and instead reads the
+consensus container's own mounts, picking the most specific one; `--data-dir`
+(or the environment variable) still overrides that if you pass it.
+
+**Container checks don't appear in the report at all on bare-metal** - not as
+a greyed-out "n/a" row, just absent, since a bare-metal node has no restart
+count to show.
+
+#### Exit code
+
+`0` when every check passes or the worst outcome is a warning. `1` when any
+check fails. This is the same convention `tekops update check --json` uses:
+0 means the run completed, not that everything is healthy.
+
+#### Checks
+
+The thresholds below are conservative defaults picked for a home-staker
+mainnet node, not measurements taken from a specific setup - treat them as a
+starting point.
+
+| Check | Pass | Warn | Fail |
+| --- | --- | --- | --- |
+| beacon api | ready | syncing | not ready, unreachable |
+| metrics endpoint | reachable, versions found | reachable but the metric family is absent (wrong port) | unreachable |
+| sync status | synced | syncing | - |
+| execution layer | online | - | offline (`el_offline`) |
+| optimistic head | verified | - | unverified |
+| finality lag | <= 3 epochs behind | 4-6 epochs | > 6 epochs |
+| peer count | >= 20 peers | 1-19 peers | 0 peers |
+| validator keys | any `active_ongoing` | 0 `active_ongoing` (none loaded, or only other statuses) | - |
+| duties published | any of blocks/attestations/sync messages/aggregates > 0 | all four are 0 | - |
+| containers running (Docker stacks only) | every container up | - | any container not running, or none found |
+| container restarts (Docker stacks only) | 0 restarts | 1-4 restarts | >= 5 restarts |
+| disk free | >= 50 GiB | < 50 GiB | < 20 GiB |
+| memory available | >= 1 GiB | < 1 GiB | - |
+| load average (1 min) | <= number of CPUs | > CPUs, up to 2x | > 2x CPUs |
+
+`duties published` and `memory available` never fail, only warn: a validator
+client that restarted moments ago legitimately reports zero duties, and
+Teku's heap is preallocated, so low available memory (as distinct from low
+*total* memory) is a healthy node's normal steady state, not a leak.
+
+#### Sample output
+
+    tekops doctor
+
+      eth-docker · teku/v25.1.0 · linux x86_64
+
+      ✔  beacon api          ready at http://localhost:5052
+      ✔  metrics endpoint    teku/v25.1.0 at http://localhost:8009/metrics
+      ✔  sync status         synced, head 8891234
+      ✔  execution layer     online
+      ✘  optimistic head     head unverified by the execution client; duties will not be performed
+      ✔  finality lag        1 epochs
+      ⚠  peer count          12 peers (want >= 20)
+      ✔  validator keys      142 active_ongoing, 4544.00 ETH
+      ⚠  duties published    none yet (normal if the validator client restarted recently)
+      ✔  containers running  eth-docker-consensus-1 up
+      ✔  container restarts  0
+      ✔  disk free           412.0 GiB on /var/lib/docker/volumes/eth-docker_consensus-data/_data
+      ⚠  memory available    0.8 GiB of 31.3 GiB
+      ✔  load average        1.20 (8 cpus)
+
+    1 failure, 3 warnings.
+
+No ANSI escape sequences are ever emitted, and every value interpolated into a
+finding (versions, mount paths, container names, node error text) is
+sanitized first, the same as everything else tekops prints from data it
+didn't author.
 
 ### beacon validators, beacon duties
 
