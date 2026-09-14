@@ -101,6 +101,88 @@ fn anchor_key(tok: &str) -> String {
     tok.trim_end_matches([':', '.']).to_ascii_lowercase()
 }
 
+/// Four dot-separated decimal groups, each at most 255.
+fn is_ipv4(s: &str) -> bool {
+    let mut groups = 0;
+    for p in s.split('.') {
+        groups += 1;
+        if groups > 4
+            || p.is_empty()
+            || p.len() > 3
+            || !p.chars().all(|c| c.is_ascii_digit())
+            || p.parse::<u16>().map_or(true, |n| n > 255)
+        {
+            return false;
+        }
+    }
+    groups == 4
+}
+
+/// Hex groups separated by colons.
+///
+/// The second condition is load-bearing rather than pedantry. A Teku console
+/// timestamp's time field is `01:16:54`, which is two colons and three groups
+/// that are all valid hexadecimal - a rule of "two or more colons and every
+/// group is hex" redacts every timestamp in the file. Requiring either a `::`
+/// run or the full eight-group (seven-colon) form rejects it, and no real IPv6
+/// address lacks both.
+fn is_ipv6(s: &str) -> bool {
+    let colons = s.chars().filter(|c| *c == ':').count();
+    if colons < 2 {
+        return false;
+    }
+    if !s.contains("::") && colons != 7 {
+        return false;
+    }
+    if !s.chars().any(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    s.split(':')
+        .all(|g| g.len() <= 4 && g.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Base58 as Bitcoin and libp2p define it: alphanumeric minus the four glyphs
+/// that are easy to confuse (`0`, `O`, `I`, `l`).
+fn is_base58(c: char) -> bool {
+    c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l')
+}
+
+/// The multihash prefixes libp2p peer ids actually appear with. Teku uses
+/// secp256k1 (`16Uiu2HA`); `12D3KooW` is ed25519 and `Qm` the older sha256
+/// form, both of which turn up in peer lists from other clients.
+const PEER_PREFIXES: [&str; 3] = ["16Uiu2HA", "12D3KooW", "Qm"];
+
+/// The length bound is what keeps this from matching ordinary prose that
+/// happens to start with `Qm`. Real peer ids are 44 to 53 characters.
+fn is_peer_id(s: &str) -> bool {
+    (40..=60).contains(&s.len())
+        && PEER_PREFIXES.iter().any(|p| s.starts_with(p))
+        && s.chars().all(is_base58)
+}
+
+/// Splits a trailing `:<digits>` port off a token, if there is one.
+fn split_host_port(tok: &str) -> Option<(&str, &str)> {
+    let (host, port) = tok.rsplit_once(':')?;
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((host, port))
+}
+
+/// Classification that depends only on the token's own shape.
+fn shape_of(tok: &str) -> Option<Category> {
+    if tok.starts_with("enr:-") {
+        return Some(Category::Enr);
+    }
+    if is_ipv4(tok) || is_ipv6(tok) {
+        return Some(Category::Ip);
+    }
+    if is_peer_id(tok) {
+        return Some(Category::Peer);
+    }
+    None
+}
+
 impl Redactor {
     pub fn new() -> Self {
         Self::default()
@@ -160,8 +242,16 @@ impl Redactor {
     }
 
     fn replace_token(&mut self, tok: &str, _prev: Option<&str>) -> String {
-        if tok.starts_with("enr:-") {
-            return self.token(Category::Enr, tok);
+        // Checked before the plain shapes: `10.0.0.5:8551` is a single token
+        // (`:` is not a delimiter, so IPv6 survives), and only the address
+        // half of it is sensitive.
+        if let Some((host, port)) = split_host_port(tok) {
+            if is_ipv4(host) {
+                return format!("{}:{}", self.token(Category::Ip, host), port);
+            }
+        }
+        if let Some(cat) = shape_of(tok) {
+            return self.token(cat, tok);
         }
         tok.to_string()
     }
@@ -212,5 +302,66 @@ mod tests {
         let mut r = Redactor::new();
         r.redact("enr:-AAA");
         assert_eq!(r.summary().to_string(), "1 value across 1 category");
+    }
+
+    #[test]
+    fn ipv4_addresses_are_redacted() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("peer at 93.184.216.34 left"), "peer at <ip-1> left");
+    }
+
+    /// The addresses inside a multiaddr have to come out even though the whole
+    /// multiaddr reads as one word: `/` is a delimiter precisely so they do.
+    #[test]
+    fn ipv4_inside_a_multiaddr_is_redacted_and_the_ports_survive() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("/ip4/93.184.216.34/tcp/9000"),
+            "/ip4/<ip-1>/tcp/9000"
+        );
+    }
+
+    /// `1.2.3.4:9000` is one token, since `:` is deliberately not a delimiter.
+    /// The port is not sensitive and must survive.
+    #[test]
+    fn an_ipv4_with_a_port_keeps_the_port() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("dialing 10.0.0.5:8551"), "dialing <ip-1>:8551");
+    }
+
+    #[test]
+    fn ipv6_addresses_are_redacted() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("peer at 2001:db8::1 left"), "peer at <ip-1> left");
+        assert_eq!(r.redact("2001:0db8:0000:0000:0000:ff00:0042:8329"), "<ip-2>");
+    }
+
+    /// The dangerous IPv6 false positive. `01:16:54` is two colons and three
+    /// groups that are all valid hex, so a naive "colons plus hex" rule eats
+    /// every Teku timestamp. Requiring either a `::` run or the full
+    /// seven-colon form is what rejects it.
+    #[test]
+    fn a_bare_clock_time_is_not_mistaken_for_ipv6() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("at 01:16:54 done"), "at 01:16:54 done");
+        assert_eq!(r.redact("at 01:16:54.217 done"), "at 01:16:54.217 done");
+    }
+
+    #[test]
+    fn libp2p_peer_ids_are_redacted() {
+        let mut r = Redactor::new();
+        let secp = "16Uiu2HAmPk9dR3aBcDeFgHjKmNpQrStUvWxYz1234567";
+        let ed = "12D3KooWPk9dR3aBcDeFgHjKmNpQrStUvWxYz12345678";
+        assert_eq!(r.redact(&format!("peer {secp}")), "peer <peer-1>");
+        assert_eq!(r.redact(&format!("peer {ed}")), "peer <peer-2>");
+    }
+
+    /// A word that merely starts with the same letters, or is too short, is
+    /// not a peer id. Over-matching here would eat ordinary log prose.
+    #[test]
+    fn short_or_non_base58_words_are_not_peer_ids() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("Qm is short"), "Qm is short");
+        assert_eq!(r.redact("16Uiu2HAshort"), "16Uiu2HAshort");
     }
 }
