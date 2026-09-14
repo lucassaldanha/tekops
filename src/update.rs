@@ -59,9 +59,11 @@ pub enum UpdateTarget {
 ///
 /// `check` and `latest` are matched by hand rather than declared as clap
 /// subcommands. Declaring them as subcommands alongside an optional positional
-/// version reproduces exactly the ambiguity that made `tekops logs
-/// /var/log/x.log` fail with `invalid value for [SOURCE]` - see
-/// `resolve_logs_target`, which this mirrors, down to the case-sensitivity.
+/// version reproduces exactly the ambiguity that used to break `tekops logs`:
+/// before its source argument was removed, `tekops logs /var/log/x.log` failed
+/// with `invalid value for [SOURCE]` because clap could not tell a path from a
+/// subcommand name. This mirrors the hand-matching that fixed it, down to the
+/// case-sensitivity.
 pub fn resolve_update_target(arg: Option<String>) -> UpdateTarget {
     match arg.as_deref() {
         None => UpdateTarget::Prompt,
@@ -524,7 +526,9 @@ mod tests {
         assert_eq!(normalize_version("1.2.3"), "1.2.3");
     }
 
-    /// Reserved-word matching is case-sensitive, mirroring `resolve_logs_target`.
+    /// Reserved-word matching is case-sensitive, mirroring how `tekops logs`
+    /// used to hand-match its own source argument before that concept was
+    /// removed.
     #[test]
     fn reserved_words_are_case_sensitive() {
         assert_eq!(
