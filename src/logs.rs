@@ -159,25 +159,77 @@ pub fn resolve_log_target(
     LogTarget::File(source.default_path())
 }
 
-pub fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
-    // TODO(task 5): thread the --container flag, $TEKOPS_CONTAINER, and
-    // docker ps detection through here instead of hardcoding None for all
-    // three - this shim exists only to keep the tree compiling until then.
+/// The command that produces raw log lines for one session.
+///
+/// Returned as data rather than a built `Command` so the argv shape is
+/// testable, which matters because of the shell on the container path.
+///
+/// Both producers share the property the whole process-lifetime design in
+/// `run_logs` depends on: neither ever reaches EOF on its own, so the streaming
+/// loop cannot be what ends the session.
+///
+/// The container path goes through `sh` for exactly one reason: `docker logs`
+/// writes the container's stderr to *its* stderr, and an uncaptured stderr
+/// would paint over the live `less`. Merging with `2>&1` in the shell keeps
+/// `stream_logs` as it is - one reader, one writer, one byte cap - where
+/// capturing both streams in Rust would need either two threads sharing the
+/// writer behind a mutex, which splits the cap across them, or a `pre_exec`
+/// `dup2`.
+///
+/// The line count and container name are passed as arguments *after* the `sh`
+/// argv[0] placeholder and referenced positionally as `"$1"` and `"$2"`. They
+/// are never interpolated into the script text: a container name is
+/// autodetected or operator-supplied, and interpolating it would turn it into
+/// shell code. `exec` keeps the process count the same as the `tail` path, so
+/// the kill in `supervise_pager` still reaches the process that matters.
+pub fn producer_argv(target: &LogTarget, lines: u32) -> (String, Vec<String>) {
+    match target {
+        LogTarget::File(path) => (
+            "tail".to_string(),
+            vec![
+                "-F".to_string(),
+                "-n".to_string(),
+                lines.to_string(),
+                path.display().to_string(),
+            ],
+        ),
+        LogTarget::Container(name) => (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "exec docker logs -f --tail \"$1\" \"$2\" 2>&1".to_string(),
+                "sh".to_string(),
+                lines.to_string(),
+                name.clone(),
+            ],
+        ),
+    }
+}
+
+pub fn run_logs(
+    source: LogSource,
+    path: Option<PathBuf>,
+    lines: u32,
+    container: Option<String>,
+    detected: Option<String>,
+) -> ExitCode {
     let target = resolve_log_target(
         source,
         path,
-        None,
-        None,
+        container,
+        env::var("TEKOPS_CONTAINER").ok(),
         env::var("TEKOPS_LOGS_FILE").ok(),
-        None,
+        detected,
     );
-    let path = match target {
-        LogTarget::File(p) => p,
-        LogTarget::Container(_) => unreachable!("containers arrive in the next task"),
-    };
-    if !path.exists() {
-        eprintln!("error: log file not found: {}", path.display());
-        return ExitCode::FAILURE;
+
+    // Only a file can be checked for existence up front. A container's absence
+    // surfaces as `docker logs` exiting non-zero, which reaches the operator
+    // through the pager's own teardown.
+    if let LogTarget::File(ref p) = target {
+        if !p.exists() {
+            eprintln!("error: log file not found: {}", p.display());
+            return ExitCode::FAILURE;
+        }
     }
 
     // The terminal delivers Ctrl+C to the whole foreground process group. `less`
@@ -208,17 +260,19 @@ pub fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCod
         return ExitCode::FAILURE;
     }
 
-    let mut tail = match Command::new("tail")
-        .args(["-F", "-n"])
-        .arg(lines.to_string())
-        .arg(&path)
+    let (prog, args) = producer_argv(&target, lines);
+    let mut tail = match Command::new(&prog)
+        .args(&args)
         .stdout(Stdio::piped())
         .process_group(0)
         .spawn()
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("error: failed to spawn tail: {e}");
+            eprintln!("error: failed to spawn {prog}: {e}");
+            if let LogTarget::Container(_) = target {
+                eprintln!("reading container logs needs the docker CLI on $PATH");
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -255,8 +309,16 @@ pub fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCod
     // Both of these can fail for real (fd exhaustion, /tmp remounted read-only)
     // and both happen with the pager already on screen, so a panic here would
     // dump a Rust backtrace over a live `less` and skip the cleanup below.
+    //
+    // On the container path, a container that isn't running makes `docker logs`
+    // write an error to stderr and exit non-zero. Because `producer_argv` merged
+    // that stderr into this same stdout stream with `2>&1`, it arrives here as
+    // just another line, flows through `stream_logs` and `format_log_line` like
+    // any other, and is sanitized by the passthrough branch rather than reaching
+    // the terminal raw. That is the whole error-reporting path for a missing
+    // container - there is no separate one, and there should not be one added.
     let Some(stdout) = tail.stdout.take() else {
-        eprintln!("error: tail stdout was not piped");
+        eprintln!("error: log producer stdout was not piped");
         let _ = pager.kill();
         let _ = tail.kill();
         return ExitCode::FAILURE;
@@ -574,7 +636,7 @@ mod tests {
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(LogSource::Teku, Some(missing), 500);
+        let code = run_logs(LogSource::Teku, Some(missing), 500, None, None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
@@ -671,5 +733,62 @@ mod tests {
     fn custom_container_works_with_no_detection_at_all() {
         let t = target(None, Some("mynode-teku"), None, None, None);
         assert_eq!(t, LogTarget::Container("mynode-teku".into()));
+    }
+
+    #[test]
+    fn file_targets_still_spawn_tail_exactly_as_before() {
+        let (prog, args) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 500);
+        assert_eq!(prog, "tail");
+        assert_eq!(args, vec!["-F", "-n", "500", "/a.log"]);
+    }
+
+    #[test]
+    fn container_targets_spawn_docker_logs_with_stderr_merged() {
+        let (prog, args) = producer_argv(&LogTarget::Container("rocketpool_eth2".into()), 500);
+        assert_eq!(prog, "sh");
+        assert_eq!(args[0], "-c");
+        assert!(
+            args[1].contains("docker logs -f --tail"),
+            "got: {}",
+            args[1]
+        );
+        assert!(
+            args[1].contains("2>&1"),
+            "stderr must be merged: {}",
+            args[1]
+        );
+        assert!(args[1].starts_with("exec "), "got: {}", args[1]);
+        assert_eq!(args[2], "sh");
+        assert_eq!(args[3], "500");
+        assert_eq!(args[4], "rocketpool_eth2");
+    }
+
+    /// The injection guard. A container name is autodetected or operator
+    /// supplied, and interpolating it into the script text would make it shell
+    /// code. It must arrive as its own argv element, with the script referring
+    /// to it only positionally.
+    #[test]
+    fn a_hostile_container_name_stays_data_not_code() {
+        let hostile = "x\"; touch /tmp/pwned; echo \"";
+        let (_, args) = producer_argv(&LogTarget::Container(hostile.into()), 500);
+        assert!(
+            !args[1].contains("pwned"),
+            "container name leaked into the script: {}",
+            args[1]
+        );
+        assert_eq!(
+            args[4], hostile,
+            "name should arrive verbatim as its own arg"
+        );
+    }
+
+    /// `-n 0` means "follow only new output" on the file path, and `--tail 0`
+    /// is docker's spelling of the same thing. The two must agree.
+    #[test]
+    fn zero_lines_is_passed_through_on_both_paths() {
+        let (_, file) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 0);
+        assert_eq!(file[2], "0");
+        let (_, container) = producer_argv(&LogTarget::Container("c".into()), 0);
+        assert_eq!(container[3], "0");
     }
 }

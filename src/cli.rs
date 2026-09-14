@@ -195,7 +195,7 @@ pub fn run() -> ExitCode {
             path,
             lines,
         } => match resolve_logs_target(source, path) {
-            Ok((source, path)) => run_logs(source, path, lines),
+            Ok((source, path)) => run_logs(source, path, lines, None, None),
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
