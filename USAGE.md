@@ -186,7 +186,7 @@ Teku's heap is preallocated, so low available memory (as distinct from low
       ✔  sync status         synced, head 8891234
       ✔  execution layer     online
       ✘  optimistic head     head unverified by the execution client; duties will not be performed
-      ✔  finality lag        1 epochs
+      ✔  finality lag        1 epoch
       ⚠  peer count          12 peers (want >= 20)
       ✔  validator keys      142 active_ongoing, 4544.00 ETH
       ⚠  duties published    none yet (normal if the validator client restarted recently)
