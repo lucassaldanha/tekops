@@ -1,5 +1,5 @@
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Which deployment tekops is pointed at.
@@ -22,7 +22,7 @@ use std::fmt;
 /// which disagrees with both the flag and `Display`. Each rename must match
 /// the variant's own `#[value(name = "...")]` exactly; see
 /// `serde_matches_clap_values_for_every_variant` below.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum Stack {
     /// Teku and Besu running directly on the host.
     #[value(name = "bare-metal")]

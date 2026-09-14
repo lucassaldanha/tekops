@@ -17,6 +17,13 @@ serde_json = "1"
 # the download should not depend on which coreutils the host ships.
 sha2 = "0.10"
 tempfile = "3"
+# Pure Rust with no C and no transitive C, so it does not reintroduce what
+# dropping ureq's TLS backend removed. Six crates, all Cargo-team maintained.
+# Measured marginal cost of deserializing the config struct: 137,104 bytes.
+# YAML was considered and rejected: the first-party binding publishes as
+# `serde_yaml 0.9.34+deprecated` and rests on the unmaintained
+# `unsafe-libyaml`, and YAML would coerce a container named `on` to a boolean.
+toml = "1"
 # default-features = false drops ureq's TLS backend (rustls, and ring's C and
 # assembly with it). Deliberate, not an oversight: every endpoint tekops talks
 # to is a node-local http:// URL. Re-enabling it is a one-word change if a

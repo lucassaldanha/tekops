@@ -265,6 +265,29 @@ enum DutiesKind {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
+
+    // Loaded once, before dispatch, so every command sees the same config and
+    // a broken file is reported by whichever command the operator runs first.
+    // "The config file is broken" is a fact about the installation rather than
+    // about one command, so `about` and `update` fail on it too even though
+    // neither reads any of the six keys. The alternative, loading lazily per
+    // command, makes the same typo invisible until it is maximally confusing.
+    //
+    // This does not go through `exit_for_api`: its `--stack` hint points at
+    // the node's ports, and this failure happened in a file. Same distinction
+    // `run_log_level` draws for a bad fetched body.
+    let cfg = match config_from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `Option<Stack>` is `Copy`, so this sidesteps borrowing `cfg` across the
+    // whole `match cli.command` block below; `cfg` itself is still borrowed
+    // where a handler needs more than the stack (`run_doctor`).
+    let cfg_stack = cfg.stack;
+
     match cli.command {
         Commands::Logs {
             path,
@@ -285,7 +308,7 @@ pub fn run() -> ExitCode {
                 && env::var("TEKOPS_CONTAINER").is_err()
                 && logs_file_env.is_none();
             let detected = if needs_detection {
-                let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
+                let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
                 docker_ps_names(should_report_unaskable_docker(only))
                     .and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
             } else {
@@ -313,7 +336,7 @@ pub fn run() -> ExitCode {
                 && path.is_none()
                 && container_env.is_none()
                 && logs_file_env.is_none();
-            let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
+            let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let detected: Option<(Stack, String)> = if needs_detection {
                 docker_ps_names(should_report_unaskable_docker(given_stack))
                     .and_then(|ps| detect_or_note(&ps, given_stack))
@@ -337,7 +360,7 @@ pub fn run() -> ExitCode {
             // needs the container name and the two URLs, and duplicating that
             // here would be a second approximation of the config `doctor`
             // itself builds. The extra spawn is paid only with `--doctor`.
-            let probe = doctor.then(|| doctor_probe_config(stack, None, None, None));
+            let probe = doctor.then(|| doctor_probe_config(stack, None, None, None, &cfg));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -355,37 +378,37 @@ pub fn run() -> ExitCode {
             }))
         }
         Commands::Beacon { command, api } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             run_beacon(client, command, api.json, stack)
         }
         Commands::Peers { api } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for_api(beacon_peers(&client, api.json), stack)
         }
         Commands::Health { api } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for_api(beacon_health(&client, api.json), stack)
         }
         Commands::Head { api } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for_api(beacon_head(&client, api.json), stack)
         }
         Commands::Duties { metrics } => {
-            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for_api(metrics_duties(&client, metrics.json), stack)
         }
         Commands::Validators { metrics } => {
-            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for_api(metrics_validators(&client, metrics.json), stack)
         }
         Commands::Version { metrics } => {
-            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for_api(metrics_version(&client, metrics.json), stack)
         }
@@ -394,7 +417,7 @@ pub fn run() -> ExitCode {
             log_filter,
             yes,
             api,
-        } => run_log_level(target, log_filter, yes, api),
+        } => run_log_level(target, log_filter, yes, api, &cfg),
         Commands::Autocomplete { shell, print, yes } => {
             exit_for(run_autocomplete(shell, print, yes))
         }
@@ -409,7 +432,7 @@ pub fn run() -> ExitCode {
             api,
             metric_url,
             data_dir,
-        } => run_doctor(api, metric_url, data_dir),
+        } => run_doctor(api, metric_url, data_dir, &cfg),
     }
 }
 
@@ -431,8 +454,9 @@ fn resolve_doctor_stack(
     flag: Option<Stack>,
     env: Option<String>,
     detected: Option<Stack>,
+    cfg: Option<Stack>,
 ) -> Option<Stack> {
-    resolve_stack(flag, env)
+    resolve_stack(flag, env, cfg)
         .or(detected)
         .or(Some(Stack::BareMetal))
 }
@@ -485,6 +509,7 @@ fn doctor_probe_config(
     api_url: Option<String>,
     metric_url: Option<String>,
     data_dir: Option<PathBuf>,
+    cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
     // Read once, used for both `given` (below) and `resolve_doctor_stack`.
     let stack_env = env::var("TEKOPS_STACK").ok();
@@ -498,7 +523,7 @@ fn doctor_probe_config(
     // by neither `false` here nor the lookup below, whose gate has since
     // resolved to bare-metal. That is issue #16: the two together are what
     // keep a node with no containers from hearing about Docker.
-    let given = resolve_stack(stack_flag, stack_env.clone());
+    let given = resolve_stack(stack_flag, stack_env.clone(), cfg.stack);
     let detected: Option<(Stack, String)> = if given.is_none() {
         docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
     } else {
@@ -506,7 +531,12 @@ fn doctor_probe_config(
     };
     // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
     // consuming it would leave nothing for the container lookup below.
-    let stack = resolve_doctor_stack(stack_flag, stack_env, detected.as_ref().map(|(s, _)| *s));
+    let stack = resolve_doctor_stack(
+        stack_flag,
+        stack_env,
+        detected.as_ref().map(|(s, _)| *s),
+        cfg.stack,
+    );
 
     // The container name: from detection when it ran, otherwise from a fresh
     // `docker ps` narrowed to the named stack.
@@ -530,10 +560,15 @@ fn doctor_probe_config(
     }
 }
 
-fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf>) -> ExitCode {
-    let cfg = doctor_probe_config(api.stack, api.api_url, metric_url, data_dir);
+fn run_doctor(
+    api: ApiArgs,
+    metric_url: Option<String>,
+    data_dir: Option<PathBuf>,
+    cfg: &crate::config::Config,
+) -> ExitCode {
+    let probe_cfg = doctor_probe_config(api.stack, api.api_url, metric_url, data_dir, cfg);
 
-    let facts = crate::doctor::probe(&cfg);
+    let facts = crate::doctor::probe(&probe_cfg);
     let findings = crate::doctor::evaluate(&facts);
 
     if api.json {
@@ -559,13 +594,16 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     exit_for_findings(&findings)
 }
 
-/// The stack profile in force, if any. The flag beats `$TEKOPS_STACK`.
+/// The stack profile in force, if any. Flag beats `$TEKOPS_STACK` beats config.
 ///
-/// An unparseable environment value is ignored rather than fatal. It is set
+/// An unparseable *environment* value is ignored rather than fatal: it is set
 /// once in a shell rc and would otherwise break every command in the session,
-/// including the ones that never needed it.
-fn resolve_stack(flag: Option<Stack>, env: Option<String>) -> Option<Stack> {
+/// including the ones that never needed it. A config file is the opposite kind
+/// of object - a single deliberate artifact - so a bad value there is rejected
+/// at parse time by `config::parse`, and nothing unparseable can reach here.
+fn resolve_stack(flag: Option<Stack>, env: Option<String>, cfg: Option<Stack>) -> Option<Stack> {
     flag.or_else(|| env.and_then(|v| Stack::from_str(&v, true).ok()))
+        .or(cfg)
 }
 
 fn resolve_base_url(api_url: Option<String>, stack: Option<Stack>) -> String {
@@ -913,7 +951,13 @@ fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Resu
 /// so it cannot go through `exit_for_api` - and it must not, since the
 /// `--stack` hint that adds would point at the node's ports for a failure that
 /// happened at a gist. Only the request itself is handed to `exit_for_api`.
-fn run_log_level(target: String, log_filter: Vec<String>, yes: bool, api: ApiArgs) -> ExitCode {
+fn run_log_level(
+    target: String,
+    log_filter: Vec<String>,
+    yes: bool,
+    api: ApiArgs,
+    cfg: &crate::config::Config,
+) -> ExitCode {
     let spec = match resolve_spec(target, log_filter, yes) {
         Ok(Some(spec)) => spec,
         Ok(None) => {
@@ -926,7 +970,7 @@ fn run_log_level(target: String, log_filter: Vec<String>, yes: bool, api: ApiArg
         }
     };
 
-    let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+    let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg.stack);
     let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
     exit_for_api(beacon_log_level(&client, &spec, api.json), stack)
 }
@@ -1090,6 +1134,16 @@ fn dirs_from_env() -> Result<completions::Dirs, CompletionError> {
         xdg_data: env::var_os("XDG_DATA_HOME").map(PathBuf::from),
         xdg_config: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
     })
+}
+
+/// The config file for this invocation, or an empty one.
+///
+/// The only place `$XDG_CONFIG_HOME`/`$HOME` are read for the config file,
+/// mirroring `dirs_from_env`'s role for `autocomplete`.
+fn config_from_env() -> Result<crate::config::Config, crate::config::ConfigError> {
+    let xdg = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    crate::config::load(crate::config::path(xdg.as_deref(), home.as_deref()).as_deref())
 }
 
 fn confirm_install() -> Result<bool, CompletionError> {
@@ -1262,7 +1316,13 @@ mod tests {
     /// enough to catch the helper being wired up wrong, and needs no Docker.
     #[test]
     fn doctor_probe_config_applies_the_stack_to_both_urls() {
-        let cfg = doctor_probe_config(Some(Stack::BareMetal), None, None, None);
+        let cfg = doctor_probe_config(
+            Some(Stack::BareMetal),
+            None,
+            None,
+            None,
+            &crate::config::Config::default(),
+        );
         assert_eq!(cfg.stack, Some(Stack::BareMetal));
         assert_eq!(cfg.api_url, resolve_base_url(None, Some(Stack::BareMetal)));
         assert_eq!(
@@ -1278,6 +1338,7 @@ mod tests {
             Some("http://example.invalid:1234".to_string()),
             None,
             None,
+            &crate::config::Config::default(),
         );
         assert_eq!(cfg.api_url, "http://example.invalid:1234");
     }
@@ -1886,21 +1947,51 @@ mod tests {
     #[test]
     fn stack_flag_beats_the_environment() {
         assert_eq!(
-            resolve_stack(Some(Stack::EthDocker), Some("rocketpool".into())),
+            resolve_stack(Some(Stack::EthDocker), Some("rocketpool".into()), None),
             Some(Stack::EthDocker)
         );
         assert_eq!(
-            resolve_stack(None, Some("rocketpool".into())),
+            resolve_stack(None, Some("rocketpool".into()), None),
             Some(Stack::RocketPool)
         );
-        assert_eq!(resolve_stack(None, None), None);
+        assert_eq!(resolve_stack(None, None, None), None);
     }
 
     /// An unparseable $TEKOPS_STACK is ignored rather than fatal: it must not
     /// break commands that would have worked without it.
     #[test]
     fn an_unknown_stack_env_value_is_ignored() {
-        assert_eq!(resolve_stack(None, Some("nonsense".into())), None);
+        assert_eq!(resolve_stack(None, Some("nonsense".into()), None), None);
+    }
+
+    #[test]
+    fn the_stack_flag_beats_both_the_env_and_the_config() {
+        let got = resolve_stack(
+            Some(Stack::BareMetal),
+            Some("eth-docker".into()),
+            Some(Stack::RocketPool),
+        );
+        assert_eq!(got, Some(Stack::BareMetal));
+    }
+
+    #[test]
+    fn the_stack_env_beats_the_config() {
+        let got = resolve_stack(None, Some("eth-docker".into()), Some(Stack::RocketPool));
+        assert_eq!(got, Some(Stack::EthDocker));
+    }
+
+    #[test]
+    fn the_config_stack_is_used_when_nothing_else_says() {
+        let got = resolve_stack(None, None, Some(Stack::RocketPool));
+        assert_eq!(got, Some(Stack::RocketPool));
+    }
+
+    /// The env value is ignored when unparseable, and must fall through to the
+    /// config rather than swallowing it.
+    #[test]
+    fn an_unparseable_stack_env_falls_through_to_the_config() {
+        let got = resolve_stack(None, Some("nonsense".into()), Some(Stack::RocketPool));
+        assert_eq!(got, Some(Stack::RocketPool));
     }
 
     #[test]
@@ -2016,7 +2107,7 @@ mod tests {
     /// report that prints is one the note would have contradicted.
     #[test]
     fn failed_detection_leaves_doctor_on_a_stack_that_reports_no_docker() {
-        let stack = resolve_doctor_stack(None, None, None);
+        let stack = resolve_doctor_stack(None, None, None, None);
         assert_eq!(stack, Some(Stack::BareMetal));
         assert!(!should_report_unaskable_docker(stack));
     }
@@ -2113,22 +2204,27 @@ mod tests {
     #[test]
     fn doctor_stack_ladder_prefers_flag_then_env_then_detection() {
         assert_eq!(
-            resolve_doctor_stack(Some(Stack::BareMetal), None, Some(Stack::EthDocker)),
+            resolve_doctor_stack(Some(Stack::BareMetal), None, Some(Stack::EthDocker), None),
             Some(Stack::BareMetal)
         );
         assert_eq!(
-            resolve_doctor_stack(None, Some("rocketpool".to_string()), Some(Stack::EthDocker)),
+            resolve_doctor_stack(
+                None,
+                Some("rocketpool".to_string()),
+                Some(Stack::EthDocker),
+                None
+            ),
             Some(Stack::RocketPool)
         );
         assert_eq!(
-            resolve_doctor_stack(None, None, Some(Stack::EthDocker)),
+            resolve_doctor_stack(None, None, Some(Stack::EthDocker), None),
             Some(Stack::EthDocker)
         );
         // The ladder terminates in bare-metal, not None: the report header
         // and the (bare-metal-defaulted) URLs it prints alongside it must
         // never disagree about what "nothing was given" means.
         assert_eq!(
-            resolve_doctor_stack(None, None, None),
+            resolve_doctor_stack(None, None, None, None),
             Some(Stack::BareMetal)
         );
     }
