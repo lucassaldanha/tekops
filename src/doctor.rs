@@ -1131,6 +1131,13 @@ mod tests {
 
     // --- probe ---
 
+    /// What actually proves the short-circuit here is the five
+    /// `Probe::Skipped` matches below, not the elapsed-time bound: a
+    /// connection to `127.0.0.1:1` is refused instantly, so the `< 30s`
+    /// assertion would pass even if `probe` made all seven calls with no
+    /// short-circuit at all. The timing check is a loose backstop against a
+    /// regression that reintroduces a real per-call wait, not the mechanism
+    /// this test relies on to catch a broken guard.
     #[test]
     fn a_dead_beacon_api_skips_the_rest_instead_of_timing_out_once_per_call() {
         use std::time::Instant;
@@ -1174,5 +1181,112 @@ mod tests {
         let f = probe(&cfg);
         assert_eq!(f.api_url, "http://127.0.0.1:1");
         assert_eq!(f.stack, Some(Stack::EthDocker));
+    }
+
+    /// Only unreachability short-circuits the Beacon API probes. An endpoint
+    /// that answers with an error (a 500, here) may still answer the other
+    /// calls, and skipping them on anything less specific than
+    /// `is_unreachable()` (e.g. `health.ok().is_none()`) would discard real
+    /// diagnostic data at exactly the moment an operator needs it - and would
+    /// pass every other test in this module unchanged, since none of them
+    /// distinguish "failed but reachable" from "unreachable".
+    #[test]
+    fn a_beacon_api_error_that_is_not_unreachable_does_not_skip_the_rest() {
+        let mut server = mockito::Server::new();
+        let _health = server
+            .mock("GET", "/eth/v1/node/health")
+            .with_status(500)
+            .create();
+        let _syncing = server
+            .mock("GET", "/eth/v1/node/syncing")
+            .with_status(200)
+            .with_body(
+                r#"{"data":{"is_syncing":false,"is_optimistic":false,
+                    "head_slot":"100","sync_distance":"0"}}"#,
+            )
+            .create();
+        let _finality = server
+            .mock("GET", "/eth/v1/beacon/states/head/finality_checkpoints")
+            .with_status(200)
+            .with_body(
+                r#"{"data":{"previous_justified":{"epoch":"10","root":"0x1"},
+                    "current_justified":{"epoch":"11","root":"0x2"},
+                    "finalized":{"epoch":"9","root":"0x3"}}}"#,
+            )
+            .create();
+        let _peers = server
+            .mock("GET", "/eth/v1/node/peers")
+            .with_status(200)
+            .with_body(r#"{"data":[]}"#)
+            .create();
+
+        let cfg = ProbeConfig {
+            stack: Some(Stack::BareMetal),
+            api_url: server.url(),
+            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            container: None,
+            data_dir: None,
+        };
+        let f = probe(&cfg);
+
+        assert!(matches!(f.health, Probe::Failed(_)));
+        assert!(
+            !matches!(f.syncing, Probe::Skipped(_)),
+            "syncing was skipped on a non-unreachable health failure: {:?}",
+            f.syncing
+        );
+        assert!(
+            !matches!(f.finality, Probe::Skipped(_)),
+            "finality was skipped on a non-unreachable health failure: {:?}",
+            f.finality
+        );
+        assert!(
+            !matches!(f.peers, Probe::Skipped(_)),
+            "peers was skipped on a non-unreachable health failure: {:?}",
+            f.peers
+        );
+    }
+
+    /// Same reasoning as `a_beacon_api_error_that_is_not_unreachable_does_not_skip_the_rest`,
+    /// for the metrics side. A scrape that responds 200 but exports none of
+    /// the version metric families is `ApiError::Malformed` (via
+    /// `require_metric`/`version`'s own check), not `Unreachable`, and must
+    /// not skip `duties`/`validators` - the body below deliberately includes
+    /// the metrics those two calls need, so a skip would be visible as a
+    /// missing `Probe::Ok`.
+    #[test]
+    fn a_metrics_error_that_is_not_unreachable_does_not_skip_the_rest() {
+        let mut server = mockito::Server::new();
+        let body = r#"
+validator_beacon_node_requests_total{method="publish_block",outcome="success"} 1
+validator_local_validator_counts{status="active_ongoing"} 1
+validator_local_validator_balances{pubkey="0x1"} 32000000000
+"#;
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let cfg = ProbeConfig {
+            stack: Some(Stack::BareMetal),
+            api_url: "http://127.0.0.1:1".to_string(),
+            metric_url: format!("{}/metrics", server.url()),
+            container: None,
+            data_dir: None,
+        };
+        let f = probe(&cfg);
+
+        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(
+            !matches!(f.duties, Probe::Skipped(_)),
+            "duties was skipped on a non-unreachable version failure: {:?}",
+            f.duties
+        );
+        assert!(
+            !matches!(f.validators, Probe::Skipped(_)),
+            "validators was skipped on a non-unreachable version failure: {:?}",
+            f.validators
+        );
     }
 }
