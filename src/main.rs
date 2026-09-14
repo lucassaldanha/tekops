@@ -7,6 +7,7 @@ mod logs;
 mod metrics;
 mod output;
 mod protocol;
+mod stack;
 mod term;
 mod update;
 
