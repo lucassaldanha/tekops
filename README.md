@@ -89,12 +89,58 @@ identically to the published one.
     tekops logs besu [path]      # defaults to /var/log/besu/besu.log
     tekops logs -n 2000          # 2000 lines of scrollback instead of the default 500
     tekops logs --lines 0        # skip existing output, follow only new lines
+    tekops logs --container rocketpool_eth2   # read a container's logs
+    tekops logs --stack rocketpool            # narrow autodetection
+    tekops health --stack eth-docker          # take that stack's port defaults
 
 `logs` opens with the last 500 lines already in the buffer and then follows
 new output. `-n`/`--lines` changes that count; it is passed straight to
 `tail -n`, so `0` means "show nothing existing, follow only what arrives
 next". The pre-loaded lines go into the scrollback buffer, not just on
 screen, so searching covers all of them from the moment the session starts.
+
+### Docker deployments
+
+`tekops logs` reads a container's logs when one is named or detected. With
+nothing configured it runs `docker ps` and looks for an Eth Docker
+(`*-consensus-1`) or Rocket Pool (`*_eth2`) consensus container, using it only
+if exactly one matches. Anything you state yourself wins over that: a path, a
+`--container` name, `$TEKOPS_CONTAINER`, or `$TEKOPS_LOGS_FILE`.
+
+`--stack` sets the port defaults for a known deployment, since both Docker
+stacks differ from a bare-metal node and from each other:
+
+| | Beacon API | Metrics (validator client) |
+| --- | --- | --- |
+| bare-metal | 5051 | 8010 |
+| eth-docker | 5052 | 8009 |
+| rocketpool | 5052 | 9101 |
+
+Neither stack publishes those ports to the host by default, so exposing them is
+a change you make in the stack itself: Eth Docker needs `cl-shared.yml` added to
+`COMPOSE_FILE`, and Rocket Pool needs its "Expose API Port" setting changed from
+the default of closed.
+
+A stack tekops does not recognize is fully supported; it just gets no defaults.
+Name the pieces directly and skip `--stack` entirely:
+
+    export TEKOPS_CONTAINER=mynode-teku
+    export TEKOPS_API_URL=http://localhost:5099
+    export TEKOPS_METRIC_URL=http://localhost:9109/metrics
+
+Every value a stack profile would supply is independently overridable, and
+`--stack` can be mixed with explicit flags: `--stack rocketpool
+--api-url http://localhost:5099` takes the Rocket Pool metrics default and the
+explicit API URL.
+
+#### Log colourizing under Docker
+
+Under Docker, Teku logs in its console layout rather than the JSON a bare-metal
+node is usually configured to write, and `tekops logs` colourizes both.
+
+`tekops logs besu` is the exception: Besu wraps every field of its console
+output in ANSI, and neither stack turns that off, so those lines are passed
+through readable but uncoloured. Teku, the default source, is unaffected.
 
     tekops beacon validators <index-or-pubkey>...
     tekops beacon duties attester --epoch=N <index>...

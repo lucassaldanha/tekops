@@ -98,7 +98,7 @@ impl fmt::Display for DetectError {
 ///
 /// Takes the output as a parameter rather than running `docker` itself, so the
 /// whole matching rule is unit-testable on a machine with no Docker installed -
-/// the same shape, and for the same reason, as `logs::resolve_log_path`.
+/// the same shape, and for the same reason, as `logs::resolve_log_target`.
 ///
 /// `only` narrows the search to a single stack's naming, which is what
 /// `--stack` contributes to detection. Note it contributes a *filter*, never a

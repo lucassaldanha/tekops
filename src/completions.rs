@@ -22,7 +22,7 @@ pub enum Shell {
 /// Picks a shell from the value of `$SHELL`, which is a path like `/bin/zsh`.
 ///
 /// Takes the value as a parameter rather than reading the environment so it
-/// stays a pure, race-free unit test - the same reason `logs::resolve_log_path`
+/// stays a pure, race-free unit test - the same reason `logs::resolve_log_target`
 /// does. An unrecognized or absent shell yields `None`; the caller turns that
 /// into "name one explicitly" rather than guessing.
 pub fn detect_shell(shell_env: Option<&str>) -> Option<Shell> {
@@ -44,7 +44,7 @@ pub const MARKER: &str = "# added by tekops";
 ///
 /// Passed in rather than read from the environment inside `plan`, so the whole
 /// path computation is a pure function testable against a tempdir - the same
-/// shape `logs::resolve_log_path` uses.
+/// shape `logs::resolve_log_target` uses.
 pub struct Dirs {
     pub home: PathBuf,
     pub xdg_data: Option<PathBuf>,

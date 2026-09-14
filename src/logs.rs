@@ -236,32 +236,34 @@ pub fn run_logs(
     // is designed to catch it and drop out of follow mode, but tekops itself has
     // no handler and would otherwise die right along with it, tearing down the
     // pager it's supervising. Ignoring it here lets tekops outlive the keypress;
-    // `tail` is put in its own process group so the same Ctrl+C doesn't kill it
-    // too, which would otherwise permanently break `less`'s `F` (resume follow).
+    // The producer is put in its own process group so the same Ctrl+C doesn't
+    // kill it too, which would otherwise permanently break `less`'s `F` (resume
+    // follow).
     //
     // The `termination` feature extends this same ignore to SIGTERM/SIGHUP (e.g.
     // a dropped SSH session). Unlike SIGINT, `less` has no special handling for
     // those and just dies normally, so `pager.wait()` below still returns and
-    // the existing cleanup (kill `tail`, let the temp file's Drop run) still
-    // executes. Without this, tekops and `less` would die immediately alongside
-    // the signal, skipping that cleanup entirely: `tail` (isolated into its own
-    // process group above, specifically so Ctrl+C can't reach it) would be
-    // orphaned and keep running forever, and the temp file backing `less` would
-    // never be removed - a real leak, one per dropped session, not hypothetical.
-    // Failing to install this is not cosmetic: it silently reverts the process
-    // to the exact behaviour the handler exists to prevent - Ctrl+C kills
-    // tekops mid-session, leaving `tail` (deliberately in its own process
-    // group, out of the signal's reach) orphaned forever and the temp file
-    // below undeleted. Swallowing the error hides a guaranteed leak, so say so
-    // and bail rather than starting a session that can't clean up after itself.
+    // the existing cleanup (kill the producer, let the temp file's Drop run)
+    // still executes. Without this, tekops and `less` would die immediately
+    // alongside the signal, skipping that cleanup entirely: the producer
+    // (isolated into its own process group above, specifically so Ctrl+C can't
+    // reach it) would be orphaned and keep running forever, and the temp file
+    // backing `less` would never be removed - a real leak, one per dropped
+    // session, not hypothetical. Failing to install this is not cosmetic: it
+    // silently reverts the process to the exact behaviour the handler exists to
+    // prevent - Ctrl+C kills tekops mid-session, leaving the producer
+    // (deliberately in its own process group, out of the signal's reach)
+    // orphaned forever and the temp file below undeleted. Swallowing the error
+    // hides a guaranteed leak, so say so and bail rather than starting a session
+    // that can't clean up after itself.
     if let Err(e) = ctrlc::set_handler(|| {}) {
         eprintln!("error: could not install signal handler: {e}");
-        eprintln!("refusing to start: Ctrl+C or a dropped session would orphan the log tailer");
+        eprintln!("refusing to start: Ctrl+C or a dropped session would orphan the log producer");
         return ExitCode::FAILURE;
     }
 
     let (prog, args) = producer_argv(&target, lines);
-    let mut tail = match Command::new(&prog)
+    let mut producer = match Command::new(&prog)
         .args(&args)
         .stdout(Stdio::piped())
         .process_group(0)
@@ -288,7 +290,7 @@ pub fn run_logs(
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to create temp file for log output: {e}");
-            let _ = tail.kill();
+            let _ = producer.kill();
             return ExitCode::FAILURE;
         }
     };
@@ -301,7 +303,7 @@ pub fn run_logs(
         Ok(child) => child,
         Err(e) => {
             eprintln!("error: failed to spawn less: {e}");
-            let _ = tail.kill();
+            let _ = producer.kill();
             return ExitCode::FAILURE;
         }
     };
@@ -317,10 +319,10 @@ pub fn run_logs(
     // any other, and is sanitized by the passthrough branch rather than reaching
     // the terminal raw. That is the whole error-reporting path for a missing
     // container - there is no separate one, and there should not be one added.
-    let Some(stdout) = tail.stdout.take() else {
+    let Some(stdout) = producer.stdout.take() else {
         eprintln!("error: log producer stdout was not piped");
         let _ = pager.kill();
-        let _ = tail.kill();
+        let _ = producer.kill();
         return ExitCode::FAILURE;
     };
     let writer = match sink.reopen() {
@@ -328,11 +330,16 @@ pub fn run_logs(
         Err(e) => {
             eprintln!("error: failed to open temp file for writing: {e}");
             let _ = pager.kill();
-            let _ = tail.kill();
+            let _ = producer.kill();
             return ExitCode::FAILURE;
         }
     };
-    match supervise_pager(pager, tail, BufReader::new(stdout), LineWriter::new(writer)) {
+    match supervise_pager(
+        pager,
+        producer,
+        BufReader::new(stdout),
+        LineWriter::new(writer),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error while streaming logs: {e}");
@@ -342,15 +349,16 @@ pub fn run_logs(
 }
 
 /// Runs the streaming loop against `reader` while the pager owns process
-/// lifetime, then tears the tailer down.
+/// lifetime, then tears the producer down.
 ///
-/// The ordering here is the whole point, and it has regressed before. `tail -F`
-/// never reaches EOF, so the streaming loop cannot be what ends the process -
-/// blocking the main thread on it hangs until the log happens to move, which on
-/// a quiet node is forever. So: stream on a worker thread, block the main
-/// thread on the pager, and only once the pager has exited kill the tailer.
-/// Killing it is what closes the pipe and gives the worker its EOF; joining
-/// before the kill deadlocks instead.
+/// The ordering here is the whole point, and it has regressed before. Neither
+/// `tail -F` nor `docker logs -f` reaches EOF on its own, so the streaming loop
+/// cannot be what ends the process - blocking the main thread on it hangs until
+/// the log happens to move, which on a quiet node (or a quiet container) is
+/// forever. So: stream on a worker thread, block the main thread on the pager,
+/// and only once the pager has exited kill the producer. Killing it is what
+/// closes the pipe and gives the worker its EOF; joining before the kill
+/// deadlocks instead.
 fn supervise_pager(
     mut pager: Child,
     mut tail: Child,
@@ -713,7 +721,7 @@ mod tests {
     }
 
     /// `$TEKOPS_LOGS_FILE` describes a Teku log, so it must not redirect a besu
-    /// session. This preserves the behaviour `resolve_log_path` had.
+    /// session. This preserves the behaviour `resolve_log_target`'s predecessor had.
     #[test]
     fn logs_file_env_does_not_apply_to_besu() {
         let t = resolve_log_target(

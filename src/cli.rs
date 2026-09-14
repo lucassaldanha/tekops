@@ -225,6 +225,11 @@ pub fn run() -> ExitCode {
                 // configured operator never pays for a `docker ps` spawn. Note
                 // `path` here is the *resolved* path, which is what catches the
                 // lone-positional case where a path arrived in `source`.
+                //
+                // This condition must stay the logical negation of every branch
+                // in `logs::resolve_log_target` that fires before its `detected`
+                // parameter - nothing ties the two together at compile time, so
+                // a change to that ladder has to be mirrored here by hand.
                 let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
                 let needs_detection = container.is_none()
                     && path.is_none()
