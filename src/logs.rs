@@ -107,23 +107,74 @@ pub fn resolve_logs_target(
     }
 }
 
-/// Resolves the log file path for `tekops logs`: an explicit positional
-/// `path` wins, then `$TEKOPS_LOGS_FILE` (Teku only, since that's the source
-/// this env var's own fallback value describes), then the source's default.
-pub fn resolve_log_path(
+/// Where one `tekops logs` session reads from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogTarget {
+    File(PathBuf),
+    Container(String),
+}
+
+/// Resolves what `tekops logs` should read, given everything that can say so.
+///
+/// Precedence, highest first: the `--container` flag or positional path (clap
+/// keeps those mutually exclusive, so there is no ordering question between
+/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE` (Teku only, since
+/// that is the source its own fallback value describes), then `docker ps`
+/// detection, then the source's hardcoded default.
+///
+/// The principle is: flags beat environment beats detection beats hardcoded
+/// default. Detection sits below everything the operator stated and above the
+/// hardcoded path, which is the only placement that behaves. Above the
+/// positional path, `tekops logs /var/log/teku/teku.log` would tail a container
+/// on any host that also runs Docker; below the hardcoded default, a Docker
+/// host would always fail on a path that does not exist there.
+///
+/// Every input arrives as a parameter rather than being read here, so the whole
+/// ladder is testable with no environment races and no Docker installed.
+pub fn resolve_log_target(
     source: LogSource,
     path: Option<PathBuf>,
+    container_flag: Option<String>,
+    container_env: Option<String>,
     teku_logs_file_env: Option<String>,
-) -> PathBuf {
-    path.or_else(|| match source {
-        LogSource::Teku => teku_logs_file_env.map(PathBuf::from),
-        LogSource::Besu => None,
-    })
-    .unwrap_or_else(|| source.default_path())
+    detected: Option<String>,
+) -> LogTarget {
+    if let Some(c) = container_flag {
+        return LogTarget::Container(c);
+    }
+    if let Some(p) = path {
+        return LogTarget::File(p);
+    }
+    if let Some(c) = container_env {
+        return LogTarget::Container(c);
+    }
+    if let LogSource::Teku = source {
+        if let Some(p) = teku_logs_file_env {
+            return LogTarget::File(PathBuf::from(p));
+        }
+    }
+    if let Some(c) = detected {
+        return LogTarget::Container(c);
+    }
+    LogTarget::File(source.default_path())
 }
 
 pub fn run_logs(source: LogSource, path: Option<PathBuf>, lines: u32) -> ExitCode {
-    let path = resolve_log_path(source, path, env::var("TEKOPS_LOGS_FILE").ok());
+    // TODO(task 5): thread the --container flag, $TEKOPS_CONTAINER, and
+    // docker ps detection through here instead of hardcoding None for all
+    // three - this shim exists only to keep the tree compiling until then.
+    let target = resolve_log_target(
+        source,
+        path,
+        None,
+        None,
+        env::var("TEKOPS_LOGS_FILE").ok(),
+        None,
+    );
+    let path = match target {
+        LogTarget::File(p) => p,
+        LogTarget::Container(_) => unreachable!("containers arrive in the next task"),
+    };
     if !path.exists() {
         eprintln!("error: log file not found: {}", path.display());
         return ExitCode::FAILURE;
@@ -369,34 +420,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_log_path_prefers_explicit_positional_path() {
-        let path = resolve_log_path(
-            LogSource::Teku,
-            Some(PathBuf::from("/custom.log")),
-            Some("/env.log".to_string()),
-        );
-        assert_eq!(path, PathBuf::from("/custom.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_falls_back_to_env_var_for_teku() {
-        let path = resolve_log_path(LogSource::Teku, None, Some("/env.log".to_string()));
-        assert_eq!(path, PathBuf::from("/env.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_falls_back_to_default_when_unset() {
-        let path = resolve_log_path(LogSource::Teku, None, None);
-        assert_eq!(path, PathBuf::from("/var/log/teku/teku.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_ignores_env_var_for_besu() {
-        let path = resolve_log_path(LogSource::Besu, None, Some("/env.log".to_string()));
-        assert_eq!(path, PathBuf::from("/var/log/besu/besu.log"));
-    }
-
     // The first positional of `tekops logs` is either a source name or a
     // path. Typing it as LogSource made `tekops logs /var/log/x.log` fail
     // with "invalid value for [SOURCE]" even though the README documented
@@ -553,5 +576,100 @@ mod tests {
         assert!(!missing.exists(), "test precondition");
         let code = run_logs(LogSource::Teku, Some(missing), 500);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    fn target(
+        path: Option<&str>,
+        container_flag: Option<&str>,
+        container_env: Option<&str>,
+        logs_file_env: Option<&str>,
+        detected: Option<&str>,
+    ) -> LogTarget {
+        resolve_log_target(
+            LogSource::Teku,
+            path.map(PathBuf::from),
+            container_flag.map(String::from),
+            container_env.map(String::from),
+            logs_file_env.map(String::from),
+            detected.map(String::from),
+        )
+    }
+
+    #[test]
+    fn container_flag_wins_over_everything_below_it() {
+        let t = target(None, Some("mine"), Some("env"), Some("/x.log"), Some("det"));
+        assert_eq!(t, LogTarget::Container("mine".into()));
+    }
+
+    /// The case that pins the ordering: naming a file on a host that also runs
+    /// Docker must read that file. An earlier draft put detection above the
+    /// positional path and would have tailed a container instead.
+    #[test]
+    fn explicit_path_beats_a_successful_detection() {
+        let t = target(
+            Some("/var/log/teku/teku.log"),
+            None,
+            None,
+            None,
+            Some("det"),
+        );
+        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/teku/teku.log")));
+    }
+
+    #[test]
+    fn container_env_beats_logs_file_env_and_detection() {
+        let t = target(None, None, Some("env"), Some("/x.log"), Some("det"));
+        assert_eq!(t, LogTarget::Container("env".into()));
+    }
+
+    #[test]
+    fn logs_file_env_beats_detection() {
+        let t = target(None, None, None, Some("/x.log"), Some("det"));
+        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
+    }
+
+    /// Detection sits above the hardcoded default because on a Docker host that
+    /// default path does not exist, and a detected container is a far better
+    /// answer than a guaranteed "file not found".
+    #[test]
+    fn detection_beats_the_hardcoded_default_path() {
+        let t = target(None, None, None, None, Some("rocketpool_eth2"));
+        assert_eq!(t, LogTarget::Container("rocketpool_eth2".into()));
+    }
+
+    #[test]
+    fn falls_back_to_the_sources_default_path_when_nothing_is_known() {
+        assert_eq!(
+            target(None, None, None, None, None),
+            LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))
+        );
+        let besu = resolve_log_target(LogSource::Besu, None, None, None, None, None);
+        assert_eq!(
+            besu,
+            LogTarget::File(PathBuf::from("/var/log/besu/besu.log"))
+        );
+    }
+
+    /// `$TEKOPS_LOGS_FILE` describes a Teku log, so it must not redirect a besu
+    /// session. This preserves the behaviour `resolve_log_path` had.
+    #[test]
+    fn logs_file_env_does_not_apply_to_besu() {
+        let t = resolve_log_target(
+            LogSource::Besu,
+            None,
+            None,
+            None,
+            Some("/teku.log".into()),
+            None,
+        );
+        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/besu/besu.log")));
+    }
+
+    /// A custom stack tekops does not recognize is a supported deployment: the
+    /// container override must work with detection having found nothing.
+    #[test]
+    fn custom_container_works_with_no_detection_at_all() {
+        let t = target(None, Some("mynode-teku"), None, None, None);
+        assert_eq!(t, LogTarget::Container("mynode-teku".into()));
     }
 }
