@@ -11,19 +11,81 @@ fn color_for_level(level: &str) -> &'static str {
     }
 }
 
-pub fn format_log_line(raw: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        // A line that isn't JSON is still untrusted bytes headed for a
-        // terminal, so it gets the same treatment as the parsed fields below.
-        return sanitize(raw);
-    };
+/// The levels `parse_console` will accept in a line's level field.
+///
+/// TRACE and FATAL are accepted here but have no entry in `color_for_level`, so
+/// they render uncoloured - the same treatment TRACE already gets on the JSON
+/// path.
+const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
-    // Log fields carry data the node didn't author - peer identifiers, remote
-    // agent strings, exception text from malformed gossip. The colorized
-    // output is written to a temp file that `less -R` renders with escapes
-    // live, so an unsanitized field can clear the operator's screen, retitle
-    // the terminal, or forge a red ERROR line that appears to come from tekops
-    // itself. Strip control characters before they reach the format string.
+/// One log record's fields, however they were parsed.
+///
+/// `thread` and `class` are empty for console records, which carry neither.
+struct Fields {
+    timestamp: String,
+    level: String,
+    thread: String,
+    class: String,
+    message: String,
+    throwable: String,
+}
+
+/// Whether a string has the shape of one of Teku's console timestamps,
+/// `2026-09-14 01:16:54.217` or the time-only `01:16:54.217`.
+///
+/// This is the second of `parse_console`'s two guards, and it is not optional:
+/// the level check alone would happily accept `some text INFO - hello`.
+fn looks_like_timestamp(s: &str) -> bool {
+    !s.is_empty()
+        && s.contains(':')
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | '.' | ' '))
+}
+
+/// Teku's console layout, which is what both Eth Docker and Rocket Pool run it
+/// with (`--log-destination=CONSOLE`):
+///
+/// ```text
+/// %d{yyyy-MM-dd HH:mm:ss.SSS} %-5level - %msg%n
+/// 2026-09-14 01:16:54.217 INFO  - Teku version: teku/v26.7.1
+/// ```
+///
+/// Three fields, not five: there is no thread and no class. Teku's five-field
+/// pipe-delimited `FILE_MESSAGE_FORMAT` belongs to the *file* appender and is
+/// deliberately not parsed here - no deployment this targets emits it, and Teku
+/// puts literal pipes inside its own messages (`Configuration | Network: hoodi`),
+/// so a pipe splitter would both miss every real line and mangle those.
+///
+/// Splitting on the *first* `" - "` is what keeps a message containing one
+/// whole, since the header never contains a `" - "`. `%-5level` right-pads, so
+/// `INFO` arrives padded and `ERROR` does not; trimming the head handles both.
+fn parse_console(raw: &str) -> Option<Fields> {
+    let (head, message) = raw.split_once(" - ")?;
+    let (timestamp, level) = head.trim_end().rsplit_once(' ')?;
+
+    if !LEVELS.contains(&level) || !looks_like_timestamp(timestamp) {
+        return None;
+    }
+
+    Some(Fields {
+        timestamp: sanitize(timestamp),
+        level: sanitize(level),
+        thread: String::new(),
+        class: String::new(),
+        message: sanitize(message),
+        // The console layout has no throwable field. Log4j appends stack traces
+        // as separate physical lines, which reach `format_log_line` on their own
+        // and fall through to passthrough.
+        throwable: String::new(),
+    })
+}
+
+/// Log fields carry data the node didn't author - peer identifiers, remote
+/// agent strings, exception text from malformed gossip. The colorized output is
+/// written to a temp file that `less -R` renders with escapes live, so an
+/// unsanitized field can clear the operator's screen, retitle the terminal, or
+/// forge a red ERROR line that appears to come from tekops itself.
+fn parse_json(value: &Value) -> Fields {
     let get = |key: &str| {
         value
             .get(key)
@@ -31,23 +93,58 @@ pub fn format_log_line(raw: &str) -> String {
             .map(sanitize)
             .unwrap_or_default()
     };
-    let timestamp = get("@timestamp");
-    let level = get("level");
-    let thread = get("thread");
-    let class = get("class");
-    let message = get("message");
-    let throwable = get("throwable");
+    Fields {
+        timestamp: get("@timestamp"),
+        level: get("level"),
+        thread: get("thread"),
+        class: get("class"),
+        message: get("message"),
+        throwable: get("throwable"),
+    }
+}
 
-    let color = color_for_level(&level);
-    let throwable_suffix = if throwable.is_empty() {
+/// Renders one parsed record, omitting the thread and class when absent.
+///
+/// Omitting rather than emitting empty `[] ` placeholders is what lets a console
+/// record render as `<timestamp> <LEVEL> - <message>`, the shape Teku itself
+/// prints, while leaving the JSON path's output byte-identical to what it was
+/// before the two paths shared a renderer.
+fn render(f: &Fields) -> String {
+    let color = color_for_level(&f.level);
+    let mut middle = String::new();
+    if !f.thread.is_empty() {
+        middle.push_str(&format!("[{}] ", f.thread));
+    }
+    if !f.class.is_empty() {
+        middle.push_str(&format!("{} ", f.class));
+    }
+    let throwable_suffix = if f.throwable.is_empty() {
         String::new()
     } else {
-        format!("\n{throwable}")
+        format!("\n{}", f.throwable)
     };
-
     format!(
-        "\u{1b}[{color}m{timestamp} {level} [{thread}] {class} - {message}{throwable_suffix}\u{1b}[0m"
+        "\u{1b}[{color}m{} {} {middle}- {}{throwable_suffix}\u{1b}[0m",
+        f.timestamp, f.level, f.message
     )
+}
+
+/// Tries each known layout in turn, most specific first, and falls back to
+/// passing the raw line through sanitized.
+///
+/// JSON is attempted before the console layout because it is unambiguous: a
+/// line that parses as JSON is JSON. The console attempt is guarded by its two
+/// checks so it cannot claim arbitrary text, and anything neither parser
+/// accepts is still untrusted bytes headed for a terminal, so it gets the same
+/// sanitizing.
+pub fn format_log_line(raw: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        return render(&parse_json(&value));
+    }
+    if let Some(fields) = parse_console(raw) {
+        return render(&fields);
+    }
+    sanitize(raw)
 }
 
 #[cfg(test)]
@@ -142,5 +239,126 @@ mod tests {
         let raw = r#"{"@timestamp":"t","level":"ERROR","thread":"t1","class":"C","message":"boom","throwable":"java.lang.RuntimeException\n\tat C.run"}"#;
         let out = format_log_line(raw);
         assert!(out.contains("java.lang.RuntimeException\n\tat C.run"));
+    }
+
+    /// Captured verbatim from a real `consensys/teku:latest` container.
+    #[test]
+    fn formats_teku_console_lines_with_the_same_colors_as_json() {
+        let raw = "2026-09-14 01:16:54.217 INFO  - Teku version: teku/v26.7.1";
+        let out = format_log_line(raw);
+        assert!(
+            out.starts_with("\u{1b}[32m"),
+            "expected green, got: {out:?}"
+        );
+        assert!(
+            out.contains("2026-09-14 01:16:54.217 INFO - Teku version: teku/v26.7.1"),
+            "got: {out:?}"
+        );
+        assert!(out.ends_with("\u{1b}[0m"));
+    }
+
+    /// ERROR is already 5 chars so `%-5level` adds no padding, giving one space
+    /// before the dash where INFO gives two. Both are real, both must parse.
+    #[test]
+    fn console_handles_both_padded_and_unpadded_levels() {
+        let unpadded = "2026-09-14 01:17:07.062 ERROR - Failed to update fork choice";
+        let out = format_log_line(unpadded);
+        assert!(out.starts_with("\u{1b}[31m"), "got: {out:?}");
+        assert!(out.contains("01:17:07.062 ERROR - Failed to update fork choice"));
+
+        let padded = "2026-09-14 01:17:12.652 WARN  - Syncing started";
+        assert!(format_log_line(padded).starts_with("\u{1b}[33m"));
+    }
+
+    /// The no-date variant of the console format, for a node started with
+    /// date prepending disabled.
+    #[test]
+    fn console_parses_the_time_only_timestamp_variant() {
+        let raw = "01:16:54.217 INFO  - Started";
+        let out = format_log_line(raw);
+        assert!(out.starts_with("\u{1b}[32m"), "got: {out:?}");
+        assert!(out.contains("01:16:54.217 INFO - Started"));
+    }
+
+    /// Teku puts literal pipes in its own messages. This is the line that makes
+    /// a pipe-splitting parser wrong, so it is pinned as a test.
+    #[test]
+    fn console_message_containing_a_pipe_is_not_mangled() {
+        let raw =
+            "2026-09-14 01:16:54.282 INFO  - Configuration | Network: hoodi, Storage Mode: MINIMAL";
+        let out = format_log_line(raw);
+        assert!(
+            out.contains("INFO - Configuration | Network: hoodi, Storage Mode: MINIMAL"),
+            "got: {out:?}"
+        );
+    }
+
+    /// Splitting on the FIRST " - " is what keeps a message containing one
+    /// whole, since the header never contains a " - ".
+    #[test]
+    fn console_message_may_contain_the_separator() {
+        let raw = "2026-09-14 01:16:54.217 INFO  - peer said a - b - c";
+        let out = format_log_line(raw);
+        assert!(out.contains("INFO - peer said a - b - c"), "got: {out:?}");
+    }
+
+    /// The level guard alone would accept this; the timestamp-shape guard is
+    /// what rejects it. Both are needed.
+    #[test]
+    fn prose_that_merely_contains_a_level_word_is_not_a_log_record() {
+        assert_eq!(
+            format_log_line("some text INFO - hello"),
+            "some text INFO - hello"
+        );
+    }
+
+    #[test]
+    fn a_line_with_no_separator_falls_through_to_passthrough() {
+        assert_eq!(format_log_line("just some output"), "just some output");
+    }
+
+    /// Java stack traces arrive as continuation lines. They stay readable via
+    /// passthrough rather than being mangled.
+    #[test]
+    fn console_stack_trace_continuation_lines_pass_through() {
+        let raw = "\tat tech.pegasys.teku.Foo.run(Foo.java:42)";
+        assert_eq!(
+            format_log_line(raw),
+            "\tat tech.pegasys.teku.Foo.run(Foo.java:42)"
+        );
+    }
+
+    /// Same threat as the JSON path: message text carries remote-authored data
+    /// and lands in a file `less -R` renders with escapes live. Teku's own event
+    /// colouring arrives this way too, so this path is exercised constantly.
+    #[test]
+    fn strips_terminal_escapes_from_console_messages() {
+        let raw = "2026-09-14 01:16:54.217 INFO  - peer: \u{1b}[2J\u{1b}]0;PWNED\u{7}\u{1b}[31mFAKE\u{1b}[0m";
+        let out = format_log_line(raw);
+        assert_eq!(
+            out.matches('\u{1b}').count(),
+            2,
+            "field escapes leaked: {out:?}"
+        );
+        assert!(!out.contains('\u{7}'), "BEL leaked: {out:?}");
+        assert!(out.contains("FAKE"), "text should survive: {out:?}");
+    }
+
+    /// The renderer is now shared between the JSON and console paths, so this
+    /// pins that sharing it did not change the JSON output.
+    #[test]
+    fn json_rendering_is_unchanged_by_the_shared_renderer() {
+        let raw = r#"{"@timestamp":"t","level":"INFO","thread":"main","class":"Node","message":"Started"}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("t INFO [main] Node - Started"), "got: {out:?}");
+    }
+
+    /// JSON is tried first, so a JSON line whose values contain " - " still
+    /// takes the JSON path.
+    #[test]
+    fn json_still_wins_over_console_parsing() {
+        let raw = r#"{"@timestamp":"t","level":"INFO","thread":"a - b","class":"C","message":"m"}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("[a - b] C - m"), "got: {out:?}");
     }
 }
