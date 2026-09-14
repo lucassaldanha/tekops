@@ -75,7 +75,7 @@ impl LogSource {
 /// path. The first one is either a source name or a path, which is why `cli`
 /// takes it as a `String` rather than letting clap type it as a `LogSource`:
 /// doing that made `tekops logs /var/log/x.log` fail with "invalid value for
-/// [SOURCE]" even though it is the form the README documents.
+/// [SOURCE]" even though it is the form USAGE.md documents.
 ///
 /// A file actually named `teku` or `besu` is read as a source, not a path.
 /// That ambiguity is inherent to the two-meanings-one-slot design; `./teku`
@@ -503,7 +503,7 @@ mod tests {
 
     // The first positional of `tekops logs` is either a source name or a
     // path. Typing it as LogSource made `tekops logs /var/log/x.log` fail
-    // with "invalid value for [SOURCE]" even though the README documented
+    // with "invalid value for [SOURCE]" even though USAGE.md documented
     // exactly that form.
 
     #[test]

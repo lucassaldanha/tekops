@@ -862,7 +862,7 @@ mod tests {
 
     // Regression: clap used to type this positional as a LogSource, so a bare
     // path was rejected outright with "invalid value for [SOURCE]" despite
-    // being the form the README documents. Meaning is assigned by
+    // being the form USAGE.md documents. Meaning is assigned by
     // logs::resolve_logs_target, which is where the behaviour is tested; this
     // only asserts the parser lets a path through at all.
     #[test]
