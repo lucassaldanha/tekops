@@ -301,20 +301,33 @@ pub fn run() -> ExitCode {
             // This condition must stay the logical negation of every branch
             // in `logs::resolve_log_target` that fires before its `detected`
             // parameter - nothing ties the two together at compile time, so
-            // a change to that ladder has to be mirrored here by hand.
+            // a change to that ladder has to be mirrored here by hand. The
+            // two config rungs are part of that list: an operator who set
+            // `container` or `logs_file` in the file has already answered,
+            // and a spawn here could not change the result.
+            let container_env = env::var("TEKOPS_CONTAINER").ok();
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
-            let needs_detection = container.is_none()
-                && path.is_none()
-                && env::var("TEKOPS_CONTAINER").is_err()
-                && logs_file_env.is_none();
-            let detected = if needs_detection {
+            let detected = if needs_detection(
+                path.as_ref(),
+                container.as_ref(),
+                container_env.as_ref(),
+                logs_file_env.as_ref(),
+                &cfg,
+            ) {
                 let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
                 docker_ps_names(should_report_unaskable_docker(only))
                     .and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
             } else {
                 None
             };
-            run_logs(path, lines, container, detected)
+            run_logs(
+                path,
+                lines,
+                container,
+                cfg.container.clone(),
+                cfg.logs_file.clone(),
+                detected,
+            )
         }
         Commands::DumpLogs {
             path,
@@ -332,12 +345,14 @@ pub fn run() -> ExitCode {
             // fires before its `detected` parameter.
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
-            let needs_detection = container.is_none()
-                && path.is_none()
-                && container_env.is_none()
-                && logs_file_env.is_none();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let detected: Option<(Stack, String)> = if needs_detection {
+            let detected: Option<(Stack, String)> = if needs_detection(
+                path.as_ref(),
+                container.as_ref(),
+                container_env.as_ref(),
+                logs_file_env.as_ref(),
+                &cfg,
+            ) {
                 docker_ps_names(should_report_unaskable_docker(given_stack))
                     .and_then(|ps| detect_or_note(&ps, given_stack))
             } else {
@@ -354,6 +369,8 @@ pub fn run() -> ExitCode {
                 container,
                 container_env,
                 logs_file_env,
+                cfg.container.clone(),
+                cfg.logs_file.clone(),
                 detected.map(|(_, name)| name),
             );
             // `--doctor` runs its own `docker ps` through `doctor_probe_config`
@@ -749,6 +766,26 @@ fn detect_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
             None
         }
     }
+}
+
+/// Whether `docker ps` has anything left to answer.
+///
+/// The logical negation of every rung in `logs::resolve_log_target` above
+/// `detected`. Extracted so the two call sites cannot drift apart and so the
+/// condition is testable without spawning Docker.
+fn needs_detection(
+    path: Option<&PathBuf>,
+    container_flag: Option<&String>,
+    container_env: Option<&String>,
+    logs_file_env: Option<&String>,
+    cfg: &crate::config::Config,
+) -> bool {
+    path.is_none()
+        && container_flag.is_none()
+        && container_env.is_none()
+        && logs_file_env.is_none()
+        && cfg.container.is_none()
+        && cfg.logs_file.is_none()
 }
 
 /// Generic over the error type so `UpdateError` shares the exit path with
@@ -2151,6 +2188,44 @@ mod tests {
     fn an_unparseable_stack_env_falls_through_to_the_config() {
         let got = resolve_stack(None, Some("nonsense".into()), Some(Stack::RocketPool));
         assert_eq!(got, Some(Stack::RocketPool));
+    }
+
+    #[test]
+    fn nothing_stated_anywhere_still_needs_detection() {
+        let cfg = crate::config::Config::default();
+        assert!(needs_detection(None, None, None, None, &cfg));
+    }
+
+    /// The regression this guards: a configured operator paying for a spawn whose
+    /// answer cannot be used. It is silent when it breaks - the symptom is a
+    /// `docker ps`, not an error.
+    #[test]
+    fn a_config_container_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            container: Some("c".into()),
+            ..Default::default()
+        };
+        assert!(!needs_detection(None, None, None, None, &cfg));
+    }
+
+    #[test]
+    fn a_config_logs_file_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            logs_file: Some(PathBuf::from("/x.log")),
+            ..Default::default()
+        };
+        assert!(!needs_detection(None, None, None, None, &cfg));
+    }
+
+    #[test]
+    fn any_stated_source_removes_the_need_to_detect() {
+        let cfg = crate::config::Config::default();
+        let p = PathBuf::from("/x.log");
+        let s = "c".to_string();
+        assert!(!needs_detection(Some(&p), None, None, None, &cfg));
+        assert!(!needs_detection(None, Some(&s), None, None, &cfg));
+        assert!(!needs_detection(None, None, Some(&s), None, &cfg));
+        assert!(!needs_detection(None, None, None, Some(&s), &cfg));
     }
 
     #[test]

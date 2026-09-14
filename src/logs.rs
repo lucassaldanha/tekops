@@ -69,23 +69,37 @@ pub enum LogTarget {
 ///
 /// Precedence, highest first: the `--container` flag or positional path (clap
 /// keeps those mutually exclusive, so there is no ordering question between
-/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then `docker ps`
-/// detection, then the hardcoded default.
+/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then the config
+/// file's `container`, then its `logs_file`, then `docker ps` detection, then
+/// the hardcoded default.
 ///
-/// The principle is: flags beat environment beats detection beats hardcoded
-/// default. Detection sits below everything the operator stated and above the
-/// hardcoded path, which is the only placement that behaves. Above the
-/// positional path, `tekops logs /var/log/teku/teku.log` would tail a container
-/// on any host that also runs Docker; below the hardcoded default, a Docker
-/// host would always fail on a path that does not exist there.
+/// The principle is: flags beat environment beats config beats detection beats
+/// hardcoded default. Config sits below the environment because a variable is
+/// the more specific act - it was typed for this session - and above detection
+/// because a value the operator wrote down beats one tekops guessed. Within
+/// each tier, naming a container beats naming a file, for the same reason in
+/// both: it is the more specific statement.
+///
+/// Detection sits below everything the operator stated and above the hardcoded
+/// path, which is the only placement that behaves. Above the positional path,
+/// `tekops logs /var/log/teku/teku.log` would tail a container on any host
+/// that also runs Docker; below the hardcoded default, a Docker host would
+/// always fail on a path that does not exist there.
 ///
 /// Every input arrives as a parameter rather than being read here, so the whole
 /// ladder is testable with no environment races and no Docker installed.
+///
+/// `cli.rs` has two `needs_detection` gates that are this function's
+/// precedence list negated by hand. Adding a rung above `detected` means
+/// adding a clause to both, or a configured operator pays for a `docker ps`
+/// spawn whose answer cannot be used.
 pub fn resolve_log_target(
     path: Option<PathBuf>,
     container_flag: Option<String>,
     container_env: Option<String>,
     teku_logs_file_env: Option<String>,
+    container_cfg: Option<String>,
+    logs_file_cfg: Option<PathBuf>,
     detected: Option<String>,
 ) -> LogTarget {
     if let Some(c) = container_flag {
@@ -99,6 +113,12 @@ pub fn resolve_log_target(
     }
     if let Some(p) = teku_logs_file_env {
         return LogTarget::File(PathBuf::from(p));
+    }
+    if let Some(c) = container_cfg {
+        return LogTarget::Container(c);
+    }
+    if let Some(p) = logs_file_cfg {
+        return LogTarget::File(p);
     }
     if let Some(c) = detected {
         return LogTarget::Container(c);
@@ -185,6 +205,8 @@ pub fn run_logs(
     path: Option<PathBuf>,
     lines: u32,
     container: Option<String>,
+    container_cfg: Option<String>,
+    logs_file_cfg: Option<PathBuf>,
     detected: Option<String>,
 ) -> ExitCode {
     let target = resolve_log_target(
@@ -192,6 +214,8 @@ pub fn run_logs(
         container,
         env::var("TEKOPS_CONTAINER").ok(),
         env::var("TEKOPS_LOGS_FILE").ok(),
+        container_cfg,
+        logs_file_cfg,
         detected,
     );
 
@@ -552,7 +576,7 @@ mod tests {
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(Some(missing), 500, None, None);
+        let code = run_logs(Some(missing), 500, None, None, None, None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
@@ -568,8 +592,111 @@ mod tests {
             container_flag.map(String::from),
             container_env.map(String::from),
             logs_file_env.map(String::from),
+            None,
+            None,
             detected.map(String::from),
         )
+    }
+
+    /// The two config rungs sit below both environment variables.
+    #[test]
+    fn the_logs_file_env_beats_the_config_container() {
+        let got = resolve_log_target(
+            None,
+            None,
+            None,
+            Some("/var/log/teku/teku.log".into()),
+            Some("cfg-container".into()),
+            Some(PathBuf::from("/cfg/teku.log")),
+            None,
+        );
+        assert_eq!(
+            got,
+            LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))
+        );
+    }
+
+    #[test]
+    fn the_container_env_beats_both_config_rungs() {
+        let got = resolve_log_target(
+            None,
+            None,
+            Some("env-container".into()),
+            None,
+            Some("cfg-container".into()),
+            Some(PathBuf::from("/cfg/teku.log")),
+            None,
+        );
+        assert_eq!(got, LogTarget::Container("env-container".into()));
+    }
+
+    /// Within the config tier, naming a container is the more specific statement,
+    /// mirroring why $TEKOPS_CONTAINER beats $TEKOPS_LOGS_FILE.
+    #[test]
+    fn the_config_container_beats_the_config_logs_file() {
+        let got = resolve_log_target(
+            None,
+            None,
+            None,
+            None,
+            Some("cfg-container".into()),
+            Some(PathBuf::from("/cfg/teku.log")),
+            None,
+        );
+        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+    }
+
+    /// Config beats detection: a value the operator wrote down beats one tekops
+    /// guessed.
+    #[test]
+    fn the_config_logs_file_beats_detection() {
+        let got = resolve_log_target(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(PathBuf::from("/cfg/teku.log")),
+            Some("detected-container".into()),
+        );
+        assert_eq!(got, LogTarget::File(PathBuf::from("/cfg/teku.log")));
+    }
+
+    #[test]
+    fn the_config_container_beats_detection() {
+        let got = resolve_log_target(
+            None,
+            None,
+            None,
+            None,
+            Some("cfg-container".into()),
+            None,
+            Some("detected-container".into()),
+        );
+        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+    }
+
+    /// Detection still beats the hardcoded default when the config says nothing.
+    #[test]
+    fn detection_still_beats_the_default_with_an_empty_config() {
+        let got = resolve_log_target(None, None, None, None, None, None, Some("d".into()));
+        assert_eq!(got, LogTarget::Container("d".into()));
+    }
+
+    /// The positional path outranks everything in the config, so naming a file on
+    /// a configured host still reads that file.
+    #[test]
+    fn the_positional_path_beats_both_config_rungs() {
+        let got = resolve_log_target(
+            Some(PathBuf::from("/tmp/x.log")),
+            None,
+            None,
+            None,
+            Some("cfg-container".into()),
+            Some(PathBuf::from("/cfg/teku.log")),
+            None,
+        );
+        assert_eq!(got, LogTarget::File(PathBuf::from("/tmp/x.log")));
     }
 
     #[test]
