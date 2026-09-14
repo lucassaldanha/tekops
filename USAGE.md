@@ -2,7 +2,7 @@
 
 Every command. See the [README](README.md) for installing and building.
 
-    tekops logs [teku|besu] [path]
+    tekops logs [path]
     tekops peers
     tekops health
     tekops head
@@ -20,9 +20,8 @@ Every command. See the [README](README.md) for installing and building.
 
 ## logs
 
-    tekops logs [path]           # source defaults to teku; a bare path works
-    tekops logs teku [path]      # defaults to /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE
-    tekops logs besu [path]      # defaults to /var/log/besu/besu.log
+    tekops logs                  # /var/log/teku/teku.log, or $TEKOPS_LOGS_FILE, or a detected container
+    tekops logs /var/log/x.log   # tails that path instead
     tekops logs -n 2000          # 2000 lines of scrollback instead of the default 500
     tekops logs --lines 0        # skip existing output, follow only new lines
     tekops logs --container rocketpool_eth2   # read a container's logs
@@ -32,6 +31,14 @@ new output. `-n`/`--lines` changes that count; it is passed straight to
 `tail -n`, so `0` means "show nothing existing, follow only what arrives
 next". The pre-loaded lines go into the scrollback buffer, not just on
 screen, so searching covers all of them from the moment the session starts.
+
+**`tekops logs teku` no longer works.** The `[teku|besu]` source argument was
+removed: the first positional is now always a path. Typing `teku` there reads
+as a file named `./teku` in the current directory, which almost never exists,
+so it fails with a bare "no such file" error that gives no hint why. Drop the
+word - `tekops logs` alone already tails the Teku log (or a detected
+container). Execution-client logs (Besu, or any other EL) are not supported;
+see issue #3 for that decision.
 
 Under Docker the source is a container rather than a file. See
 [Docker deployments](#docker-deployments).
@@ -275,20 +282,8 @@ if exactly one matches. Anything you state yourself wins over that: a path, a
 
 If `docker ps` finds more than one consensus container, tekops cannot guess
 which one you mean; it prints a note naming the candidates and falls through
-to the rest of the precedence chain (`$TEKOPS_LOGS_FILE`, then the source's
+to the rest of the precedence chain (`$TEKOPS_LOGS_FILE`, then the hardcoded
 default path) rather than failing the session outright.
-
-Detection only ever finds a *consensus* container - neither stack's naming
-gives the execution client a suffix to match - so `tekops logs besu` never
-resolves to a detected container. On a Docker host it needs `--container
-<execution container name>` (or `$TEKOPS_CONTAINER`) named explicitly;
-without one it falls through to `/var/log/besu/besu.log`, which will not
-exist under Docker. Note that `$TEKOPS_CONTAINER` is not scoped to a source
-either, so `export TEKOPS_CONTAINER=rocketpool_eth2` followed by `tekops logs
-besu` reads the consensus container while claiming to show Besu - that one is
-deliberate (you typed it, and the precedence ladder puts an explicit
-environment variable above detection) but worth knowing before it surprises
-you.
 
 On a host that runs both a bare-metal node and Docker, `--stack bare-metal`
 (or `TEKOPS_STACK=bare-metal`) turns container detection off entirely and
@@ -337,13 +332,6 @@ typed.
 
 Under Docker, Teku logs in its console layout rather than the JSON a bare-metal
 node is usually configured to write, and `tekops logs` colourizes both.
-
-`tekops logs besu` under Docker only reaches Besu's log lines at all once you
-name its container yourself with `--container` or `$TEKOPS_CONTAINER` (see
-above - detection has nothing to find it with). Once it does: Besu wraps
-every field of its console output in ANSI, and neither stack turns that off,
-so those lines are passed through readable but uncoloured. Teku, the default
-source, is unaffected.
 
 ## Common behaviour
 
