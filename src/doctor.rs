@@ -57,6 +57,15 @@ const MEM_WARN_BELOW: u64 = GIB;
 /// calendar, and the restart count already carries the signal.
 const RESTARTS_FAIL_AT: u64 = 5;
 
+/// A load average at the core count means fully busy; twice that means work
+/// is queueing faster than the box retires it.
+const LOAD_WARN_ABOVE_PER_CPU: f64 = 1.0;
+const LOAD_FAIL_ABOVE_PER_CPU: f64 = 2.0;
+
+/// Bare-metal, or a stack whose container could not be named. Distinct from
+/// `Probe::Failed`, which means Docker was asked and did not answer.
+const NO_CONTAINER: &str = "no container for this stack";
+
 /// The outcome of one piece of I/O.
 ///
 /// `Skipped` is distinct from `Failed` on purpose. Doctor makes seven network
@@ -141,10 +150,12 @@ pub struct Facts {
     pub duties: Probe<DutiesMetrics>,
     pub validators: Probe<ValidatorMetrics>,
 
-    /// Empty on bare-metal, by design, and rendered as no rows at all rather
-    /// than as "n/a": a bare-metal operator has no restart count and should
-    /// never be shown one.
-    pub containers: Vec<ContainerState>,
+    /// `Probe::Skipped(NO_CONTAINER)` on bare-metal, where there is no
+    /// container to inspect and the question does not apply. On a Docker
+    /// stack, `Probe::Ok` with an empty `Vec` is itself a finding (no
+    /// container was found), distinct from `Probe::Failed` (Docker was asked
+    /// and did not answer).
+    pub containers: Probe<Vec<ContainerState>>,
     pub disk: Option<Disk>,
     pub memory: Option<Memory>,
     pub load: Option<Load>,
@@ -219,8 +230,25 @@ fn check_metrics_endpoint(f: &Facts, out: &mut Vec<Finding>) {
 }
 
 fn check_syncing(f: &Facts, out: &mut Vec<Finding>) {
-    let Some(s) = f.syncing.ok() else {
-        return;
+    // A probe that was attempted and errored is a diagnosis in itself, not an
+    // absence: unlike a host fact that was never measured, silence here would
+    // hide that the beacon API answered `health` but not `syncing`. The
+    // outage is already `beacon api`'s to report as a Fail, so this warns
+    // rather than failing a second time for one cause.
+    let s = match &f.syncing {
+        Probe::Ok(s) => s,
+        Probe::Failed(e) => {
+            push(out, "sync status", Status::Warn, e);
+            push(out, "execution layer", Status::Warn, e);
+            push(out, "optimistic head", Status::Warn, e);
+            return;
+        }
+        Probe::Skipped(why) => {
+            push(out, "sync status", Status::Warn, *why);
+            push(out, "execution layer", Status::Warn, *why);
+            push(out, "optimistic head", Status::Warn, *why);
+            return;
+        }
     };
     if s.is_syncing {
         push(
@@ -264,8 +292,17 @@ fn check_syncing(f: &Facts, out: &mut Vec<Finding>) {
 }
 
 fn check_finality(f: &Facts, out: &mut Vec<Finding>) {
-    let (Some(fin), Some(s)) = (f.finality.ok(), f.syncing.ok()) else {
-        return;
+    // Same reasoning as `check_syncing`: a probe that errored is a finding
+    // (Warn - the outage is already reported elsewhere), not silence.
+    let s = match &f.syncing {
+        Probe::Ok(s) => s,
+        Probe::Failed(e) => return push(out, "finality lag", Status::Warn, e),
+        Probe::Skipped(why) => return push(out, "finality lag", Status::Warn, *why),
+    };
+    let fin = match &f.finality {
+        Probe::Ok(fin) => fin,
+        Probe::Failed(e) => return push(out, "finality lag", Status::Warn, e),
+        Probe::Skipped(why) => return push(out, "finality lag", Status::Warn, *why),
     };
     let (Ok(head), Ok(finalized)) = (
         s.head_slot.parse::<u64>(),
@@ -285,8 +322,12 @@ fn check_finality(f: &Facts, out: &mut Vec<Finding>) {
 }
 
 fn check_peers(f: &Facts, out: &mut Vec<Finding>) {
-    let Some(p) = f.peers.ok() else {
-        return;
+    // Same reasoning as `check_syncing`: a probe that errored is a finding
+    // (Warn - the outage is already reported elsewhere), not silence.
+    let p = match &f.peers {
+        Probe::Ok(p) => p,
+        Probe::Failed(e) => return push(out, "peer count", Status::Warn, e),
+        Probe::Skipped(why) => return push(out, "peer count", Status::Warn, *why),
     };
     let n = p.len();
     let status = if n == 0 {
@@ -375,19 +416,38 @@ fn check_duties(f: &Facts, out: &mut Vec<Finding>) {
 }
 
 fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
-    // Omitted entirely on bare-metal, where the question does not apply.
-    if f.containers.is_empty() {
-        return;
+    // The question does not apply on bare-metal (or when the stack itself is
+    // unknown): there is no container to inspect.
+    match f.stack {
+        Some(Stack::BareMetal) | None => return,
+        Some(Stack::EthDocker) | Some(Stack::RocketPool) => {}
     }
 
-    let stopped: Vec<&str> = f
-        .containers
+    // Unlike bare-metal, an empty listing on a Docker stack is itself the
+    // finding: the operator asked for a consensus container and none was
+    // found, which is exactly the failure this command exists to catch, not
+    // silence that could be misread as "containers weren't the problem".
+    let containers = match &f.containers {
+        Probe::Ok(v) if v.is_empty() => {
+            return push(
+                out,
+                "containers running",
+                Status::Fail,
+                "no containers found for this stack",
+            );
+        }
+        Probe::Ok(v) => v,
+        Probe::Failed(e) => return push(out, "containers running", Status::Fail, e),
+        Probe::Skipped(why) => return push(out, "containers running", Status::Fail, *why),
+    };
+
+    let stopped: Vec<&str> = containers
         .iter()
         .filter(|c| !c.running)
         .map(|c| c.name.as_str())
         .collect();
     if stopped.is_empty() {
-        let names: Vec<&str> = f.containers.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
         push(
             out,
             "containers running",
@@ -403,7 +463,7 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
         );
     }
 
-    let worst = f.containers.iter().max_by_key(|c| c.restart_count);
+    let worst = containers.iter().max_by_key(|c| c.restart_count);
     if let Some(c) = worst {
         let status = if c.restart_count >= RESTARTS_FAIL_AT {
             Status::Fail
@@ -455,9 +515,9 @@ fn check_host(f: &Facts, out: &mut Vec<Finding>) {
 
     if let (Some(l), Some(cpus)) = (&f.load, f.cpus) {
         let cpus_f = cpus as f64;
-        let status = if l.one > cpus_f * 2.0 {
+        let status = if l.one > cpus_f * LOAD_FAIL_ABOVE_PER_CPU {
             Status::Fail
-        } else if l.one > cpus_f {
+        } else if l.one > cpus_f * LOAD_WARN_ABOVE_PER_CPU {
             Status::Warn
         } else {
             Status::Pass
@@ -520,7 +580,7 @@ mod tests {
                 counts_by_status: BTreeMap::from([("active_ongoing".to_string(), 142)]),
                 total_eth: 4544.0,
             }),
-            containers: vec![],
+            containers: Probe::Skipped(NO_CONTAINER),
             disk: Some(Disk {
                 available_bytes: 400 * GIB,
                 mount_point: "/var/lib/teku".to_string(),
@@ -786,10 +846,14 @@ mod tests {
     }
 
     /// A bare-metal operator has no restart count and must never be shown a
-    /// row about one.
+    /// row about one - proven here by giving it a non-empty, healthy
+    /// container list and asserting the rows are absent anyway. If this
+    /// passed only because the list happened to be empty, it would not be
+    /// testing the stack branch at all.
     #[test]
     fn bare_metal_omits_both_container_checks() {
-        let f = healthy();
+        let mut f = healthy();
+        f.containers = Probe::Ok(vec![container("some-unrelated-container", true, 0)]);
         let got = evaluate(&f);
         assert!(status_of(&got, "containers running").is_none());
         assert!(status_of(&got, "container restarts").is_none());
@@ -803,7 +867,7 @@ mod tests {
         ] {
             let mut f = healthy();
             f.stack = Some(stack);
-            f.containers = vec![container(name, false, 0)];
+            f.containers = Probe::Ok(vec![container(name, false, 0)]);
             let got = evaluate(&f);
             assert_eq!(
                 status_of(&got, "containers running"),
@@ -819,12 +883,28 @@ mod tests {
         }
     }
 
+    /// An empty listing on a Docker stack is itself the failure - no
+    /// consensus container was found at all - and must not read as silence.
+    #[test]
+    fn docker_stack_with_no_container_found_fails() {
+        for stack in [Stack::EthDocker, Stack::RocketPool] {
+            let mut f = healthy();
+            f.stack = Some(stack);
+            f.containers = Probe::Ok(vec![]);
+            assert_eq!(
+                status_of(&evaluate(&f), "containers running"),
+                Some(Status::Fail),
+                "{stack:?}"
+            );
+        }
+    }
+
     #[test]
     fn container_restart_boundaries() {
         for (n, want) in [(0u64, Status::Pass), (1, Status::Warn), (5, Status::Fail)] {
             let mut f = healthy();
             f.stack = Some(Stack::RocketPool);
-            f.containers = vec![container("rocketpool_eth2", true, n)];
+            f.containers = Probe::Ok(vec![container("rocketpool_eth2", true, n)]);
             assert_eq!(
                 status_of(&evaluate(&f), "container restarts"),
                 Some(want),
@@ -839,8 +919,109 @@ mod tests {
     fn findings_are_sanitized() {
         let mut f = healthy();
         f.stack = Some(Stack::EthDocker);
-        f.containers = vec![container("evil\u{1b}[2Jname", false, 0)];
+        f.containers = Probe::Ok(vec![container("evil\u{1b}[2Jname", false, 0)]);
         let got = evaluate(&f);
         assert!(got.iter().all(|x| !x.detail.contains('\u{1b}')));
+    }
+
+    // --- Probe::Skipped and Probe::Failed on the dependent checks ---
+    //
+    // A probe that was attempted and errored is a diagnosis in itself, and
+    // must render as a Warn row naming the reason, not vanish the way an
+    // unmeasured host fact correctly does.
+
+    #[test]
+    fn sync_status_execution_layer_and_optimistic_head_warn_when_syncing_is_skipped() {
+        let mut f = healthy();
+        f.syncing = Probe::Skipped("beacon api unreachable");
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "sync status"), Some(Status::Warn));
+        assert_eq!(status_of(&got, "execution layer"), Some(Status::Warn));
+        assert_eq!(status_of(&got, "optimistic head"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn sync_status_warns_rather_than_vanishing_when_syncing_failed() {
+        let mut f = healthy();
+        f.syncing = Probe::Failed("could not reach endpoint: refused".to_string());
+        assert_eq!(status_of(&evaluate(&f), "sync status"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn finality_lag_warns_when_syncing_is_skipped() {
+        let mut f = healthy();
+        f.syncing = Probe::Skipped("beacon api unreachable");
+        assert_eq!(status_of(&evaluate(&f), "finality lag"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn finality_lag_warns_when_the_finality_probe_itself_is_skipped() {
+        let mut f = healthy();
+        f.finality = Probe::Skipped("beacon api unreachable");
+        assert_eq!(status_of(&evaluate(&f), "finality lag"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn peer_count_warns_when_skipped() {
+        let mut f = healthy();
+        f.peers = Probe::Skipped("beacon api unreachable");
+        assert_eq!(status_of(&evaluate(&f), "peer count"), Some(Status::Warn));
+    }
+
+    #[test]
+    fn peer_count_warns_rather_than_vanishing_when_peers_failed() {
+        let mut f = healthy();
+        f.peers = Probe::Failed("could not reach endpoint: refused".to_string());
+        assert_eq!(status_of(&evaluate(&f), "peer count"), Some(Status::Warn));
+    }
+
+    // --- metrics endpoint ---
+    //
+    // The only genuinely non-obvious status logic in the module: unreachable
+    // is Fail, but reachable-and-erroring is Warn, since that almost always
+    // means the scrape is pointed at the beacon node's port rather than the
+    // validator client's - a misconfiguration, not an outage.
+
+    #[test]
+    fn metrics_endpoint_passes_when_a_version_is_reported() {
+        let f = healthy();
+        assert_eq!(
+            status_of(&evaluate(&f), "metrics endpoint"),
+            Some(Status::Pass)
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_fails_when_unreachable() {
+        let mut f = healthy();
+        f.version = Probe::Failed("could not reach endpoint: refused".to_string());
+        assert_eq!(
+            status_of(&evaluate(&f), "metrics endpoint"),
+            Some(Status::Fail)
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_warns_when_reachable_but_missing_the_metric() {
+        let mut f = healthy();
+        f.version = Probe::Failed(
+            "metric beacon_teku_version_total not found at http://localhost:8010/metrics \
+             - the endpoint responded but exports no such metric"
+                .to_string(),
+        );
+        assert_eq!(
+            status_of(&evaluate(&f), "metrics endpoint"),
+            Some(Status::Warn)
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_fails_when_skipped() {
+        let mut f = healthy();
+        f.version = Probe::Skipped("beacon api unreachable");
+        assert_eq!(
+            status_of(&evaluate(&f), "metrics endpoint"),
+            Some(Status::Fail)
+        );
     }
 }
