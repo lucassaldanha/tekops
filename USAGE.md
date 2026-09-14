@@ -11,6 +11,7 @@ Every command. See the [README](README.md) for installing and building.
     tekops validators
     tekops version
     tekops log-level <LEVEL> [--filter=org.example ...]
+    tekops log-level <URL> [-y]
     tekops beacon validators <index-or-pubkey>...
     tekops beacon duties attester --epoch=N <index>...
     tekops beacon duties proposer --epoch=N
@@ -231,6 +232,11 @@ validator-client metrics instead.
 
 ### log-level
 
+    tekops log-level info                                  # global change
+    tekops log-level debug --filter=tech.pegasys.teku.sync # scoped to loggers
+    tekops log-level https://gist.github.com/someone/abc123 # a prepared body
+    tekops log-level https://gist.github.com/someone/abc123 -y
+
 Sends a `PUT` to `/teku/v1/admin/log_level` to change the node's runtime log
 level - the only mutating command `tekops` has. The level is a positional
 argument, e.g. `tekops log-level info`, sent to the API exactly as typed (no
@@ -238,6 +244,57 @@ case normalization). Repeat `--filter` to scope the change to one or more
 logger names (e.g. `org.hyperledger.besu`, or a fully-qualified class); omit
 it entirely to change the global log level - `log_filter` is left out of the
 request body in that case rather than sent as `null` or `[]`.
+
+#### Applying a prepared body from a URL
+
+Working out which Teku packages or classes to turn up is not something an
+operator can reasonably be expected to know. So the same positional also takes
+an **https URL** serving the request body, which is how a Teku maintainer can
+hand over exactly the right set of loggers: put the body in a gist, share the
+link, and the operator runs one command.
+
+The body is the same JSON the endpoint takes, and nothing else:
+
+```json
+{
+  "level": "DEBUG",
+  "log_filter": [
+    "tech.pegasys.teku.networking.eth2",
+    "tech.pegasys.teku.sync"
+  ]
+}
+```
+
+`log_filter` may be omitted for a global change. Any other key is an error
+rather than something quietly ignored, so a body with `log_filters` in it
+fails instead of applying a change missing the filters it was written to
+carry. Requires `curl` on the host, like `tekops update` does.
+
+Before anything is sent, tekops prints what the body would apply and asks:
+
+    $ tekops log-level https://gist.github.com/someone/abc123
+    fetched from https://gist.github.com/someone/abc123
+      level:  DEBUG
+      filter: tech.pegasys.teku.networking.eth2
+              tech.pegasys.teku.sync
+    apply? [y/N]
+
+Answer anything but `y`/`yes` and nothing is sent. Pass `-y` to skip the
+prompt when scripting. The preview and the prompt go to stderr, so `--json`
+still writes nothing but JSON to stdout.
+
+Notes on the URL:
+
+- A gist **page** URL works; tekops rewrites it to its `/raw` form before
+  fetching, dropping any `#file-...` fragment first. A
+  `gist.githubusercontent.com` URL is used as-is.
+- **Put one file in the gist.** A gist's `/raw` URL serves only its first
+  file, so a second file is silently not what gets applied.
+- Any https URL serving the body works - a gist is just the convenient one.
+  Plain `http` is refused.
+- `--filter` cannot be combined with a URL: the fetched body carries its own
+  `log_filter`, and honouring one while discarding the other silently is worse
+  than saying so.
 
 ## Metrics commands
 

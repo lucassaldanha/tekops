@@ -57,7 +57,7 @@ All of them are present on a default Debian/Ubuntu install.
 | --- | --- | --- |
 | `tail` | `tekops logs` | follows the log file |
 | `less` | `tekops logs` | the pager, with scrollback and search |
-| `curl` | `tekops update` | HTTPS to GitHub - tekops itself is built without a TLS stack |
+| `curl` | `tekops update`, `tekops log-level <url>` | HTTPS - tekops itself is built without a TLS stack |
 | `tar` | `tekops update` | unpacks the release tarball |
 
 Everything else is statically linked into the binary; nothing but that one
