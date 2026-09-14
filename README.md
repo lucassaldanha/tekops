@@ -128,10 +128,12 @@ Name the pieces directly and skip `--stack` entirely:
     export TEKOPS_API_URL=http://localhost:5099
     export TEKOPS_METRIC_URL=http://localhost:9109/metrics
 
-Every value a stack profile would supply is independently overridable, and
-`--stack` can be mixed with explicit flags: `--stack rocketpool
---api-url http://localhost:5099` takes the Rocket Pool metrics default and the
-explicit API URL.
+Every value a stack profile would supply is independently overridable, and a
+profile is a layer in the precedence chain rather than a mode that locks the
+rest: `tekops health --stack rocketpool --api-url http://localhost:5099` uses
+the explicit API URL instead of Rocket Pool's 5052 default, and `tekops duties
+--stack rocketpool` takes the Rocket Pool metrics default with nothing else
+typed.
 
 #### Log colourizing under Docker
 
