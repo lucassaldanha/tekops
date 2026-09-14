@@ -25,6 +25,11 @@ struct SyncingData {
     is_optimistic: bool,
     head_slot: String,
     sync_distance: String,
+    /// Present in the Beacon API spec and populated by Teku, but defaulted
+    /// rather than required: a client that omits it must not fail the whole
+    /// decode, because every other field on this response is still useful.
+    #[serde(default)]
+    el_offline: bool,
 }
 
 #[derive(Serialize)]
@@ -33,6 +38,7 @@ pub struct SyncingStatus {
     pub is_optimistic: bool,
     pub head_slot: String,
     pub sync_distance: String,
+    pub el_offline: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +263,7 @@ impl BeaconClient {
             is_optimistic: parsed.data.is_optimistic,
             head_slot: parsed.data.head_slot,
             sync_distance: parsed.data.sync_distance,
+            el_offline: parsed.data.el_offline,
         })
     }
 
@@ -426,6 +433,43 @@ mod tests {
         assert!(!status.is_optimistic);
         assert_eq!(status.head_slot, "123");
         assert_eq!(status.sync_distance, "4");
+    }
+
+    #[test]
+    fn syncing_reads_el_offline_when_present() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/eth/v1/node/syncing")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"is_syncing":false,"is_optimistic":false,
+                    "el_offline":true,"head_slot":"100","sync_distance":"0"}}"#,
+            )
+            .create();
+
+        let got = BeaconClient::new(server.url()).syncing().unwrap();
+        assert!(got.el_offline);
+    }
+
+    /// Not every client ships the field. Its absence must not fail the whole
+    /// response decode, which would turn a missing optional into an unusable
+    /// `sync-status` check.
+    #[test]
+    fn syncing_defaults_el_offline_to_false_when_absent() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/eth/v1/node/syncing")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"is_syncing":false,"is_optimistic":false,
+                    "head_slot":"100","sync_distance":"0"}}"#,
+            )
+            .create();
+
+        let got = BeaconClient::new(server.url()).syncing().unwrap();
+        assert!(!got.el_offline);
     }
 
     #[test]

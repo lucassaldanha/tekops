@@ -1187,6 +1187,7 @@ mod tests {
             is_optimistic: false,
             head_slot: "123".to_string(),
             sync_distance: "4".to_string(),
+            el_offline: false,
         };
         let health = HealthState::Ready;
         let payload = HealthJson {

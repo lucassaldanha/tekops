@@ -224,6 +224,7 @@ mod tests {
             is_optimistic: false,
             head_slot: "123456".to_string(),
             sync_distance: "0".to_string(),
+            el_offline: false,
         };
         let table = format_health_table(&HealthState::Ready, &syncing);
         assert!(table.contains("ready"));
@@ -238,6 +239,7 @@ mod tests {
             is_optimistic: true,
             head_slot: "100".to_string(),
             sync_distance: "50".to_string(),
+            el_offline: false,
         };
         let table = format_health_table(&HealthState::Syncing, &syncing);
         assert!(table.contains("syncing"));
