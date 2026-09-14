@@ -506,7 +506,8 @@ fn resolve_doctor_stack(
 }
 
 /// Teku's conventional bare-metal data directory. `--data-dir` (or
-/// `$TEKOPS_DATA_DIR`) exists for a node that relocated it.
+/// `$TEKOPS_DATA_DIR`, or the config file's `data_dir`) exists for a node
+/// that relocated it.
 const DEFAULT_BARE_METAL_DATA_DIR: &str = "/var/lib/teku";
 
 /// The disk-free check's data-dir ladder: `--data-dir` > `$TEKOPS_DATA_DIR` >
@@ -540,6 +541,23 @@ fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
     }
 }
 
+/// Whether `doctor_probe_config` has to run `docker ps` to learn the stack.
+///
+/// True exactly when no stack has been stated by flag, environment, or config
+/// file - the same `resolve_stack` ladder every other command reads. A
+/// configured stack makes the spawn pointless: its answer would only be
+/// overridden by `resolve_doctor_stack`, which already prefers a stated stack
+/// over a detected one. Extracted, the same shape `logs::needs_detection`
+/// uses for the identical failure mode, so a configured operator's spawn-skip
+/// is directly testable without mocking `docker ps`.
+fn doctor_needs_stack_detection(
+    flag: Option<Stack>,
+    env: Option<String>,
+    cfg: Option<Stack>,
+) -> bool {
+    resolve_stack(flag, env, cfg).is_none()
+}
+
 /// Doctor's full probe configuration, `docker ps` detection included.
 ///
 /// Lifted out of `run_doctor` so `dump-logs --doctor` builds the identical
@@ -555,24 +573,25 @@ fn doctor_probe_config(
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
-    // Read once, used for both `given` (below) and `resolve_doctor_stack`.
+    // Read once, used for both `doctor_needs_stack_detection` (below) and
+    // `resolve_doctor_stack`.
     let stack_env = env::var("TEKOPS_STACK").ok();
 
-    // `docker ps` runs only when nothing else has answered, matching the
-    // `needs_detection` gate in `logs`, so a bare-metal operator never pays
-    // for the spawn.
+    // `docker ps` runs only when nothing else has answered - see
+    // `doctor_needs_stack_detection` - matching the `needs_detection` gate in
+    // `logs`, so a configured or bare-metal operator never pays for the spawn.
     //
     // This rung is speculative by construction - it is reached only when no
     // stack has been named - so a `docker ps` that cannot answer is reported
     // by neither `false` here nor the lookup below, whose gate has since
     // resolved to bare-metal. That is issue #16: the two together are what
     // keep a node with no containers from hearing about Docker.
-    let given = resolve_stack(stack_flag, stack_env.clone(), cfg.stack);
-    let detected: Option<(Stack, String)> = if given.is_none() {
-        docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
-    } else {
-        None
-    };
+    let detected: Option<(Stack, String)> =
+        if doctor_needs_stack_detection(stack_flag, stack_env.clone(), cfg.stack) {
+            docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
+        } else {
+            None
+        };
     // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
     // consuming it would leave nothing for the container lookup below.
     let stack = resolve_doctor_stack(
@@ -2572,22 +2591,44 @@ mod tests {
 
     /// Carried over from Task 1's review: a configured stack must suppress the
     /// `docker ps` detection spawn in `doctor_probe_config`, the same way a
-    /// flag or env var already does. The spawn itself isn't observable without
-    /// mocking `Command` (out of scope here - `doctor_probe_config` calls
-    /// `docker_ps_names` directly), so this instead pins the condition that
-    /// gates it: `given.is_none()`, where `given` already folds in `cfg.stack`.
-    /// With `cfg.stack` set and no flag/env, `given` is `Some`, so the
-    /// production code's `if given.is_none()` branch - and the `docker ps`
-    /// spawn inside it - is never reached, regardless of what real `docker ps`
-    /// output would have said. This is deterministic on any host, Docker
-    /// installed or not, precisely because detection never runs.
+    /// flag or env var already does. The four tests below are pinned directly
+    /// on the extracted gate, `doctor_needs_stack_detection`, rather than on
+    /// `doctor_probe_config`'s output - asserting on the final `stack` would
+    /// still pass even if the `cfg` clause were dropped from the gate
+    /// entirely, since `resolve_doctor_stack` independently prefers a
+    /// configured stack over a detected one.
     #[test]
-    fn doctor_probe_config_config_stack_suppresses_docker_detection() {
-        let cfg = crate::config::Config {
-            stack: Some(Stack::RocketPool),
-            ..Default::default()
-        };
-        let probe_cfg = doctor_probe_config(None, None, None, None, &cfg);
-        assert_eq!(probe_cfg.stack, Some(Stack::RocketPool));
+    fn doctor_needs_stack_detection_when_nothing_is_stated() {
+        assert!(doctor_needs_stack_detection(None, None, None));
+    }
+
+    #[test]
+    fn a_stack_flag_removes_the_need_for_doctor_to_detect() {
+        assert!(!doctor_needs_stack_detection(
+            Some(Stack::BareMetal),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_stack_env_removes_the_need_for_doctor_to_detect() {
+        assert!(!doctor_needs_stack_detection(
+            None,
+            Some("rocketpool".into()),
+            None
+        ));
+    }
+
+    /// The clause that matters here: with only `cfg` set, removing it from
+    /// `doctor_needs_stack_detection`'s body is exactly what would make this
+    /// test fail - confirmed by testing the change directly and reverting it.
+    #[test]
+    fn a_configured_stack_removes_the_need_for_doctor_to_detect() {
+        assert!(!doctor_needs_stack_detection(
+            None,
+            None,
+            Some(Stack::RocketPool)
+        ));
     }
 }
