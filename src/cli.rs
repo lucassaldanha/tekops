@@ -370,12 +370,44 @@ pub fn run() -> ExitCode {
 /// and is applied to the URLs as well: `flags > env > detection > default`, the
 /// same ladder `logs` uses. Because detection has already been applied, doctor
 /// does not print the hint; there would be nothing left for it to suggest.
+///
+/// The ladder terminates in `Stack::BareMetal` rather than `None`:
+/// `resolve_base_url`/`resolve_metric_url` already default to bare-metal
+/// independently when handed `None`, so leaving this rung off let the report
+/// header say "unknown stack" directly above two confidently bare-metal URLs -
+/// two different facts that must not disagree.
 fn resolve_doctor_stack(
     flag: Option<Stack>,
     env: Option<String>,
     detected: Option<Stack>,
 ) -> Option<Stack> {
-    resolve_stack(flag, env).or(detected)
+    resolve_stack(flag, env)
+        .or(detected)
+        .or(Some(Stack::BareMetal))
+}
+
+/// Teku's conventional bare-metal data directory. `--data-dir` (or
+/// `$TEKOPS_DATA_DIR`) exists for a node that relocated it.
+const DEFAULT_BARE_METAL_DATA_DIR: &str = "/var/lib/teku";
+
+/// The disk-free check's data-dir ladder: `--data-dir` > `$TEKOPS_DATA_DIR` >
+/// a bare-metal default, matching the ladder in spec.md's cross-stack table.
+///
+/// The default is gated to bare-metal specifically. `doctor::probe` layers a
+/// container-mount fallback beneath whatever this returns
+/// (`cfg.data_dir.clone().or_else(|| ... data_mount ...)`), so handing down a
+/// value unconditionally on a Docker stack would win over that mount and make
+/// eth-docker/rocketpool measure the wrong filesystem. On those stacks this
+/// stays `None` unless the operator passed the flag or env var explicitly, so
+/// the container's own mount is what answers.
+fn resolve_doctor_data_dir(
+    flag: Option<PathBuf>,
+    env: Option<String>,
+    stack: Option<Stack>,
+) -> Option<PathBuf> {
+    flag.or_else(|| env.map(PathBuf::from)).or_else(|| {
+        matches!(stack, Some(Stack::BareMetal)).then(|| PathBuf::from(DEFAULT_BARE_METAL_DATA_DIR))
+    })
 }
 
 fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
@@ -390,10 +422,13 @@ fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
 }
 
 fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf>) -> ExitCode {
+    // Read once, used for both `given` (below) and `resolve_doctor_stack`.
+    let stack_env = env::var("TEKOPS_STACK").ok();
+
     // `docker ps` runs only when nothing else has answered, matching the
     // `needs_detection` gate in `logs`, so a bare-metal operator never pays
     // for the spawn.
-    let given = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+    let given = resolve_stack(api.stack, stack_env.clone());
     let detected: Option<(Stack, String)> = if given.is_none() {
         docker_ps_names().and_then(|ps| detect_stack(&ps, None).ok())
     } else {
@@ -401,11 +436,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     };
     // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
     // consuming it would leave nothing for the container lookup below.
-    let stack = resolve_doctor_stack(
-        api.stack,
-        env::var("TEKOPS_STACK").ok(),
-        detected.as_ref().map(|(s, _)| *s),
-    );
+    let stack = resolve_doctor_stack(api.stack, stack_env, detected.as_ref().map(|(s, _)| *s));
 
     // The container name: from detection when it ran, otherwise from a fresh
     // `docker ps` narrowed to the named stack.
@@ -422,7 +453,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
         api_url: resolve_base_url(api.api_url, stack),
         metric_url: resolve_metric_url(metric_url, stack),
         container,
-        data_dir: data_dir.or_else(|| env::var("TEKOPS_DATA_DIR").ok().map(PathBuf::from)),
+        data_dir: resolve_doctor_data_dir(data_dir, env::var("TEKOPS_DATA_DIR").ok(), stack),
     };
 
     let facts = crate::doctor::probe(&cfg);
@@ -1761,6 +1792,44 @@ mod tests {
             resolve_doctor_stack(None, None, Some(Stack::EthDocker)),
             Some(Stack::EthDocker)
         );
-        assert_eq!(resolve_doctor_stack(None, None, None), None);
+        // The ladder terminates in bare-metal, not None: the report header
+        // and the (bare-metal-defaulted) URLs it prints alongside it must
+        // never disagree about what "nothing was given" means.
+        assert_eq!(
+            resolve_doctor_stack(None, None, None),
+            Some(Stack::BareMetal)
+        );
+    }
+
+    #[test]
+    fn doctor_data_dir_defaults_to_the_bare_metal_path_when_nothing_else_answers() {
+        assert_eq!(
+            resolve_doctor_data_dir(None, None, Some(Stack::BareMetal)),
+            Some(PathBuf::from(DEFAULT_BARE_METAL_DATA_DIR))
+        );
+    }
+
+    #[test]
+    fn doctor_data_dir_flag_beats_the_bare_metal_default() {
+        assert_eq!(
+            resolve_doctor_data_dir(Some(PathBuf::from("/custom")), None, Some(Stack::BareMetal)),
+            Some(PathBuf::from("/custom"))
+        );
+    }
+
+    /// On a Docker stack, nothing given must resolve to `None`, not the
+    /// bare-metal default: `doctor::probe` layers the container's own mount
+    /// fallback beneath this value, and a default here would shadow it,
+    /// making the check measure the wrong filesystem.
+    #[test]
+    fn doctor_data_dir_stays_none_on_a_docker_stack_so_the_container_mount_can_answer() {
+        assert_eq!(
+            resolve_doctor_data_dir(None, None, Some(Stack::EthDocker)),
+            None
+        );
+        assert_eq!(
+            resolve_doctor_data_dir(None, None, Some(Stack::RocketPool)),
+            None
+        );
     }
 }
