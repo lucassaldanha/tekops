@@ -107,6 +107,28 @@ nothing configured it runs `docker ps` and looks for an Eth Docker
 if exactly one matches. Anything you state yourself wins over that: a path, a
 `--container` name, `$TEKOPS_CONTAINER`, or `$TEKOPS_LOGS_FILE`.
 
+Detection only ever finds a *consensus* container - neither stack's naming
+gives the execution client a suffix to match - so `tekops logs besu` never
+resolves to a detected container. On a Docker host it needs `--container
+<execution container name>` (or `$TEKOPS_CONTAINER`) named explicitly;
+without one it falls through to `/var/log/besu/besu.log`, which will not
+exist under Docker. Note that `$TEKOPS_CONTAINER` is not scoped to a source
+either, so `export TEKOPS_CONTAINER=rocketpool_eth2` followed by `tekops logs
+besu` reads the consensus container while claiming to show Besu - that one is
+deliberate (you typed it, and the precedence ladder puts an explicit
+environment variable above detection) but worth knowing before it surprises
+you.
+
+On a host that runs both a bare-metal node and Docker, `--stack bare-metal`
+(or `TEKOPS_STACK=bare-metal`) turns container detection off entirely and
+restores the plain file-path behaviour, since narrowing to a stack with no
+container suffix can never match anything `docker ps` returns.
+
+If `docker ps` finds more than one consensus container, tekops cannot guess
+which one you mean; it prints a note naming the candidates and falls through
+to the rest of the precedence chain (`$TEKOPS_LOGS_FILE`, then the source's
+default path) rather than failing the session outright.
+
 `--stack` sets the port defaults for a known deployment, since both Docker
 stacks differ from a bare-metal node and from each other:
 
@@ -140,9 +162,12 @@ typed.
 Under Docker, Teku logs in its console layout rather than the JSON a bare-metal
 node is usually configured to write, and `tekops logs` colourizes both.
 
-`tekops logs besu` is the exception: Besu wraps every field of its console
-output in ANSI, and neither stack turns that off, so those lines are passed
-through readable but uncoloured. Teku, the default source, is unaffected.
+`tekops logs besu` under Docker only reaches Besu's log lines at all once you
+name its container yourself with `--container` or `$TEKOPS_CONTAINER` (see
+above - detection has nothing to find it with). Once it does: Besu wraps
+every field of its console output in ANSI, and neither stack turns that off,
+so those lines are passed through readable but uncoloured. Teku, the default
+source, is unaffected.
 
     tekops beacon validators <index-or-pubkey>...
     tekops beacon duties attester --epoch=N <index>...

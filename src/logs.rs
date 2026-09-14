@@ -153,8 +153,19 @@ pub fn resolve_log_target(
             return LogTarget::File(PathBuf::from(p));
         }
     }
-    if let Some(c) = detected {
-        return LogTarget::Container(c);
+    // Detection only ever finds a *consensus* container - `stack.rs` has no
+    // suffix for either stack's execution client, and
+    // `does_not_match_rocket_pools_execution_container` pins that on purpose.
+    // Applying a detected name to a besu session would render Teku's logs
+    // while claiming to show Besu, the exact inverse of what the operator
+    // asked for and with nothing in the output to reveal the swap. So a
+    // detected container only ever answers a teku session; besu falls through
+    // to its own default path (or an explicit --container/$TEKOPS_CONTAINER,
+    // both handled above).
+    if let LogSource::Teku = source {
+        if let Some(c) = detected {
+            return LogTarget::Container(c);
+        }
     }
     LogTarget::File(source.default_path())
 }
@@ -731,6 +742,23 @@ mod tests {
             None,
             Some("/teku.log".into()),
             None,
+        );
+        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/besu/besu.log")));
+    }
+
+    /// Detection only ever finds a consensus container (see
+    /// `stack::does_not_match_rocket_pools_execution_container`), so applying
+    /// it to a besu session would silently show Teku logs to someone who asked
+    /// for Besu. A successful detection must not redirect a besu session.
+    #[test]
+    fn detection_does_not_apply_to_besu() {
+        let t = resolve_log_target(
+            LogSource::Besu,
+            None,
+            None,
+            None,
+            None,
+            Some("rocketpool_eth2".into()),
         );
         assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/besu/besu.log")));
     }

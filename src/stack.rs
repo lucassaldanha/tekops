@@ -246,6 +246,19 @@ mod tests {
         );
     }
 
+    /// `--stack bare-metal` is the escape hatch for a host that runs Docker
+    /// alongside a bare-metal node: narrowing to a stack with no
+    /// `container_suffix()` can never match anything, so detection turns off
+    /// and `resolve_log_target` falls through to the file-path behaviour. This
+    /// already worked - `container_suffix()` is `None` for `BareMetal` and the
+    /// loop skips a `None` suffix - but nothing pinned it before this test.
+    #[test]
+    fn narrowing_to_bare_metal_matches_nothing() {
+        let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
+        let err = detect_stack(ps, Some(Stack::BareMetal)).unwrap_err();
+        assert_eq!(err, DetectError::NotFound);
+    }
+
     #[test]
     fn narrowing_to_one_stack_ignores_the_others_containers() {
         let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";

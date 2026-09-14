@@ -11,7 +11,8 @@ use crate::output::{
     format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
-use crate::stack::{detect_stack, Stack};
+use crate::stack::{detect_stack, DetectError, Stack};
+use crate::term::sanitize;
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -230,16 +231,43 @@ pub fn run() -> ExitCode {
                 // in `logs::resolve_log_target` that fires before its `detected`
                 // parameter - nothing ties the two together at compile time, so
                 // a change to that ladder has to be mirrored here by hand.
+                //
+                // `matches!(source, LogSource::Teku)` mirrors the same gate
+                // `resolve_log_target` now applies to `detected`: detection only
+                // ever finds a consensus container, so a besu session has no use
+                // for it and skips the `docker ps` spawn entirely. This is a
+                // latency nicety only - the correctness fix lives in
+                // `resolve_log_target`, which is the tested ladder.
                 let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
                 let needs_detection = container.is_none()
                     && path.is_none()
                     && env::var("TEKOPS_CONTAINER").is_err()
-                    && !(matches!(source, LogSource::Teku) && logs_file_env.is_some());
+                    && !(matches!(source, LogSource::Teku) && logs_file_env.is_some())
+                    && matches!(source, LogSource::Teku);
                 let detected = if needs_detection {
                     let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
-                    docker_ps_names()
-                        .and_then(|ps| detect_stack(&ps, only).ok())
-                        .map(|(_, name)| name)
+                    docker_ps_names().and_then(|ps| match detect_stack(&ps, only) {
+                        Ok((_, name)) => Some(name),
+                        // A bare-metal host that never wanted Docker must not
+                        // be nagged about detection finding nothing.
+                        Err(DetectError::NotFound) => None,
+                        // Ambiguity is never a guess: `detect_stack` refuses to
+                        // pick between two candidates, and hard-failing the
+                        // session here would apply the same refusal one layer
+                        // too aggressively, breaking a mixed host that also has
+                        // a real /var/log/teku/teku.log. Falling through to the
+                        // rest of the ladder honours the same rule by picking
+                        // neither container, and if the fallback file is also
+                        // missing, this note plus that error together say
+                        // exactly what happened. Names come from `docker ps`,
+                        // which tekops did not author, so they're sanitized
+                        // before they reach the terminal - see term.rs's entry
+                        // in CLAUDE.md.
+                        Err(e @ DetectError::Ambiguous(_)) => {
+                            eprintln!("note: {}", sanitize(&e.to_string()));
+                            None
+                        }
+                    })
                 } else {
                     None
                 };
@@ -330,16 +358,22 @@ fn resolve_metric_url(metric_url: Option<String>, stack: Option<Stack>) -> Strin
 
 /// The names of running containers, or `None` if Docker cannot be asked.
 ///
-/// Every failure mode collapses to `None` on purpose: Docker not installed, the
-/// daemon not running, and the user not being in the `docker` group are all
-/// just "no detection available" as far as callers are concerned, and none of
-/// them should produce an error on a bare-metal host that never wanted Docker.
+/// Two different failures both end up `None`, but only one of them is silent.
+/// Docker being entirely absent (the `.output()` call itself errors - no
+/// `docker` on $PATH) says nothing: a bare-metal host that never wanted
+/// Docker must not be nagged about it. Docker being present but refusing (not
+/// in the `docker` group, or the daemon down) is a different situation worth
+/// naming, so it prints a note instead of collapsing into the same silent
+/// case - this is safe to do unconditionally because detection only ever
+/// runs once nothing else (a path, `--container`, an env var) has already
+/// answered, so it can't nag an operator who supplied one of those.
 fn docker_ps_names() -> Option<String> {
     let out = Command::new("docker")
         .args(["ps", "--format", "{{.Names}}"])
         .output()
         .ok()?;
     if !out.status.success() {
+        eprintln!("note: `docker ps` failed; container detection unavailable");
         return None;
     }
     String::from_utf8(out.stdout).ok()
