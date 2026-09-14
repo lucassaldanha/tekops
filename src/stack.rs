@@ -71,6 +71,19 @@ impl Stack {
     }
 }
 
+/// Renders exactly the value a user types for `--stack`, so doctor's report
+/// header names a stack in the CLI's own vocabulary rather than inventing a
+/// second spelling.
+impl fmt::Display for Stack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stack::BareMetal => write!(f, "bare-metal"),
+            Stack::EthDocker => write!(f, "eth-docker"),
+            Stack::RocketPool => write!(f, "rocketpool"),
+        }
+    }
+}
+
 /// Why `detect_stack` could not name exactly one container.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DetectError {
@@ -147,6 +160,16 @@ pub fn detect_stack(ps_output: &str, only: Option<Stack>) -> Result<(Stack, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Must match the `--stack` flag's own spelling: a doctor report that
+    /// prints a stack name the CLI does not accept would hand the operator a
+    /// value they cannot paste back in.
+    #[test]
+    fn display_matches_the_flag_values() {
+        assert_eq!(Stack::BareMetal.to_string(), "bare-metal");
+        assert_eq!(Stack::EthDocker.to_string(), "eth-docker");
+        assert_eq!(Stack::RocketPool.to_string(), "rocketpool");
+    }
 
     #[test]
     fn bare_metal_keeps_todays_defaults() {

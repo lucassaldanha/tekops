@@ -2,6 +2,7 @@ use crate::beaconapi::{
     AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
     ValidatorInfo,
 };
+use crate::doctor::{Facts, Finding, Status};
 use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
 use crate::protocol::Protocol;
 use comfy_table::Table;
@@ -190,6 +191,79 @@ pub fn format_about() -> String {
         "tekops {}\nMade with love by Lucas \u{2764}\u{fe0f}\nhttps://github.com/lucassaldanha/tekops",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+// `glyph`, `plural`, and `format_doctor_report` are only reached from this
+// module's own tests until `tekops doctor` wires them up in a later task -
+// same situation, and same fix, as `doctor.rs`'s module-level
+// `#![allow(dead_code)]`. Remove these once that wiring lands.
+#[allow(dead_code)]
+fn glyph(s: Status) -> char {
+    match s {
+        Status::Pass => '✔',
+        Status::Warn => '⚠',
+        Status::Fail => '✘',
+    }
+}
+
+#[allow(dead_code)]
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("{n} {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// The doctor report.
+///
+/// Deliberately not a `comfy-table`: pasting this into a chat when asking for
+/// help is a stated goal of the command, and box-drawing characters are noise
+/// there. No ANSI is emitted either, for the same reason.
+#[allow(dead_code)]
+pub fn format_doctor_report(f: &Facts, findings: &[Finding]) -> String {
+    let mut s = String::new();
+
+    let stack = f
+        .stack
+        .map(|st| st.to_string())
+        .unwrap_or_else(|| "unknown stack".to_string());
+    let version = match &f.version {
+        crate::doctor::Probe::Ok(v) if !v.versions.is_empty() => v.versions.join(", "),
+        _ => "version unknown".to_string(),
+    };
+    s.push_str(&format!(
+        "\n  {} · {} · {} {}\n\n",
+        stack,
+        crate::term::sanitize(&version),
+        f.os,
+        f.arch
+    ));
+
+    let width = findings.iter().map(|x| x.name.len()).max().unwrap_or(0);
+    for x in findings {
+        s.push_str(&format!(
+            "  {}  {:width$}  {}\n",
+            glyph(x.status),
+            x.name,
+            x.detail,
+            width = width
+        ));
+    }
+
+    let fails = findings.iter().filter(|x| x.status == Status::Fail).count();
+    let warns = findings.iter().filter(|x| x.status == Status::Warn).count();
+    s.push('\n');
+    if fails == 0 && warns == 0 {
+        s.push_str("no problems found.\n");
+    } else {
+        s.push_str(&format!(
+            "{}, {}.\n",
+            plural(fails, "failure"),
+            plural(warns, "warning")
+        ));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -398,5 +472,104 @@ mod tests {
         let table = format_version_table(&info);
         assert!(table.contains("teku/v24.10.0"));
         assert!(table.contains("teku/v24.9.0"));
+    }
+
+    /// A node built the same way Task 6's `healthy()` builds one, except
+    /// pinned to a Docker stack and a `linux` host, since the header tests
+    /// below need both named.
+    fn facts_for_output() -> crate::doctor::Facts {
+        use crate::doctor::Probe;
+        use crate::host::{Disk, Load, Memory};
+        use crate::stack::Stack;
+        use std::collections::BTreeMap;
+
+        crate::doctor::Facts {
+            stack: Some(Stack::EthDocker),
+            api_url: "http://localhost:5052".to_string(),
+            metric_url: "http://localhost:8009/metrics".to_string(),
+            os: "linux",
+            arch: "x86_64",
+            health: Probe::Ok(HealthState::Ready),
+            syncing: Probe::Ok(SyncingStatus {
+                is_syncing: false,
+                is_optimistic: false,
+                el_offline: false,
+                head_slot: "3200".to_string(),
+                sync_distance: "0".to_string(),
+            }),
+            finality: Probe::Ok(FinalityCheckpoints {
+                previous_justified_epoch: "98".to_string(),
+                current_justified_epoch: "99".to_string(),
+                finalized_epoch: "98".to_string(),
+            }),
+            peers: Probe::Ok(vec![]),
+            version: Probe::Ok(VersionInfo {
+                versions: vec!["teku/v25.1.0".to_string()],
+            }),
+            duties: Probe::Ok(DutiesMetrics {
+                published_blocks: 1,
+                published_attestations: 10,
+                published_sync_committee_messages: 0,
+                published_aggregates: 0,
+            }),
+            validators: Probe::Ok(ValidatorMetrics {
+                counts_by_status: BTreeMap::from([("active_ongoing".to_string(), 142)]),
+                total_eth: 4544.0,
+            }),
+            containers: Probe::Skipped("no container for this stack"),
+            disk: Some(Disk {
+                available_bytes: 400 * 1024 * 1024 * 1024,
+                mount_point: "/var/lib/teku".to_string(),
+            }),
+            memory: Some(Memory {
+                total_bytes: 32 * 1024 * 1024 * 1024,
+                available_bytes: 8 * 1024 * 1024 * 1024,
+            }),
+            load: Some(Load {
+                one: 1.0,
+                five: 1.0,
+                fifteen: 1.0,
+            }),
+            cpus: Some(8),
+        }
+    }
+
+    #[test]
+    fn doctor_report_lists_every_finding_with_a_glyph_and_a_summary() {
+        let findings = vec![
+            Finding::new("beacon api", Status::Pass, "ready at http://x"),
+            Finding::new("peer count", Status::Warn, "12 peers (want >= 20)"),
+            Finding::new("optimistic head", Status::Fail, "head unverified"),
+        ];
+        let out = format_doctor_report(&facts_for_output(), &findings);
+
+        assert!(out.contains("beacon api"));
+        assert!(out.contains("12 peers"));
+        assert!(out.contains('✔') && out.contains('⚠') && out.contains('✘'));
+        assert!(out.contains("1 failure, 1 warning"), "summary was: {out}");
+    }
+
+    /// The Discord-paste case is a stated goal, and escape sequences would
+    /// both corrupt a paste and reintroduce the surface `term::sanitize`
+    /// exists to close.
+    #[test]
+    fn doctor_report_emits_no_ansi_escape_sequences() {
+        let findings = vec![Finding::new("beacon api", Status::Fail, "down")];
+        let out = format_doctor_report(&facts_for_output(), &findings);
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn doctor_report_says_so_when_everything_passes() {
+        let findings = vec![Finding::new("beacon api", Status::Pass, "ready")];
+        let out = format_doctor_report(&facts_for_output(), &findings);
+        assert!(out.contains("no problems found"), "summary was: {out}");
+    }
+
+    #[test]
+    fn doctor_report_header_names_the_stack_and_host() {
+        let out = format_doctor_report(&facts_for_output(), &[]);
+        assert!(out.contains("eth-docker"));
+        assert!(out.contains("linux"));
     }
 }
