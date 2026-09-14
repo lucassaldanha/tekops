@@ -380,37 +380,72 @@ pub fn run() -> ExitCode {
         }
         Commands::Beacon { command, api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+            let client = BeaconClient::new(resolve_base_url(
+                api.api_url,
+                env::var("TEKOPS_API_URL").ok(),
+                cfg.api_url.clone(),
+                stack,
+            ));
             run_beacon(client, command, api.json, stack)
         }
         Commands::Peers { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+            let client = BeaconClient::new(resolve_base_url(
+                api.api_url,
+                env::var("TEKOPS_API_URL").ok(),
+                cfg.api_url.clone(),
+                stack,
+            ));
             exit_for_api(beacon_peers(&client, api.json), stack)
         }
         Commands::Health { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+            let client = BeaconClient::new(resolve_base_url(
+                api.api_url,
+                env::var("TEKOPS_API_URL").ok(),
+                cfg.api_url.clone(),
+                stack,
+            ));
             exit_for_api(beacon_health(&client, api.json), stack)
         }
         Commands::Head { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+            let client = BeaconClient::new(resolve_base_url(
+                api.api_url,
+                env::var("TEKOPS_API_URL").ok(),
+                cfg.api_url.clone(),
+                stack,
+            ));
             exit_for_api(beacon_head(&client, api.json), stack)
         }
         Commands::Duties { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
+            let client = MetricsClient::new(resolve_metric_url(
+                metrics.metric_url,
+                env::var("TEKOPS_METRIC_URL").ok(),
+                cfg.metric_url.clone(),
+                stack,
+            ));
             exit_for_api(metrics_duties(&client, metrics.json), stack)
         }
         Commands::Validators { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
+            let client = MetricsClient::new(resolve_metric_url(
+                metrics.metric_url,
+                env::var("TEKOPS_METRIC_URL").ok(),
+                cfg.metric_url.clone(),
+                stack,
+            ));
             exit_for_api(metrics_validators(&client, metrics.json), stack)
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
+            let client = MetricsClient::new(resolve_metric_url(
+                metrics.metric_url,
+                env::var("TEKOPS_METRIC_URL").ok(),
+                cfg.metric_url.clone(),
+                stack,
+            ));
             exit_for_api(metrics_version(&client, metrics.json), stack)
         }
         Commands::LogLevel {
@@ -555,8 +590,18 @@ fn doctor_probe_config(
 
     crate::doctor::ProbeConfig {
         stack,
-        api_url: resolve_base_url(api_url, stack),
-        metric_url: resolve_metric_url(metric_url, stack),
+        api_url: resolve_base_url(
+            api_url,
+            env::var("TEKOPS_API_URL").ok(),
+            cfg.api_url.clone(),
+            stack,
+        ),
+        metric_url: resolve_metric_url(
+            metric_url,
+            env::var("TEKOPS_METRIC_URL").ok(),
+            cfg.metric_url.clone(),
+            stack,
+        ),
         container,
         data_dir: resolve_doctor_data_dir(data_dir, env::var("TEKOPS_DATA_DIR").ok(), stack),
     }
@@ -608,15 +653,32 @@ fn resolve_stack(flag: Option<Stack>, env: Option<String>, cfg: Option<Stack>) -
         .or(cfg)
 }
 
-fn resolve_base_url(api_url: Option<String>, stack: Option<Stack>) -> String {
-    api_url
-        .or_else(|| env::var("TEKOPS_API_URL").ok())
+/// The Beacon API base URL: flag, then `$TEKOPS_API_URL`, then config, then
+/// the stack's default port.
+///
+/// The environment arrives as a parameter rather than being read here, the
+/// same shape `resolve_stack` uses, so the ladder is testable without
+/// environment races.
+fn resolve_base_url(
+    flag: Option<String>,
+    env: Option<String>,
+    cfg: Option<String>,
+    stack: Option<Stack>,
+) -> String {
+    flag.or(env)
+        .or(cfg)
         .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).api_url().to_string())
 }
 
-fn resolve_metric_url(metric_url: Option<String>, stack: Option<Stack>) -> String {
-    metric_url
-        .or_else(|| env::var("TEKOPS_METRIC_URL").ok())
+/// The Prometheus scrape URL, on the same ladder as `resolve_base_url`.
+fn resolve_metric_url(
+    flag: Option<String>,
+    env: Option<String>,
+    cfg: Option<String>,
+    stack: Option<Stack>,
+) -> String {
+    flag.or(env)
+        .or(cfg)
         .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).metric_url().to_string())
 }
 
@@ -973,7 +1035,12 @@ fn run_log_level(
     };
 
     let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg.stack);
-    let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+    let client = BeaconClient::new(resolve_base_url(
+        api.api_url,
+        env::var("TEKOPS_API_URL").ok(),
+        cfg.api_url.clone(),
+        stack,
+    ));
     exit_for_api(beacon_log_level(&client, &spec, api.json), stack)
 }
 
@@ -1326,10 +1393,13 @@ mod tests {
             &crate::config::Config::default(),
         );
         assert_eq!(cfg.stack, Some(Stack::BareMetal));
-        assert_eq!(cfg.api_url, resolve_base_url(None, Some(Stack::BareMetal)));
+        assert_eq!(
+            cfg.api_url,
+            resolve_base_url(None, None, None, Some(Stack::BareMetal))
+        );
         assert_eq!(
             cfg.metric_url,
-            resolve_metric_url(None, Some(Stack::BareMetal))
+            resolve_metric_url(None, None, None, Some(Stack::BareMetal))
         );
     }
 
@@ -1904,30 +1974,43 @@ mod tests {
     fn url_precedence_is_flag_then_env_then_stack_then_bare_metal() {
         // Flag beats a stack profile.
         assert_eq!(
-            resolve_base_url(Some("http://x:1".into()), Some(Stack::RocketPool)),
+            resolve_base_url(
+                Some("http://x:1".into()),
+                None,
+                None,
+                Some(Stack::RocketPool)
+            ),
             "http://x:1"
         );
         // Stack profile beats the bare-metal default.
         assert_eq!(
-            resolve_base_url(None, Some(Stack::RocketPool)),
+            resolve_base_url(None, None, None, Some(Stack::RocketPool)),
             "http://localhost:5052"
         );
         // Nothing at all keeps today's behaviour.
-        assert_eq!(resolve_base_url(None, None), "http://localhost:5051");
+        assert_eq!(
+            resolve_base_url(None, None, None, None),
+            "http://localhost:5051"
+        );
     }
 
     #[test]
     fn metric_url_precedence_matches_the_api_url_ladder() {
         assert_eq!(
-            resolve_metric_url(Some("http://x:2/m".into()), Some(Stack::EthDocker)),
+            resolve_metric_url(
+                Some("http://x:2/m".into()),
+                None,
+                None,
+                Some(Stack::EthDocker)
+            ),
             "http://x:2/m"
         );
         assert_eq!(
-            resolve_metric_url(None, Some(Stack::EthDocker)),
+            resolve_metric_url(None, None, None, Some(Stack::EthDocker)),
             "http://localhost:8009/metrics"
         );
         assert_eq!(
-            resolve_metric_url(None, None),
+            resolve_metric_url(None, None, None, None),
             "http://localhost:8010/metrics"
         );
     }
@@ -1937,12 +2020,86 @@ mod tests {
     #[test]
     fn a_stack_profile_and_an_explicit_url_can_be_combined() {
         assert_eq!(
-            resolve_base_url(Some("http://custom:5099".into()), Some(Stack::RocketPool)),
+            resolve_base_url(
+                Some("http://custom:5099".into()),
+                None,
+                None,
+                Some(Stack::RocketPool)
+            ),
             "http://custom:5099"
         );
         assert_eq!(
-            resolve_metric_url(None, Some(Stack::RocketPool)),
+            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
             "http://localhost:9101/metrics"
+        );
+    }
+
+    #[test]
+    fn the_api_url_flag_beats_the_env_and_the_config() {
+        let got = resolve_base_url(
+            Some("http://flag:1".into()),
+            Some("http://env:2".into()),
+            Some("http://cfg:3".into()),
+            Some(Stack::EthDocker),
+        );
+        assert_eq!(got, "http://flag:1");
+    }
+
+    #[test]
+    fn the_api_url_env_beats_the_config() {
+        let got = resolve_base_url(
+            None,
+            Some("http://env:2".into()),
+            Some("http://cfg:3".into()),
+            Some(Stack::EthDocker),
+        );
+        assert_eq!(got, "http://env:2");
+    }
+
+    #[test]
+    fn the_config_api_url_beats_the_stack_default() {
+        let got = resolve_base_url(
+            None,
+            None,
+            Some("http://cfg:3".into()),
+            Some(Stack::EthDocker),
+        );
+        assert_eq!(got, "http://cfg:3");
+    }
+
+    #[test]
+    fn the_stack_default_applies_when_nothing_states_an_api_url() {
+        let got = resolve_base_url(None, None, None, Some(Stack::EthDocker));
+        assert_eq!(got, Stack::EthDocker.api_url());
+    }
+
+    #[test]
+    fn the_metric_url_follows_the_same_ladder() {
+        assert_eq!(
+            resolve_metric_url(
+                Some("http://flag:1".into()),
+                Some("http://env:2".into()),
+                Some("http://cfg:3".into()),
+                Some(Stack::RocketPool)
+            ),
+            "http://flag:1"
+        );
+        assert_eq!(
+            resolve_metric_url(
+                None,
+                Some("http://env:2".into()),
+                Some("http://cfg:3".into()),
+                None
+            ),
+            "http://env:2"
+        );
+        assert_eq!(
+            resolve_metric_url(None, None, Some("http://cfg:3".into()), None),
+            "http://cfg:3"
+        );
+        assert_eq!(
+            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
+            Stack::RocketPool.metric_url()
         );
     }
 
