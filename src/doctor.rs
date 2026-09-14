@@ -14,6 +14,7 @@ use crate::docker::ContainerState;
 use crate::host::{Disk, Load, Memory};
 use crate::http::ApiError;
 use crate::metrics::{DutiesMetrics, MetricsClient, ValidatorMetrics, VersionInfo};
+use crate::output::plural;
 use crate::stack::Stack;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -248,12 +249,14 @@ fn check_syncing(f: &Facts, out: &mut Vec<Finding>) {
         }
     };
     if s.is_syncing {
-        push(
-            out,
-            "sync status",
-            Status::Warn,
-            format!("syncing, {} slots behind", s.sync_distance),
-        );
+        // sync_distance arrives as a Beacon API string, not a number - parsed
+        // here only to pick a/the word, with the original string kept as a
+        // fallback so an unparseable value still renders rather than vanishing.
+        let detail = match s.sync_distance.parse::<usize>() {
+            Ok(n) => format!("syncing, {} behind", plural(n, "slot")),
+            Err(_) => format!("syncing, {} slots behind", s.sync_distance),
+        };
+        push(out, "sync status", Status::Warn, detail);
     } else {
         push(
             out,
@@ -315,7 +318,7 @@ fn check_finality(f: &Facts, out: &mut Vec<Finding>) {
     } else {
         Status::Pass
     };
-    push(out, "finality lag", status, format!("{lag} epochs"));
+    push(out, "finality lag", status, plural(lag as usize, "epoch"));
 }
 
 fn check_peers(f: &Facts, out: &mut Vec<Finding>) {
@@ -334,10 +337,11 @@ fn check_peers(f: &Facts, out: &mut Vec<Finding>) {
     } else {
         Status::Pass
     };
+    let word = plural(n, "peer");
     let detail = if status == Status::Pass {
-        format!("{n} peers")
+        word
     } else {
-        format!("{n} peers (want >= {PEERS_WARN_BELOW})")
+        format!("{word} (want >= {PEERS_WARN_BELOW})")
     };
     push(out, "peer count", status, detail);
 }
@@ -392,8 +396,9 @@ fn check_duties(f: &Facts, out: &mut Vec<Finding>) {
                     "duties published",
                     Status::Pass,
                     format!(
-                        "{} attestations, {} blocks",
-                        d.published_attestations, d.published_blocks
+                        "{}, {}",
+                        plural(d.published_attestations as usize, "attestation"),
+                        plural(d.published_blocks as usize, "block")
                     ),
                 );
             } else {
@@ -472,7 +477,11 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
         let detail = if c.restart_count == 0 {
             "0".to_string()
         } else {
-            format!("{} restarts on {}", c.restart_count, c.name)
+            format!(
+                "{} on {}",
+                plural(c.restart_count as usize, "restart"),
+                c.name
+            )
         };
         push(out, "container restarts", status, detail);
     }
@@ -523,7 +532,7 @@ fn check_host(f: &Facts, out: &mut Vec<Finding>) {
             out,
             "load average",
             status,
-            format!("{:.2} ({cpus} cpus)", l.one),
+            format!("{:.2} ({})", l.one, plural(cpus, "cpu")),
         );
     }
 }
@@ -774,6 +783,19 @@ mod tests {
         assert!(detail.contains("412"), "detail was {detail:?}");
     }
 
+    /// "1 slots behind" reads as broken English. `sync_distance` arrives as a
+    /// Beacon API string, not a number, which is exactly the kind of value
+    /// that's easy to interpolate straight into a unit word without noticing
+    /// it can be singular.
+    #[test]
+    fn sync_status_detail_is_singular_for_one_slot_behind() {
+        let mut f = healthy();
+        f.syncing = Probe::Ok(syncing(true, "1"));
+        let got = evaluate(&f);
+        let detail = &got.iter().find(|x| x.name == "sync status").unwrap().detail;
+        assert_eq!(detail, "syncing, 1 slot behind");
+    }
+
     /// Finality runs exactly two epochs behind when healthy, so the boundary
     /// between "normal" and "worth mentioning" has to be tested on both sides.
     #[test]
@@ -799,6 +821,26 @@ mod tests {
         }
     }
 
+    /// "1 epochs" reads as broken English. Reuses `output::plural`, which the
+    /// summary line ("1 failure, 3 warnings") already relies on getting right.
+    #[test]
+    fn finality_lag_detail_is_singular_for_one_epoch() {
+        let mut f = healthy();
+        // head 3200 -> epoch 100; finalized 99 -> lag 1.
+        f.finality = Probe::Ok(FinalityCheckpoints {
+            previous_justified_epoch: "99".to_string(),
+            current_justified_epoch: "99".to_string(),
+            finalized_epoch: "99".to_string(),
+        });
+        let got = evaluate(&f);
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "finality lag")
+            .unwrap()
+            .detail;
+        assert_eq!(detail, "1 epoch");
+    }
+
     #[test]
     fn peer_count_boundaries() {
         for (n, want) in [
@@ -814,6 +856,15 @@ mod tests {
                 "{n} peers"
             );
         }
+    }
+
+    #[test]
+    fn peer_count_detail_is_singular_for_one_peer() {
+        let mut f = healthy();
+        f.peers = Probe::Ok(peers(1));
+        let got = evaluate(&f);
+        let detail = &got.iter().find(|x| x.name == "peer count").unwrap().detail;
+        assert_eq!(detail, "1 peer (want >= 20)");
     }
 
     /// The documented past bug this must not reintroduce: absent metric
@@ -861,6 +912,24 @@ mod tests {
             .unwrap()
             .detail
             .contains("restart"));
+    }
+
+    #[test]
+    fn duties_published_detail_is_singular_for_one_of_each() {
+        let mut f = healthy();
+        f.duties = Probe::Ok(DutiesMetrics {
+            published_blocks: 1,
+            published_attestations: 1,
+            published_sync_committee_messages: 0,
+            published_aggregates: 0,
+        });
+        let got = evaluate(&f);
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "duties published")
+            .unwrap()
+            .detail;
+        assert_eq!(detail, "1 attestation, 1 block");
     }
 
     #[test]
@@ -917,6 +986,24 @@ mod tests {
                 "load {one}"
             );
         }
+    }
+
+    #[test]
+    fn load_average_detail_is_singular_for_one_cpu() {
+        let mut f = healthy();
+        f.load = Some(Load {
+            one: 1.0,
+            five: 1.0,
+            fifteen: 1.0,
+        });
+        f.cpus = Some(1);
+        let got = evaluate(&f);
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "load average")
+            .unwrap()
+            .detail;
+        assert_eq!(detail, "1.00 (1 cpu)");
     }
 
     #[test]
@@ -1010,6 +1097,20 @@ mod tests {
                 "{n} restarts"
             );
         }
+    }
+
+    #[test]
+    fn container_restarts_detail_is_singular_for_one_restart() {
+        let mut f = healthy();
+        f.stack = Some(Stack::RocketPool);
+        f.containers = Probe::Ok(vec![container("rocketpool_eth2", true, 1)]);
+        let got = evaluate(&f);
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "container restarts")
+            .unwrap()
+            .detail;
+        assert_eq!(detail, "1 restart on rocketpool_eth2");
     }
 
     /// Findings are printed to a terminal, and container names and versions

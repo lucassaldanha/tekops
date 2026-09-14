@@ -201,7 +201,7 @@ fn glyph(s: Status) -> char {
     }
 }
 
-fn plural(n: usize, word: &str) -> String {
+pub(crate) fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("{n} {word}")
     } else {
