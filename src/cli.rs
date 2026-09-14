@@ -2,6 +2,7 @@ use crate::beaconapi::{
     BeaconClient, BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus,
 };
 use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
+use crate::curl;
 use crate::http::ApiError;
 use crate::logs::run_logs;
 use crate::metrics::MetricsClient;
@@ -825,7 +826,7 @@ fn beacon_log_level(
 fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateError> {
     match target {
         UpdateTarget::Check => {
-            let result = update::check(update::fetch)?;
+            let result = update::check(curl::fetch)?;
             if json {
                 println!(
                     "{}",
@@ -843,7 +844,7 @@ fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateE
         }
         UpdateTarget::Prompt | UpdateTarget::Latest => {
             let prompt = matches!(target, UpdateTarget::Prompt);
-            let result = update::check(update::fetch)?;
+            let result = update::check(curl::fetch)?;
             if !result.update_available {
                 println!("already on {} (latest)", result.current);
                 return Ok(());
@@ -953,7 +954,7 @@ fn confirm(current: &str, latest: &str) -> Result<bool, UpdateError> {
 fn install_version(version: &str) -> Result<(), UpdateError> {
     let dest = env::current_exe().map_err(|e| UpdateError::Io(e.to_string()))?;
     println!("downloading tekops {version} for {}...", dest.display());
-    update::install(update::fetch, version, &dest)?;
+    update::install(curl::fetch, version, &dest)?;
     println!("installed tekops {version}");
     refresh_completions(&dest);
     Ok(())
