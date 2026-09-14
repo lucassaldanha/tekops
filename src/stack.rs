@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use serde::Serialize;
 use std::fmt;
 
 /// Which deployment tekops is pointed at.
@@ -12,7 +13,8 @@ use std::fmt;
 /// hand-matched because they double as a path and a subcommand name) because a
 /// `--stack` value doubles as nothing: clap can reject a bad one at parse time
 /// and list the valid values itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Stack {
     /// Teku and Besu running directly on the host.
     #[value(name = "bare-metal")]

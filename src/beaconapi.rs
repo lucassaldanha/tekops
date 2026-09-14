@@ -32,7 +32,7 @@ struct SyncingData {
     el_offline: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SyncingStatus {
     pub is_syncing: bool,
     pub is_optimistic: bool,
@@ -80,7 +80,7 @@ struct Checkpoint {
     epoch: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct FinalityCheckpoints {
     pub previous_justified_epoch: String,
     pub current_justified_epoch: String,
@@ -99,6 +99,7 @@ struct PeerData {
     direction: String,
 }
 
+#[derive(Debug, Serialize)]
 pub struct PeerInfo {
     pub peer_id: String,
     pub last_seen_p2p_address: String,

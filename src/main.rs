@@ -2,6 +2,7 @@ mod beaconapi;
 mod cli;
 mod completions;
 mod docker;
+mod doctor;
 mod host;
 mod http;
 mod logfmt;
