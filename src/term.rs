@@ -16,12 +16,17 @@
 /// `ESC` into U+FFFD but left the rest of the sequence - `[37m` and so on -
 /// as visible literal text, which is exactly the noise this function is
 /// supposed to prevent. Removing the whole sequence is strictly safer than
-/// the old behaviour, not weaker: a hostile `ESC[31mFAKE ERROR ESC[0m`
-/// becomes the plain text "FAKE ERROR", with no colour and no cursor
-/// control - the visible payload survived under the old behaviour too, just
-/// with a U+FFFD glued to the front of it. Passing CSI through unmodified
-/// would reintroduce the screen-clear/retitle/forged-line attack this
-/// function exists to close - see the module doc.
+/// the old behaviour against terminal *control* - the actual threat this
+/// function exists to close (see the module doc): a hostile
+/// `ESC[31mFAKE ERROR ESC[0m` still renders as the plain text "FAKE ERROR",
+/// but now with no colour and no cursor control reaching the terminal
+/// either way. Passing CSI through unmodified would reintroduce that attack.
+/// What does change is a side effect, not a new hole: the old
+/// `<FFFD>[31m` residue was an incidental tell that something had been
+/// stripped, and a clean `FAKE ERROR` no longer carries that tell. `sanitize`
+/// was never a defence against forged plain text - a field whose message is
+/// literally "FAKE ERROR" always rendered as exactly that in both versions -
+/// so nothing that was actually prevented before is possible now.
 ///
 /// Every other escape form - OSC (`ESC ]`, used for window titles) and a bare
 /// `ESC` - keeps the old per-character behaviour: the `ESC` becomes U+FFFD
@@ -88,6 +93,17 @@ pub fn sanitize(raw: &str) -> String {
 /// `0x40..=0x7E`. Returns the index of the final byte, or `None` if the
 /// sequence runs off the end of input without ever reaching one - the signal
 /// to the caller that this was not a real CSI sequence at all.
+///
+/// The final-byte range is the full ECMA-48 range, not `[A-Za-z]` or `m`
+/// alone, and that is deliberate even though it produces surprising results
+/// on real input: `h` (0x68) is a legal final byte (Set Mode), so
+/// `ESC[hello world` really does end its sequence at the `h` and consumes
+/// it, the same as a real terminal would. Narrowing this range to something
+/// that looks more like "just colour codes" would be a genuine grammar
+/// regression, not a fix - it would stop recognising `ESC[2J` (final byte
+/// `J`, clear screen) and `ESC[?25l` (final byte `l`, hide cursor) as CSI
+/// sequences at all, leaving their bodies as visible literal text exactly
+/// like the bug this parser exists to fix.
 fn find_csi_final(chars: &[char], start: usize) -> Option<usize> {
     let mut j = start;
     while j < chars.len() && matches!(chars[j], '\u{30}'..='\u{3f}') {
@@ -164,6 +180,15 @@ mod tests {
     #[test]
     fn handles_a_non_m_final_byte() {
         assert_eq!(sanitize("a\u{1b}[2Jb"), "ab");
+    }
+
+    /// `h` is a legal CSI final byte (SM), so this sequence really does end
+    /// there and the `h` is consumed. ECMA-48-correct and what a real terminal
+    /// does - pinned so nobody "fixes" the final-byte range into something
+    /// narrower, which would break `ESC[2J` and `ESC[?25l`.
+    #[test]
+    fn a_letter_that_is_a_legal_final_byte_ends_the_sequence() {
+        assert_eq!(sanitize("a\u{1b}[hello world"), "aello world");
     }
 
     #[test]

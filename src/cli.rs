@@ -418,6 +418,20 @@ fn docker_stack_hint() -> Option<String> {
     hint_from_ps(&docker_ps_names()?)
 }
 
+/// Whether an unreachable-endpoint failure should carry a stack hint.
+///
+/// Split out from `exit_for_api` so the rule is machine-checked rather than
+/// inspection-checked: it is two tokens of condition, and it is precisely the
+/// part a later refactor could drop without any test noticing. The endpoint
+/// has to be unreachable at all - a wrong status code or a malformed body
+/// means the ports were right and the stack profile was never the problem -
+/// and the operator must not have already named one, since suggesting
+/// `--stack` to someone who passed `--stack` is just restating their own
+/// input back at them.
+fn should_hint(stack: Option<Stack>, e: &ApiError) -> bool {
+    stack.is_none() && matches!(e, ApiError::Unreachable(_))
+}
+
 /// The exit path for commands that talk to a node over HTTP.
 ///
 /// Identical to `exit_for` except that an unreachable endpoint gets a stack
@@ -432,7 +446,7 @@ fn exit_for_api(result: Result<(), ApiError>, stack: Option<Stack>) -> ExitCode 
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
-            if stack.is_none() && matches!(e, ApiError::Unreachable(_)) {
+            if should_hint(stack, &e) {
                 if let Some(hint) = docker_stack_hint() {
                     eprintln!("{hint}");
                 }
@@ -1527,5 +1541,24 @@ mod tests {
             hint_from_ps("eth-docker-consensus-1\nrocketpool_eth2\n"),
             None
         );
+    }
+
+    #[test]
+    fn hint_is_offered_only_for_an_unreachable_endpoint_with_no_stack_named() {
+        let unreachable = ApiError::Unreachable("x".into());
+        let status = ApiError::Status(404, "x".into());
+        let malformed = ApiError::Malformed("x".into());
+
+        // The one case that earns a hint.
+        assert!(should_hint(None, &unreachable));
+
+        // Already named a stack: suggesting one would restate their own input.
+        assert!(!should_hint(Some(Stack::EthDocker), &unreachable));
+
+        // The endpoint answered, so the ports are right and the stack is not
+        // the problem.
+        assert!(!should_hint(None, &status));
+        assert!(!should_hint(None, &malformed));
+        assert!(!should_hint(Some(Stack::RocketPool), &status));
     }
 }
