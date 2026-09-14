@@ -6,6 +6,7 @@
 //! that never touches a real file.
 
 use std::path::Path;
+use std::process::Command;
 
 const KIB: u64 = 1024;
 
@@ -84,8 +85,6 @@ pub fn df_argv(path: &Path) -> Vec<String> {
         path.display().to_string(),
     ]
 }
-
-use std::process::Command;
 
 #[derive(Debug, Default)]
 pub struct HostFacts {

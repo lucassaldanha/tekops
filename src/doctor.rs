@@ -60,8 +60,10 @@ const RESTARTS_FAIL_AT: u64 = 5;
 const LOAD_WARN_ABOVE_PER_CPU: f64 = 1.0;
 const LOAD_FAIL_ABOVE_PER_CPU: f64 = 2.0;
 
-/// Bare-metal, or a stack whose container could not be named. Distinct from
-/// `Probe::Failed`, which means Docker was asked and did not answer.
+/// Bare-metal, or a stack that is not known at all: there was never a
+/// container to look for. Distinct from `Probe::Failed`, which means Docker
+/// was asked and did not answer, and from a Docker stack's own
+/// `Probe::Ok(vec![])`, which means Docker was asked and matched nothing.
 const NO_CONTAINER: &str = "no container for this stack";
 
 /// The outcome of one piece of I/O.
@@ -150,9 +152,10 @@ pub struct Facts {
 
     /// `Probe::Skipped(NO_CONTAINER)` on bare-metal, where there is no
     /// container to inspect and the question does not apply. On a Docker
-    /// stack, `Probe::Ok` with an empty `Vec` is itself a finding (no
-    /// container was found), distinct from `Probe::Failed` (Docker was asked
-    /// and did not answer).
+    /// stack, `Probe::Ok` with an empty `Vec` is itself a finding (Docker was
+    /// asked and matched no consensus container), distinct from
+    /// `Probe::Failed` (Docker was asked about a named container and did not
+    /// answer).
     pub containers: Probe<Vec<ContainerState>>,
     pub disk: Option<Disk>,
     pub memory: Option<Memory>,
@@ -304,11 +307,32 @@ fn check_finality(f: &Facts, out: &mut Vec<Finding>) {
         Probe::Failed(e) => return push(out, "finality lag", Status::Warn, e),
         Probe::Skipped(why) => return push(out, "finality lag", Status::Warn, *why),
     };
-    let (Ok(head), Ok(finalized)) = (
-        s.head_slot.parse::<u64>(),
-        fin.finalized_epoch.parse::<u64>(),
-    ) else {
-        return;
+    // Unlike an absent input, an unparseable one is not silence: it is the
+    // one branch in `evaluate` where a check could otherwise vanish for a
+    // reason other than "the input was absent" (see the module's rule at the
+    // top of `evaluate`). A non-numeric head slot or finalized epoch is not a
+    // real Beacon API failure mode, but naming it beats disappearing.
+    let head = match s.head_slot.parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            return push(
+                out,
+                "finality lag",
+                Status::Warn,
+                format!("head slot {:?} is not a number", s.head_slot),
+            )
+        }
+    };
+    let finalized = match fin.finalized_epoch.parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            return push(
+                out,
+                "finality lag",
+                Status::Warn,
+                format!("finalized epoch {:?} is not a number", fin.finalized_epoch),
+            )
+        }
     };
     let lag = (head / SLOTS_PER_EPOCH).saturating_sub(finalized);
     let status = if lag > FINALITY_FAIL_ABOVE {
@@ -426,21 +450,26 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
     }
 
     // Unlike bare-metal, an empty listing on a Docker stack is itself the
-    // finding: the operator asked for a consensus container and none was
-    // found, which is exactly the failure this command exists to catch, not
+    // finding: `probe` asked Docker for a consensus container and matched
+    // none, which is exactly the failure this command exists to catch, not
     // silence that could be misread as "containers weren't the problem".
     let containers = match &f.containers {
         Probe::Ok(v) if v.is_empty() => {
             return push(
                 out,
-                "containers running",
+                "consensus container",
                 Status::Fail,
-                "no containers found for this stack",
+                "no consensus container found; is the stack running?",
             );
         }
         Probe::Ok(v) => v,
-        Probe::Failed(e) => return push(out, "containers running", Status::Fail, e),
-        Probe::Skipped(why) => return push(out, "containers running", Status::Fail, *why),
+        Probe::Failed(e) => return push(out, "consensus container", Status::Fail, e),
+        // Unreachable in practice: the bare-metal/unknown-stack match above
+        // already returned before this point, and a Docker stack's `probe`
+        // never produces `Skipped` (see `probe`'s `containers` match). Kept
+        // only for exhaustiveness, the same reasoning as the dead `Skipped`
+        // arms in `check_beacon_api`/`check_metrics_endpoint`.
+        Probe::Skipped(why) => return push(out, "consensus container", Status::Fail, *why),
     };
 
     let stopped: Vec<&str> = containers
@@ -452,14 +481,14 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
         let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
         push(
             out,
-            "containers running",
+            "consensus container",
             Status::Pass,
             format!("{} up", names.join(", ")),
         );
     } else {
         push(
             out,
-            "containers running",
+            "consensus container",
             Status::Fail,
             format!("not running: {}", stopped.join(", ")),
         );
@@ -590,11 +619,15 @@ pub fn probe(cfg: &ProbeConfig) -> Facts {
     };
 
     // `Probe`, not a bare Vec: an empty list on a Docker stack means "docker
-    // told us nothing", which is a reportable failure, and it must stay
-    // distinguishable from bare-metal's "there was never anything to list".
-    let containers: Probe<Vec<ContainerState>> = match cfg.container.as_deref() {
-        None => Probe::Skipped(NO_CONTAINER),
-        Some(name) => match inspect_container(name) {
+    // was asked and matched nothing", which is a reportable failure, and it
+    // must stay distinguishable from bare-metal's "there was never anything
+    // to list" - the two are told apart by `cfg.stack`, not by
+    // `cfg.container` alone, since a Docker stack whose detection found
+    // nothing also arrives with `cfg.container: None`.
+    let containers: Probe<Vec<ContainerState>> = match (cfg.stack, cfg.container.as_deref()) {
+        (Some(Stack::BareMetal), _) | (None, _) => Probe::Skipped(NO_CONTAINER),
+        (_, None) => Probe::Ok(vec![]),
+        (_, Some(name)) => match inspect_container(name) {
             Some(c) => Probe::Ok(vec![c]),
             None => Probe::Failed(crate::term::sanitize(&format!(
                 "docker inspect {name} failed or returned nothing"
@@ -674,7 +707,7 @@ mod tests {
                 current_justified_epoch: "99".to_string(),
                 finalized_epoch: "98".to_string(),
             }),
-            peers: Probe::Ok(vec![]),
+            peers: Probe::Ok(peers(30)),
             version: Probe::Ok(VersionInfo {
                 versions: vec!["teku/v25.1.0".to_string()],
             }),
@@ -722,9 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn a_healthy_node_has_no_failures_and_no_warnings_except_peers() {
-        let mut f = healthy();
-        f.peers = Probe::Ok(peers(30));
+    fn a_healthy_node_has_no_failures_or_warnings() {
+        let f = healthy();
         let got = evaluate(&f);
         assert!(
             got.iter().all(|x| x.status == Status::Pass),
@@ -839,6 +871,44 @@ mod tests {
             .unwrap()
             .detail;
         assert_eq!(detail, "1 epoch");
+    }
+
+    /// An unparseable value is not the same as an absent one: it must warn
+    /// and name the value, not silently vanish the row the way a genuinely
+    /// missing probe result does.
+    #[test]
+    fn finality_lag_warns_and_names_the_value_when_head_slot_does_not_parse() {
+        let mut f = healthy();
+        f.syncing = Probe::Ok(SyncingStatus {
+            head_slot: "not-a-number".to_string(),
+            ..syncing(false, "0")
+        });
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "finality lag"), Some(Status::Warn));
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "finality lag")
+            .unwrap()
+            .detail;
+        assert!(detail.contains("not-a-number"), "got: {detail:?}");
+    }
+
+    #[test]
+    fn finality_lag_warns_and_names_the_value_when_finalized_epoch_does_not_parse() {
+        let mut f = healthy();
+        f.finality = Probe::Ok(FinalityCheckpoints {
+            previous_justified_epoch: "99".to_string(),
+            current_justified_epoch: "99".to_string(),
+            finalized_epoch: "not-a-number".to_string(),
+        });
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "finality lag"), Some(Status::Warn));
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "finality lag")
+            .unwrap()
+            .detail;
+        assert!(detail.contains("not-a-number"), "got: {detail:?}");
     }
 
     #[test]
@@ -1041,7 +1111,7 @@ mod tests {
         let mut f = healthy();
         f.containers = Probe::Ok(vec![container("some-unrelated-container", true, 0)]);
         let got = evaluate(&f);
-        assert!(status_of(&got, "containers running").is_none());
+        assert!(status_of(&got, "consensus container").is_none());
         assert!(status_of(&got, "container restarts").is_none());
     }
 
@@ -1056,13 +1126,13 @@ mod tests {
             f.containers = Probe::Ok(vec![container(name, false, 0)]);
             let got = evaluate(&f);
             assert_eq!(
-                status_of(&got, "containers running"),
+                status_of(&got, "consensus container"),
                 Some(Status::Fail),
                 "{stack:?}"
             );
             assert!(got
                 .iter()
-                .find(|x| x.name == "containers running")
+                .find(|x| x.name == "consensus container")
                 .unwrap()
                 .detail
                 .contains(name));
@@ -1071,18 +1141,46 @@ mod tests {
 
     /// An empty listing on a Docker stack is itself the failure - no
     /// consensus container was found at all - and must not read as silence.
+    /// This is the state `probe` actually produces once `cfg.container` is
+    /// `None` on a Docker stack (I1): the wording asserted here is what an
+    /// operator sees in practice, not an unreachable arm.
     #[test]
     fn docker_stack_with_no_container_found_fails() {
         for stack in [Stack::EthDocker, Stack::RocketPool] {
             let mut f = healthy();
             f.stack = Some(stack);
             f.containers = Probe::Ok(vec![]);
+            let got = evaluate(&f);
             assert_eq!(
-                status_of(&evaluate(&f), "containers running"),
+                status_of(&got, "consensus container"),
                 Some(Status::Fail),
                 "{stack:?}"
             );
+            let detail = &got
+                .iter()
+                .find(|x| x.name == "consensus container")
+                .unwrap()
+                .detail;
+            assert!(
+                detail.contains("running"),
+                "detail should ask whether the stack is running: {detail:?}"
+            );
         }
+    }
+
+    /// Docker inspect failing outright (the container disappeared between
+    /// `docker ps` and `docker inspect`, say) is a distinct outcome from
+    /// finding nothing at all, and must still surface as a failure rather
+    /// than vanish.
+    #[test]
+    fn docker_stack_fails_when_the_inspect_probe_itself_failed() {
+        let mut f = healthy();
+        f.stack = Some(Stack::EthDocker);
+        f.containers = Probe::Failed("docker inspect eth-docker-consensus-1 failed".to_string());
+        assert_eq!(
+            status_of(&evaluate(&f), "consensus container"),
+            Some(Status::Fail)
+        );
     }
 
     #[test]
@@ -1277,6 +1375,50 @@ mod tests {
         let f = probe(&cfg);
         assert_eq!(f.api_url, "http://127.0.0.1:1");
         assert_eq!(f.stack, Some(Stack::EthDocker));
+    }
+
+    /// I1: on a Docker stack, `cfg.container: None` means detection ran and
+    /// matched nothing - Docker was asked - which is a reportable failure
+    /// (`Probe::Ok(vec![])`), not the same silence bare-metal reports.
+    #[test]
+    fn probe_reports_an_empty_container_list_rather_than_skipping_on_a_docker_stack() {
+        for stack in [Stack::EthDocker, Stack::RocketPool] {
+            let cfg = ProbeConfig {
+                stack: Some(stack),
+                api_url: "http://127.0.0.1:1".to_string(),
+                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                container: None,
+                data_dir: None,
+            };
+            let f = probe(&cfg);
+            assert!(
+                matches!(&f.containers, Probe::Ok(v) if v.is_empty()),
+                "{stack:?}: got {:?}",
+                f.containers
+            );
+        }
+    }
+
+    /// Bare-metal (and an unknown stack) never had a container to look for in
+    /// the first place, which stays `Probe::Skipped` rather than the "asked
+    /// and found nothing" `Probe::Ok(vec![])` a Docker stack reports.
+    #[test]
+    fn probe_skips_the_container_check_on_bare_metal_and_when_the_stack_is_unknown() {
+        for stack in [Some(Stack::BareMetal), None] {
+            let cfg = ProbeConfig {
+                stack,
+                api_url: "http://127.0.0.1:1".to_string(),
+                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                container: None,
+                data_dir: None,
+            };
+            let f = probe(&cfg);
+            assert!(
+                matches!(f.containers, Probe::Skipped(_)),
+                "{stack:?}: got {:?}",
+                f.containers
+            );
+        }
     }
 
     /// Only unreachability short-circuits the Beacon API probes. An endpoint

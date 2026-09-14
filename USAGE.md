@@ -141,11 +141,20 @@ consensus container's own mounts, picking the most specific one; `--data-dir`
 a greyed-out "n/a" row, just absent, since a bare-metal node has no restart
 count to show.
 
+**`consensus container` and `container restarts` inspect only the consensus
+client's own container** - `eth-docker-consensus-1`, `rocketpool_eth2` - the
+same one `tekops logs` detects. A dead execution or validator-client
+container is not checked directly; it is usually caught indirectly instead
+(`execution layer` if Teku notices the execution client is offline,
+`metrics endpoint` if the validator client stops answering its scrape).
+
 #### Exit code
 
 `0` when every check passes or the worst outcome is a warning. `1` when any
-check fails. This is the same convention `tekops update check --json` uses:
-0 means the run completed, not that everything is healthy.
+check fails. Unlike `tekops update check`, whose `0` means only that the
+check itself completed, doctor's exit code is a direct function of the
+findings - script against it (`tekops doctor || alert`) rather than assuming
+`0` just means the command ran.
 
 #### Checks
 
@@ -164,7 +173,7 @@ starting point.
 | peer count | >= 20 peers | 1-19 peers | 0 peers |
 | validator keys | any `active_ongoing` | 0 `active_ongoing` (none loaded, or only other statuses) | - |
 | duties published | any of blocks/attestations/sync messages/aggregates > 0 | all four are 0 | - |
-| containers running (Docker stacks only) | every container up | - | any container not running, or none found |
+| consensus container (Docker stacks only) | the consensus container is up | - | the consensus container is not running, or none found |
 | container restarts (Docker stacks only) | 0 restarts | 1-4 restarts | >= 5 restarts |
 | disk free | >= 50 GiB | < 50 GiB | < 20 GiB |
 | memory available | >= 1 GiB | < 1 GiB | - |
@@ -181,20 +190,20 @@ Teku's heap is preallocated, so low available memory (as distinct from low
 
       eth-docker · teku/v25.1.0 · linux x86_64
 
-      ✔  beacon api          ready at http://localhost:5052
-      ✔  metrics endpoint    teku/v25.1.0 at http://localhost:8009/metrics
-      ✔  sync status         synced, head 8891234
-      ✔  execution layer     online
-      ✘  optimistic head     head unverified by the execution client; duties will not be performed
-      ✔  finality lag        1 epoch
-      ⚠  peer count          12 peers (want >= 20)
-      ✔  validator keys      142 active_ongoing, 4544.00 ETH
-      ⚠  duties published    none yet (normal if the validator client restarted recently)
-      ✔  containers running  eth-docker-consensus-1 up
-      ✔  container restarts  0
-      ✔  disk free           412.0 GiB on /var/lib/docker/volumes/eth-docker_consensus-data/_data
-      ⚠  memory available    0.8 GiB of 31.3 GiB
-      ✔  load average        1.20 (8 cpus)
+      ✔  beacon api           ready at http://localhost:5052
+      ✔  metrics endpoint     teku/v25.1.0 at http://localhost:8009/metrics
+      ✔  sync status          synced, head 8891234
+      ✔  execution layer      online
+      ✘  optimistic head      head unverified by the execution client; duties will not be performed
+      ✔  finality lag         1 epoch
+      ⚠  peer count           12 peers (want >= 20)
+      ✔  validator keys       142 active_ongoing, 4544.00 ETH
+      ⚠  duties published     none yet (normal if the validator client restarted recently)
+      ✔  consensus container  eth-docker-consensus-1 up
+      ✔  container restarts   0
+      ✔  disk free            412.0 GiB on /var/lib/docker/volumes/eth-docker_consensus-data/_data
+      ⚠  memory available     0.8 GiB of 31.3 GiB
+      ✔  load average         1.20 (8 cpus)
 
     1 failure, 3 warnings.
 
