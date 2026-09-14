@@ -26,6 +26,18 @@
 /// Every other escape form - OSC (`ESC ]`, used for window titles) and a bare
 /// `ESC` - keeps the old per-character behaviour: the `ESC` becomes U+FFFD
 /// and the remaining bytes stay as inert literal text.
+///
+/// This only recognises the two-character `ESC [` introducer, not the
+/// single-byte 8-bit form (U+009B). A line using U+009B, e.g.
+/// `"\u{9b}37mSyncing"`, falls through to the OSC/bare-ESC path above and
+/// renders as U+FFFD followed by the literal `37mSyncing`, the same cosmetic
+/// leftover this function exists to remove, just via the other introducer.
+/// This is unchanged from before CSI parsing was added (U+009B was already
+/// replaced by `is_safe` on its own, so nothing about it is live) and is
+/// deliberately not being widened for: Teku, the only source of these
+/// sequences in practice, emits the 7-bit `ESC [` form, and there is no live
+/// client here that would justify widening a security-critical parser to
+/// catch a case nothing produces.
 pub fn sanitize(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::with_capacity(raw.len());
@@ -48,6 +60,16 @@ pub fn sanitize(raw: &str) -> String {
                     // single U+FFFD, and normal processing resumes right
                     // after it - so a real line that happens to end mid-
                     // sequence still shows everything that came after.
+                    //
+                    // This is the one place the output is not a pure subset
+                    // of the old one: the single U+FFFD stands for both
+                    // characters of the aborted introducer, so the `[` -
+                    // which the old per-character pass would have kept as
+                    // literal text - does not survive either. Everywhere
+                    // else this function only ever deletes escape machinery
+                    // or substitutes control characters one-for-one; this
+                    // branch also removes one character of what was
+                    // otherwise ordinary text, and that is intentional.
                     out.push('\u{fffd}');
                     i += 2;
                 }
