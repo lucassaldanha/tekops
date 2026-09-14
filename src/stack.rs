@@ -13,17 +13,28 @@ use std::fmt;
 /// hand-matched because they double as a path and a subcommand name) because a
 /// `--stack` value doubles as nothing: clap can reject a bad one at parse time
 /// and list the valid values itself.
+///
+/// The `#[serde(rename = "...")]` on each variant is pinned by hand rather
+/// than derived with a blanket `#[serde(rename_all = "kebab-case")]`: the
+/// `--stack` values are hand-chosen flag names, not a mechanical transform of
+/// the variant identifiers, and `RocketPool`'s flag value is deliberately the
+/// unhyphenated `"rocketpool"` - kebab-case would produce `"rocket-pool"`,
+/// which disagrees with both the flag and `Display`. Each rename must match
+/// the variant's own `#[value(name = "...")]` exactly; see
+/// `serde_matches_clap_values_for_every_variant` below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum Stack {
     /// Teku and Besu running directly on the host.
     #[value(name = "bare-metal")]
+    #[serde(rename = "bare-metal")]
     BareMetal,
     /// https://ethdocker.com
     #[value(name = "eth-docker")]
+    #[serde(rename = "eth-docker")]
     EthDocker,
     /// https://docs.rocketpool.net
     #[value(name = "rocketpool")]
+    #[serde(rename = "rocketpool")]
     RocketPool,
 }
 
@@ -169,6 +180,35 @@ mod tests {
         assert_eq!(Stack::BareMetal.to_string(), "bare-metal");
         assert_eq!(Stack::EthDocker.to_string(), "eth-docker");
         assert_eq!(Stack::RocketPool.to_string(), "rocketpool");
+    }
+
+    /// The bug this guards against: a blanket `#[serde(rename_all =
+    /// "kebab-case")]` coincidentally matched the clap value for `BareMetal`
+    /// and `EthDocker` but silently produced `"rocket-pool"` for `RocketPool`,
+    /// whose clap value is the unhyphenated `"rocketpool"` - so `--json`
+    /// output disagreed with both the flag vocabulary and `Display`.
+    ///
+    /// Driven off `Stack::value_variants()` and `to_possible_value()` (both
+    /// from `clap::ValueEnum`) rather than a hand-written list, so a variant
+    /// added later is covered automatically instead of silently skipped.
+    #[test]
+    fn serde_matches_clap_values_for_every_variant() {
+        for stack in Stack::value_variants() {
+            let clap_name = stack.to_possible_value().unwrap().get_name().to_string();
+
+            let serialized = serde_json::to_value(stack).unwrap();
+            let serde_name = serialized.as_str().unwrap();
+
+            assert_eq!(
+                serde_name, clap_name,
+                "serde rename for {stack:?} disagrees with its clap value"
+            );
+            assert_eq!(
+                stack.to_string(),
+                clap_name,
+                "Display for {stack:?} disagrees with its clap value"
+            );
+        }
     }
 
     #[test]
