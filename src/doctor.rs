@@ -379,12 +379,15 @@ fn check_validators(f: &Facts, out: &mut Vec<Finding>) {
                 .copied()
                 .unwrap_or(0);
             if active > 0 {
-                push(
-                    out,
-                    "validator keys",
-                    Status::Pass,
-                    format!("{active} active_ongoing, {:.2} ETH", v.total_eth),
-                );
+                // Absent, not zero: the ETH clause is omitted entirely rather
+                // than printing `0.00 ETH` when the scrape has no balances
+                // family, so a working validator client that just doesn't
+                // export balances is not misread as holding nothing.
+                let detail = match v.total_eth {
+                    Some(eth) => format!("{active} active_ongoing, {eth:.2} ETH"),
+                    None => format!("{active} active_ongoing"),
+                };
+                push(out, "validator keys", Status::Pass, detail);
             } else {
                 let breakdown: Vec<String> = v
                     .counts_by_status
@@ -719,7 +722,7 @@ mod tests {
             }),
             validators: Probe::Ok(ValidatorMetrics {
                 counts_by_status: BTreeMap::from([("active_ongoing".to_string(), 142)]),
-                total_eth: 4544.0,
+                total_eth: Some(4544.0),
             }),
             containers: Probe::Skipped(NO_CONTAINER),
             disk: Some(Disk {
@@ -963,6 +966,25 @@ mod tests {
             !detail.contains("published nothing") && !detail.contains("0 "),
             "absent must not read as zero: {detail:?}"
         );
+    }
+
+    /// I3, at the render layer: an absent balances family must drop the ETH
+    /// clause entirely rather than print a measured `0.00 ETH` behind a Pass.
+    #[test]
+    fn validator_keys_omits_the_eth_clause_when_the_balances_family_is_absent() {
+        let mut f = healthy();
+        f.validators = Probe::Ok(ValidatorMetrics {
+            counts_by_status: BTreeMap::from([("active_ongoing".to_string(), 142)]),
+            total_eth: None,
+        });
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "validator keys"), Some(Status::Pass));
+        let detail = &got
+            .iter()
+            .find(|x| x.name == "validator keys")
+            .unwrap()
+            .detail;
+        assert_eq!(detail, "142 active_ongoing");
     }
 
     #[test]

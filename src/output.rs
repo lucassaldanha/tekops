@@ -91,7 +91,13 @@ pub fn format_validator_metrics_table(metrics: &ValidatorMetrics) -> String {
     total_table.set_header(vec!["Field", "Value"]);
     total_table.add_row(vec![
         "Total ETH".to_string(),
-        format!("{:.4}", metrics.total_eth),
+        match metrics.total_eth {
+            Some(eth) => format!("{eth:.4}"),
+            // Absent, not a measured zero: the scrape exports no balances
+            // family at all, distinct from a validator client that legitimately
+            // reports 0 ETH.
+            None => "unknown (no balance metric exported)".to_string(),
+        },
     ]);
 
     format!("{counts_table}\n\n{total_table}")
@@ -438,7 +444,7 @@ mod tests {
         counts_by_status.insert("pending_queued".to_string(), 3);
         let metrics = ValidatorMetrics {
             counts_by_status,
-            total_eth: 63.5,
+            total_eth: Some(63.5),
         };
         let table = format_validator_metrics_table(&metrics);
         assert!(table.contains("active_ongoing"));
@@ -446,6 +452,24 @@ mod tests {
         assert!(table.contains("pending_queued"));
         assert!(table.contains("Total ETH"));
         assert!(table.contains("63.5000"));
+    }
+
+    /// I3: an absent balances family must render as absent, not as a
+    /// measured `0.0000` sitting beside a real count.
+    #[test]
+    fn formats_validator_metrics_table_without_a_total_eth_figure_when_absent() {
+        let mut counts_by_status = BTreeMap::new();
+        counts_by_status.insert("active_ongoing".to_string(), 142);
+        let metrics = ValidatorMetrics {
+            counts_by_status,
+            total_eth: None,
+        };
+        let table = format_validator_metrics_table(&metrics);
+        assert!(table.contains("Total ETH"));
+        assert!(
+            !table.contains("0.0000"),
+            "absent must not read as zero: {table}"
+        );
     }
 
     #[test]
@@ -507,7 +531,7 @@ mod tests {
             }),
             validators: Probe::Ok(ValidatorMetrics {
                 counts_by_status: BTreeMap::from([("active_ongoing".to_string(), 142)]),
-                total_eth: 4544.0,
+                total_eth: Some(4544.0),
             }),
             containers: Probe::Skipped("no container for this stack"),
             disk: Some(Disk {

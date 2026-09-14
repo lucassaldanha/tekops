@@ -225,7 +225,11 @@ pub struct DutiesMetrics {
 #[derive(Debug, Serialize)]
 pub struct ValidatorMetrics {
     pub counts_by_status: BTreeMap<String, u64>,
-    pub total_eth: f64,
+    /// `None` when the scrape exports no balances family at all - a
+    /// validator client that reports key counts but not balances is still
+    /// working, so this is absent rather than a confident `0.0`. See
+    /// `require_metric`'s doc comment for the bug class this avoids.
+    pub total_eth: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,7 +286,15 @@ impl MetricsClient {
             .into_iter()
             .map(|(status, value)| (status, value.round() as u64))
             .collect();
-        let total_eth = sum_all(&samples, VALIDATOR_BALANCES_METRIC) / GWEI_PER_ETH;
+        // Guarded like `require_metric`, but not through it: an absent
+        // balances family should not fail the whole call, since the key
+        // counts above are still a real, useful answer. `sum_all` alone
+        // can't tell "absent" from "present and zero" (both sum to 0.0),
+        // which is exactly the I3 bug class - a scrape exporting
+        // `validator_local_validator_counts` but not `..._balances` must not
+        // render as a measured `0.00 ETH`.
+        let total_eth = has_metric(&samples, VALIDATOR_BALANCES_METRIC)
+            .then(|| sum_all(&samples, VALIDATOR_BALANCES_METRIC) / GWEI_PER_ETH);
         Ok(ValidatorMetrics {
             counts_by_status,
             total_eth,
@@ -498,7 +510,29 @@ validator_local_validator_balances{pubkey="0x2"} 31500000000
         let metrics = client.validators().unwrap();
         assert_eq!(metrics.counts_by_status.get("active_ongoing"), Some(&2));
         assert_eq!(metrics.counts_by_status.get("pending_queued"), Some(&1));
-        assert_eq!(metrics.total_eth, 63.5);
+        assert_eq!(metrics.total_eth, Some(63.5));
+    }
+
+    /// I3: a scrape that exports the counts family but not the balances one
+    /// must report `total_eth: None`, not a confident `Some(0.0)` - the
+    /// counts are still a real answer, but absent-as-zero is the bug class
+    /// this repo has hit before (see `require_metric`'s doc comment).
+    #[test]
+    fn validators_reports_no_total_eth_when_the_balances_family_is_absent() {
+        let mut server = mockito::Server::new();
+        let body = r#"validator_local_validator_counts{status="active_ongoing"} 142"#;
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let client = MetricsClient::new(format!("{}/metrics", server.url()));
+        let metrics = client.validators().unwrap();
+        assert_eq!(metrics.counts_by_status.get("active_ongoing"), Some(&142));
+        assert_eq!(
+            metrics.total_eth, None,
+            "an absent balances family must not read as 0.0 ETH"
+        );
     }
 
     #[test]
@@ -618,7 +652,8 @@ validator_local_validator_balances{pubkey="0x2"} 32000000000
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let metrics = client.validators().unwrap();
         assert_eq!(
-            metrics.total_eth, 32.0,
+            metrics.total_eth,
+            Some(32.0),
             "the real balance must survive the NaN"
         );
     }

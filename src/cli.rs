@@ -1452,7 +1452,7 @@ mod tests {
         counts_by_status.insert("active_ongoing".to_string(), 100);
         let metrics = ValidatorMetrics {
             counts_by_status,
-            total_eth: 63.5,
+            total_eth: Some(63.5),
         };
         let json = serde_json::to_string(&metrics).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
