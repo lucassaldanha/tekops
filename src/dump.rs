@@ -5,7 +5,7 @@
 //! all the I/O.
 
 use crate::logs::{producer_argv, LogTarget, Mode};
-use crate::redact::{Redactor, Summary};
+use crate::redact::Redactor;
 use crate::stack::Stack;
 use crate::term::sanitize;
 use std::fmt;
@@ -33,7 +33,6 @@ pub enum DumpError {
     ProducerFailed { status: String, stderr: String },
     Gist(crate::gist::GistError),
     TooLarge { bytes: usize, limit: usize },
-    Cancelled,
     Io(String),
 }
 
@@ -53,7 +52,6 @@ impl fmt::Display for DumpError {
                 bytes / 1024,
                 limit / 1024
             ),
-            DumpError::Cancelled => write!(f, "cancelled"),
             DumpError::Io(m) => write!(f, "{m}"),
         }
     }
@@ -292,13 +290,12 @@ fn write_dump(path: &Path, content: &str) -> Result<(), DumpError> {
 /// This is the mitigation that matches the real risk. The redactor is a
 /// hand-rolled scanner; a missed pattern is possible, and the thing standing
 /// between a missed pattern and a leak is a human looking before the upload.
-fn confirm_upload(rendered: &str, summary: &Summary) -> Result<bool, DumpError> {
+fn confirm_upload(rendered: &str) -> Result<bool, DumpError> {
     let total = rendered.lines().count();
     eprintln!(
         "about to upload {total} lines ({} KB) to a secret gist",
         rendered.len() / 1024
     );
-    eprintln!("redacted {summary}");
     eprintln!();
     for l in rendered.lines().take(5) {
         eprintln!("  {l}");
@@ -390,8 +387,12 @@ pub fn run_dump(cfg: DumpConfig) -> Result<(), DumpError> {
 
     if let Some(token) = token {
         check_gist_size(rendered.len())?;
-        if !cfg.yes && !confirm_upload(&rendered, &summary)? {
-            return Err(DumpError::Cancelled);
+        // Declining is the mitigation doing its job, not a failure: the
+        // operator looked at the preview and said no. `log-level` answers its
+        // own prompt the same way - see `run_log_level`.
+        if !cfg.yes && !confirm_upload(&rendered)? {
+            eprintln!("aborted, nothing was uploaded");
+            return Ok(());
         }
         let url = crate::gist::upload(&token, &default_filename(cfg.now), &rendered)?;
         println!("{url}");
