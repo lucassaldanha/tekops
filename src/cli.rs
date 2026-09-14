@@ -3,7 +3,7 @@ use crate::beaconapi::{
 };
 use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
 use crate::http::ApiError;
-use crate::logs::{resolve_logs_target, run_logs};
+use crate::logs::{resolve_logs_target, run_logs, LogSource};
 use crate::metrics::MetricsClient;
 use crate::output::{
     format_about, format_attester_duties, format_duties_table, format_head_table,
@@ -11,14 +11,15 @@ use crate::output::{
     format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
+use crate::stack::{detect_stack, Stack};
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::env;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +56,9 @@ struct ApiArgs {
     /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
     #[arg(long, global = true)]
     api_url: Option<String>,
+    /// Deployment to take port defaults from (or $TEKOPS_STACK)
+    #[arg(long, global = true)]
+    stack: Option<Stack>,
     /// Print a JSON-serialized summary instead of a formatted table
     #[arg(long, global = true)]
     json: bool,
@@ -66,6 +70,9 @@ struct MetricArgs {
     /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
     #[arg(long, global = true)]
     metric_url: Option<String>,
+    /// Deployment to take port defaults from (or $TEKOPS_STACK)
+    #[arg(long, global = true)]
+    stack: Option<Stack>,
     /// Print a JSON-serialized summary instead of a formatted table
     #[arg(long, global = true)]
     json: bool,
@@ -73,14 +80,30 @@ struct MetricArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Tail and colorize a Teku or Besu JSON log file (defaults to teku)
+    /// Tail and colorize a Teku or Besu log file, or a container's logs
     Logs {
         /// teku, besu, or a path to a log file (defaults to teku)
+        //
+        // `conflicts_with` goes on BOTH positionals, not just `path`. A lone
+        // positional path lands in `source`, not `path` (see
+        // `resolve_logs_target`), so guarding only `path` would let
+        // `tekops logs /a.log --container c` parse with two answers to one
+        // question. Naming a container fully determines what gets read, which
+        // makes a source or a path alongside it meaningless rather than merely
+        // redundant.
+        #[arg(conflicts_with = "container")]
         source: Option<String>,
+        #[arg(conflicts_with = "container")]
         path: Option<PathBuf>,
         /// Lines of existing log to show before following new output
         #[arg(short = 'n', long = "lines", default_value_t = 500)]
         lines: u32,
+        /// Docker container to read logs from (or $TEKOPS_CONTAINER)
+        #[arg(long)]
+        container: Option<String>,
+        /// Deployment to narrow container detection to (or $TEKOPS_STACK)
+        #[arg(long)]
+        stack: Option<Stack>,
     },
     /// Query the node's Beacon API
     Beacon {
@@ -194,39 +217,67 @@ pub fn run() -> ExitCode {
             source,
             path,
             lines,
+            container,
+            stack,
         } => match resolve_logs_target(source, path) {
-            Ok((source, path)) => run_logs(source, path, lines, None, None),
+            Ok((source, path)) => {
+                // Detection only runs when nothing else has answered, so a
+                // configured operator never pays for a `docker ps` spawn. Note
+                // `path` here is the *resolved* path, which is what catches the
+                // lone-positional case where a path arrived in `source`.
+                let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
+                let needs_detection = container.is_none()
+                    && path.is_none()
+                    && env::var("TEKOPS_CONTAINER").is_err()
+                    && !(matches!(source, LogSource::Teku) && logs_file_env.is_some());
+                let detected = if needs_detection {
+                    let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
+                    docker_ps_names()
+                        .and_then(|ps| detect_stack(&ps, only).ok())
+                        .map(|(_, name)| name)
+                } else {
+                    None
+                };
+                run_logs(source, path, lines, container, detected)
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
             }
         },
         Commands::Beacon { command, api } => {
-            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             run_beacon(client, command, api.json)
         }
         Commands::Peers { api } => {
-            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for(beacon_peers(&client, api.json))
         }
         Commands::Health { api } => {
-            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for(beacon_health(&client, api.json))
         }
         Commands::Head { api } => {
-            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for(beacon_head(&client, api.json))
         }
         Commands::Duties { metrics } => {
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for(metrics_duties(&client, metrics.json))
         }
         Commands::Validators { metrics } => {
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for(metrics_validators(&client, metrics.json))
         }
         Commands::Version { metrics } => {
-            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url));
+            let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
+            let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
             exit_for(metrics_version(&client, metrics.json))
         }
         Commands::LogLevel {
@@ -234,7 +285,8 @@ pub fn run() -> ExitCode {
             log_filter,
             api,
         } => {
-            let client = BeaconClient::new(resolve_base_url(api.api_url));
+            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
             exit_for(beacon_log_level(&client, &level, log_filter, api.json))
         }
         Commands::Autocomplete { shell, print, yes } => {
@@ -250,16 +302,42 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn resolve_base_url(api_url: Option<String>) -> String {
-    api_url
-        .or_else(|| env::var("TEKOPS_API_URL").ok())
-        .unwrap_or_else(|| "http://localhost:5051".to_string())
+/// The stack profile in force, if any. The flag beats `$TEKOPS_STACK`.
+///
+/// An unparseable environment value is ignored rather than fatal. It is set
+/// once in a shell rc and would otherwise break every command in the session,
+/// including the ones that never needed it.
+fn resolve_stack(flag: Option<Stack>, env: Option<String>) -> Option<Stack> {
+    flag.or_else(|| env.and_then(|v| Stack::from_str(&v, true).ok()))
 }
 
-fn resolve_metric_url(metric_url: Option<String>) -> String {
+fn resolve_base_url(api_url: Option<String>, stack: Option<Stack>) -> String {
+    api_url
+        .or_else(|| env::var("TEKOPS_API_URL").ok())
+        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).api_url().to_string())
+}
+
+fn resolve_metric_url(metric_url: Option<String>, stack: Option<Stack>) -> String {
     metric_url
         .or_else(|| env::var("TEKOPS_METRIC_URL").ok())
-        .unwrap_or_else(|| "http://localhost:8010/metrics".to_string())
+        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).metric_url().to_string())
+}
+
+/// The names of running containers, or `None` if Docker cannot be asked.
+///
+/// Every failure mode collapses to `None` on purpose: Docker not installed, the
+/// daemon not running, and the user not being in the `docker` group are all
+/// just "no detection available" as far as callers are concerned, and none of
+/// them should produce an error on a bare-metal host that never wanted Docker.
+fn docker_ps_names() -> Option<String> {
+    let out = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Generic over the error type so `UpdateError` shares the exit path with
@@ -719,6 +797,7 @@ mod tests {
                 source,
                 path,
                 lines,
+                ..
             } => {
                 assert_eq!(source.as_deref(), Some("besu"));
                 assert_eq!(path, Some(PathBuf::from("/tmp/x.log")));
@@ -746,6 +825,7 @@ mod tests {
             Commands::Peers {
                 api: ApiArgs {
                     api_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -760,6 +840,7 @@ mod tests {
             Commands::Health {
                 api: ApiArgs {
                     api_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -774,6 +855,7 @@ mod tests {
             Commands::Head {
                 api: ApiArgs {
                     api_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -788,6 +870,7 @@ mod tests {
             Commands::Duties {
                 metrics: MetricArgs {
                     metric_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -802,6 +885,7 @@ mod tests {
             Commands::Validators {
                 metrics: MetricArgs {
                     metric_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -816,6 +900,7 @@ mod tests {
             Commands::Version {
                 metrics: MetricArgs {
                     metric_url: None,
+                    stack: None,
                     json: false
                 }
             }
@@ -1203,5 +1288,112 @@ mod tests {
     #[test]
     fn update_rejects_a_second_positional() {
         assert!(Cli::try_parse_from(["tekops", "update", "check", "0.3.0"]).is_err());
+    }
+
+    #[test]
+    fn url_precedence_is_flag_then_env_then_stack_then_bare_metal() {
+        // Flag beats a stack profile.
+        assert_eq!(
+            resolve_base_url(Some("http://x:1".into()), Some(Stack::RocketPool)),
+            "http://x:1"
+        );
+        // Stack profile beats the bare-metal default.
+        assert_eq!(
+            resolve_base_url(None, Some(Stack::RocketPool)),
+            "http://localhost:5052"
+        );
+        // Nothing at all keeps today's behaviour.
+        assert_eq!(resolve_base_url(None, None), "http://localhost:5051");
+    }
+
+    #[test]
+    fn metric_url_precedence_matches_the_api_url_ladder() {
+        assert_eq!(
+            resolve_metric_url(Some("http://x:2/m".into()), Some(Stack::EthDocker)),
+            "http://x:2/m"
+        );
+        assert_eq!(
+            resolve_metric_url(None, Some(Stack::EthDocker)),
+            "http://localhost:8009/metrics"
+        );
+        assert_eq!(
+            resolve_metric_url(None, None),
+            "http://localhost:8010/metrics"
+        );
+    }
+
+    /// Mixing is explicitly supported: a profile is one layer in the chain, not
+    /// a mode that locks the other values.
+    #[test]
+    fn a_stack_profile_and_an_explicit_url_can_be_combined() {
+        assert_eq!(
+            resolve_base_url(Some("http://custom:5099".into()), Some(Stack::RocketPool)),
+            "http://custom:5099"
+        );
+        assert_eq!(
+            resolve_metric_url(None, Some(Stack::RocketPool)),
+            "http://localhost:9101/metrics"
+        );
+    }
+
+    #[test]
+    fn stack_flag_beats_the_environment() {
+        assert_eq!(
+            resolve_stack(Some(Stack::EthDocker), Some("rocketpool".into())),
+            Some(Stack::EthDocker)
+        );
+        assert_eq!(
+            resolve_stack(None, Some("rocketpool".into())),
+            Some(Stack::RocketPool)
+        );
+        assert_eq!(resolve_stack(None, None), None);
+    }
+
+    /// An unparseable $TEKOPS_STACK is ignored rather than fatal: it must not
+    /// break commands that would have worked without it.
+    #[test]
+    fn an_unknown_stack_env_value_is_ignored() {
+        assert_eq!(resolve_stack(None, Some("nonsense".into())), None);
+    }
+
+    #[test]
+    fn container_flag_reaches_the_logs_command() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "--container", "mynode"]).unwrap();
+        match cli.command {
+            Commands::Logs { container, .. } => {
+                assert_eq!(container.as_deref(), Some("mynode"))
+            }
+            _ => panic!("expected Logs"),
+        }
+    }
+
+    /// A path and a container name are two answers to one question, so clap
+    /// rejects them together rather than leaving a precedence rule to invent.
+    /// Both positionals are guarded: a lone path arrives in `source`, not
+    /// `path`, so guarding only the latter would miss the common spelling.
+    #[test]
+    fn a_path_and_a_container_cannot_both_be_given() {
+        assert!(
+            Cli::try_parse_from(["tekops", "logs", "/a.log", "--container", "c"]).is_err(),
+            "a lone positional path lands in `source` and must still conflict"
+        );
+        assert!(
+            Cli::try_parse_from(["tekops", "logs", "teku", "/a.log", "--container", "c"]).is_err(),
+            "both positionals given must also conflict"
+        );
+    }
+
+    #[test]
+    fn stack_flag_reaches_each_api_and_metric_command() {
+        let cli = Cli::try_parse_from(["tekops", "health", "--stack", "rocketpool"]).unwrap();
+        match cli.command {
+            Commands::Health { api } => assert_eq!(api.stack, Some(Stack::RocketPool)),
+            _ => panic!("expected Health"),
+        }
+        let cli = Cli::try_parse_from(["tekops", "duties", "--stack", "eth-docker"]).unwrap();
+        match cli.command {
+            Commands::Duties { metrics } => assert_eq!(metrics.stack, Some(Stack::EthDocker)),
+            _ => panic!("expected Duties"),
+        }
     }
 }

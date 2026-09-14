@@ -25,7 +25,6 @@ pub enum Stack {
     RocketPool,
 }
 
-#[allow(dead_code)]
 impl Stack {
     /// The Beacon API base URL to use when nothing more specific was given.
     ///
@@ -72,7 +71,6 @@ impl Stack {
 
 /// Why `detect_stack` could not name exactly one container.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DetectError {
     NotFound,
     Ambiguous(Vec<String>),
@@ -112,11 +110,7 @@ impl fmt::Display for DetectError {
 /// Exactly one match is required. Zero is an error rather than a fallback, and
 /// two is an error rather than a guess, because tailing the wrong node's logs
 /// looks exactly like tailing the right one until it matters.
-#[allow(dead_code)]
-pub fn detect_stack(
-    ps_output: &str,
-    only: Option<Stack>,
-) -> Result<(Stack, String), DetectError> {
+pub fn detect_stack(ps_output: &str, only: Option<Stack>) -> Result<(Stack, String), DetectError> {
     let candidates = [Stack::EthDocker, Stack::RocketPool];
     let mut matches: Vec<(Stack, String)> = Vec::new();
 
@@ -246,7 +240,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("eth-docker-consensus-1"), "got: {msg}");
         assert!(msg.contains("rocketpool_eth2"), "got: {msg}");
-        assert!(msg.contains("--container"), "should name the escape hatch: {msg}");
+        assert!(
+            msg.contains("--container"),
+            "should name the escape hatch: {msg}"
+        );
     }
 
     #[test]
