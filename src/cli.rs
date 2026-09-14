@@ -263,30 +263,15 @@ pub fn run() -> ExitCode {
                     && env::var("TEKOPS_CONTAINER").is_err()
                     && !(matches!(source, LogSource::Teku) && logs_file_env.is_some())
                     && matches!(source, LogSource::Teku);
+                // Ambiguity here falls through to the rest of `resolve_log_target`'s
+                // ladder rather than hard-failing the session, which would apply
+                // `detect_or_note`'s own refusal one layer too aggressively on a
+                // mixed host that also has a real /var/log/teku/teku.log - if the
+                // fallback file is also missing, `detect_or_note`'s note plus that
+                // error together say exactly what happened.
                 let detected = if needs_detection {
                     let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
-                    docker_ps_names().and_then(|ps| match detect_stack(&ps, only) {
-                        Ok((_, name)) => Some(name),
-                        // A bare-metal host that never wanted Docker must not
-                        // be nagged about detection finding nothing.
-                        Err(DetectError::NotFound) => None,
-                        // Ambiguity is never a guess: `detect_stack` refuses to
-                        // pick between two candidates, and hard-failing the
-                        // session here would apply the same refusal one layer
-                        // too aggressively, breaking a mixed host that also has
-                        // a real /var/log/teku/teku.log. Falling through to the
-                        // rest of the ladder honours the same rule by picking
-                        // neither container, and if the fallback file is also
-                        // missing, this note plus that error together say
-                        // exactly what happened. Names come from `docker ps`,
-                        // which tekops did not author, so they're sanitized
-                        // before they reach the terminal - see term.rs's entry
-                        // in CLAUDE.md.
-                        Err(e @ DetectError::Ambiguous(_)) => {
-                            eprintln!("note: {}", sanitize(&e.to_string()));
-                            None
-                        }
-                    })
+                    docker_ps_names().and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
                 } else {
                     None
                 };
@@ -430,7 +415,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     // for the spawn.
     let given = resolve_stack(api.stack, stack_env.clone());
     let detected: Option<(Stack, String)> = if given.is_none() {
-        docker_ps_names().and_then(|ps| detect_stack(&ps, None).ok())
+        docker_ps_names().and_then(|ps| detect_or_note(&ps, None))
     } else {
         None
     };
@@ -444,7 +429,7 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
         Some((_, name)) => Some(name.clone()),
         None => stack
             .filter(|s| s.container_suffix().is_some())
-            .and_then(|s| docker_ps_names().and_then(|ps| detect_stack(&ps, Some(s)).ok()))
+            .and_then(|s| docker_ps_names().and_then(|ps| detect_or_note(&ps, Some(s))))
             .map(|(_, name)| name),
     };
 
@@ -524,6 +509,29 @@ fn docker_ps_names() -> Option<String> {
         return None;
     }
     String::from_utf8(out.stdout).ok()
+}
+
+/// `detect_stack`, with an ambiguous result reported rather than swallowed.
+///
+/// Shared by the `logs` arm and both of doctor's detection call sites, so an
+/// ambiguous host (two consensus containers, no `--stack` to narrow with)
+/// gets the same treatment everywhere a caller folds the result down to an
+/// `Option`: falling through the rest of that caller's own precedence ladder
+/// rather than silently picking bare-metal defaults that are confidently
+/// wrong. Names come from `docker ps`, which tekops did not author, so
+/// they're sanitized before they reach the terminal - see term.rs's entry in
+/// CLAUDE.md.
+fn detect_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
+    match detect_stack(ps, only) {
+        Ok(found) => Some(found),
+        // A bare-metal host that never wanted Docker must not be nagged
+        // about detection finding nothing.
+        Err(DetectError::NotFound) => None,
+        Err(e @ DetectError::Ambiguous(_)) => {
+            eprintln!("note: {}", sanitize(&e.to_string()));
+            None
+        }
+    }
 }
 
 /// Generic over the error type so `UpdateError` shares the exit path with
@@ -1687,6 +1695,31 @@ mod tests {
             hint_from_ps("eth-docker-consensus-1\nrocketpool_eth2\n"),
             None
         );
+    }
+
+    /// The C1 regression: an ambiguous host (two consensus containers, no
+    /// `--stack` to narrow with) must fall through to `None` - never a
+    /// silently wrong guess - so callers land on their own next rung
+    /// (`resolve_doctor_stack`'s bare-metal terminal, say) with a note on
+    /// stderr rather than a confidently incorrect report on stdout.
+    #[test]
+    fn detect_or_note_returns_none_on_ambiguity_rather_than_a_guess() {
+        let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
+        assert_eq!(detect_or_note(ps, None), None);
+    }
+
+    #[test]
+    fn detect_or_note_returns_the_match_when_unambiguous() {
+        let ps = "eth-docker-consensus-1\n";
+        assert_eq!(
+            detect_or_note(ps, None),
+            Some((Stack::EthDocker, "eth-docker-consensus-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn detect_or_note_returns_none_when_nothing_matches() {
+        assert_eq!(detect_or_note("postgres\nredis\n", None), None);
     }
 
     #[test]
