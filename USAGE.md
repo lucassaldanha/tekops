@@ -2,6 +2,9 @@
 
 Every command. See the [README](README.md) for installing and building.
 
+Anything you would otherwise export as a `TEKOPS_*` variable can live in a
+config file instead - see [Configuration file](#configuration-file).
+
     tekops logs [path]
     tekops dump-logs [path] [-n N] [-o FILE] [--gist] [--header] [--doctor]
     tekops peers
@@ -510,6 +513,63 @@ typed.
 
 Under Docker, Teku logs in its console layout rather than the JSON a bare-metal
 node is usually configured to write, and `tekops logs` colourizes both.
+
+## Configuration file
+
+Every setting with a `TEKOPS_*` environment variable can also be written to a
+config file, so it survives a new shell and can be copied to a second node.
+
+    ~/.config/tekops/config.toml
+
+or `$XDG_CONFIG_HOME/tekops/config.toml` when that variable is set. An absent
+file is not an error, and neither is an absent `$HOME`.
+
+`config.example.toml` ships in the release tarball and documents all six keys.
+Copy it and delete whatever you do not need:
+
+| Key          | Variable             | What it sets                         |
+|--------------|----------------------|--------------------------------------|
+| `stack`      | `$TEKOPS_STACK`      | Deployment profile and its ports     |
+| `api_url`    | `$TEKOPS_API_URL`    | Beacon API base URL                  |
+| `metric_url` | `$TEKOPS_METRIC_URL` | Prometheus scrape URL                |
+| `container`  | `$TEKOPS_CONTAINER`  | Container to read logs from          |
+| `logs_file`  | `$TEKOPS_LOGS_FILE`  | Log file to tail                     |
+| `data_dir`   | `$TEKOPS_DATA_DIR`   | Filesystem `doctor` checks for space |
+
+### Precedence
+
+    flag  >  environment variable  >  config file  >  detection  >  default
+
+A flag always wins, then the variable, then the file. Below the file sit
+`docker ps` detection and the built-in defaults, so anything you write down
+beats anything tekops guesses.
+
+`tekops logs` and `tekops dump-logs` apply that rule across two keys at once,
+giving a seven-step chain: `--container` or a positional path, then
+`$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then `container` from the file,
+then `logs_file` from the file, then a detected container, then the built-in
+Teku log path. Naming a container beats naming a file within each tier, for the
+same reason in both: it is the more specific statement.
+
+### A typo is fatal, on purpose
+
+An unknown key, or a bad value, fails the next command you run and names the
+file. This is deliberately stricter than `$TEKOPS_STACK`, which is ignored when
+it cannot be parsed: a variable is set once in a shell rc and must not break a
+whole session, but a config file is a deliberate artifact you can edit, and a
+silently dropped setting there surfaces much later as a confusing connection
+error against a port you thought you had changed.
+
+Because the file is read before any command runs, a broken one fails even
+`tekops about`. That is intended - the file being broken is a fact about the
+installation, not about one command.
+
+### Nothing else goes in the file
+
+Per-command defaults like `-n/--lines` and `--json` are not configurable, and
+neither is a GitHub token. `dump-logs --gist` reads `$GITHUB_TOKEN` or
+`$GH_TOKEN` as before; those are shared conventions with the `gh` CLI, and
+tekops does not store credentials.
 
 ## Common behaviour
 
