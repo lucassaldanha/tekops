@@ -9,11 +9,6 @@
 //! restarting" is a unit test over a struct literal, on every stack, with
 //! nothing installed.
 
-// `tekops doctor` itself, which calls `evaluate`, lands in a later task. Same
-// pattern as `host.rs` and `docker.rs` when they were first added ahead of
-// their own wiring.
-#![allow(dead_code)]
-
 use crate::beaconapi::{BeaconClient, FinalityCheckpoints, HealthState, PeerInfo, SyncingStatus};
 use crate::docker::ContainerState;
 use crate::host::{Disk, Load, Memory};

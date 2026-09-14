@@ -5,11 +5,6 @@
 //! (the dev machine), so the interesting half has to be reachable from a test
 //! that never touches a real file.
 
-// The `doctor` command that calls into this module lands in a later task;
-// until then nothing outside this file's own tests uses these items. Same
-// pattern as `stack.rs` when it was first added ahead of its own wiring.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 const KIB: u64 = 1024;

@@ -6,8 +6,8 @@ use crate::http::ApiError;
 use crate::logs::{resolve_logs_target, run_logs, LogSource};
 use crate::metrics::MetricsClient;
 use crate::output::{
-    format_about, format_attester_duties, format_duties_table, format_head_table,
-    format_health_table, format_peers_table, format_proposer_duties,
+    format_about, format_attester_duties, format_doctor_report, format_duties_table,
+    format_head_table, format_health_table, format_peers_table, format_proposer_duties,
     format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
@@ -179,6 +179,25 @@ enum Commands {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Run a series of checks across the node and report what needs attention
+    Doctor {
+        #[command(flatten)]
+        api: ApiArgs,
+        /// Prometheus metrics URL (or $TEKOPS_METRIC_URL)
+        //
+        // Declared here rather than by flattening `MetricArgs`: that struct
+        // also declares `stack` and `json`, and flattening both is a duplicate
+        // arg id, which clap turns into a panic at startup.
+        #[arg(long)]
+        metric_url: Option<String>,
+        /// Filesystem to check for free space (or $TEKOPS_DATA_DIR)
+        //
+        // Only consulted on bare-metal, where nothing else can answer. On a
+        // Docker stack the container's own mounts do, and a value here
+        // overrides them, matching the repo's flags-beat-detection rule.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -335,7 +354,101 @@ pub fn run() -> ExitCode {
         Commands::Update { target, json, yes } => {
             exit_for(run_update(resolve_update_target(target), json, yes))
         }
+        Commands::Doctor {
+            api,
+            metric_url,
+            data_dir,
+        } => run_doctor(api, metric_url, data_dir),
     }
+}
+
+/// Doctor's stack ladder, which differs from every other API command's.
+///
+/// The others read only the flag and the env var, then suggest `--stack` in a
+/// hint when the endpoint turns out to be unreachable. Doctor is already
+/// running `docker ps` for the container checks, so detection costs nothing
+/// and is applied to the URLs as well: `flags > env > detection > default`, the
+/// same ladder `logs` uses. Because detection has already been applied, doctor
+/// does not print the hint; there would be nothing left for it to suggest.
+fn resolve_doctor_stack(
+    flag: Option<Stack>,
+    env: Option<String>,
+    detected: Option<Stack>,
+) -> Option<Stack> {
+    resolve_stack(flag, env).or(detected)
+}
+
+fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
+    if findings
+        .iter()
+        .any(|f| f.status == crate::doctor::Status::Fail)
+    {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf>) -> ExitCode {
+    // `docker ps` runs only when nothing else has answered, matching the
+    // `needs_detection` gate in `logs`, so a bare-metal operator never pays
+    // for the spawn.
+    let given = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+    let detected: Option<(Stack, String)> = if given.is_none() {
+        docker_ps_names().and_then(|ps| detect_stack(&ps, None).ok())
+    } else {
+        None
+    };
+    // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
+    // consuming it would leave nothing for the container lookup below.
+    let stack = resolve_doctor_stack(
+        api.stack,
+        env::var("TEKOPS_STACK").ok(),
+        detected.as_ref().map(|(s, _)| *s),
+    );
+
+    // The container name: from detection when it ran, otherwise from a fresh
+    // `docker ps` narrowed to the named stack.
+    let container = match &detected {
+        Some((_, name)) => Some(name.clone()),
+        None => stack
+            .filter(|s| s.container_suffix().is_some())
+            .and_then(|s| docker_ps_names().and_then(|ps| detect_stack(&ps, Some(s)).ok()))
+            .map(|(_, name)| name),
+    };
+
+    let cfg = crate::doctor::ProbeConfig {
+        stack,
+        api_url: resolve_base_url(api.api_url, stack),
+        metric_url: resolve_metric_url(metric_url, stack),
+        container,
+        data_dir: data_dir.or_else(|| env::var("TEKOPS_DATA_DIR").ok().map(PathBuf::from)),
+    };
+
+    let facts = crate::doctor::probe(&cfg);
+    let findings = crate::doctor::evaluate(&facts);
+
+    if api.json {
+        let fails = findings
+            .iter()
+            .filter(|f| f.status == crate::doctor::Status::Fail)
+            .count();
+        let warns = findings
+            .iter()
+            .filter(|f| f.status == crate::doctor::Status::Warn)
+            .count();
+        let pass = findings.len() - fails - warns;
+        let doc = serde_json::json!({
+            "facts": facts,
+            "findings": findings,
+            "summary": { "pass": pass, "warn": warns, "fail": fails },
+        });
+        println!("{}", serde_json::to_string(&doc).unwrap_or_default());
+    } else {
+        print!("{}", format_doctor_report(&facts, &findings));
+    }
+
+    exit_for_findings(&findings)
 }
 
 /// The stack profile in force, if any. The flag beats `$TEKOPS_STACK`.
@@ -828,6 +941,7 @@ mod tests {
     use super::*;
     use crate::beaconapi::{AttesterDuty, ProposerDuty, ValidatorInfo};
     use crate::protocol::Protocol;
+    use clap::CommandFactory;
 
     #[test]
     fn validators_requires_at_least_one_id() {
@@ -1561,5 +1675,92 @@ mod tests {
         assert!(!should_hint(None, &status));
         assert!(!should_hint(None, &malformed));
         assert!(!should_hint(Some(Stack::RocketPool), &status));
+    }
+
+    #[test]
+    fn doctor_parses_with_no_arguments() {
+        let cli = Cli::try_parse_from(["tekops", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Commands::Doctor { .. }));
+    }
+
+    #[test]
+    fn doctor_accepts_every_url_flag_without_an_argument_id_collision() {
+        // clap panics at startup on a duplicate arg id, which is why
+        // MetricArgs is not flattened here alongside ApiArgs.
+        Cli::command().debug_assert();
+
+        let cli = Cli::try_parse_from([
+            "tekops",
+            "doctor",
+            "--api-url",
+            "http://a:5052",
+            "--metric-url",
+            "http://a:8009/metrics",
+            "--stack",
+            "rocketpool",
+            "--data-dir",
+            "/data",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Doctor {
+                api,
+                metric_url,
+                data_dir,
+            } => {
+                assert_eq!(api.api_url.as_deref(), Some("http://a:5052"));
+                assert_eq!(metric_url.as_deref(), Some("http://a:8009/metrics"));
+                assert_eq!(data_dir.as_deref(), Some(Path::new("/data")));
+                assert_eq!(api.stack, Some(Stack::RocketPool));
+                assert!(api.json);
+            }
+            _ => panic!("expected Doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_exit_code_is_failure_only_when_a_check_fails() {
+        use crate::doctor::{Finding, Status};
+        assert_eq!(
+            format!(
+                "{:?}",
+                exit_for_findings(&[Finding::new("a", Status::Pass, "")])
+            ),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                exit_for_findings(&[Finding::new("a", Status::Warn, "")])
+            ),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                exit_for_findings(&[Finding::new("a", Status::Fail, "")])
+            ),
+            format!("{:?}", ExitCode::FAILURE)
+        );
+    }
+
+    /// Doctor is the one API command that applies detection to the URL, not
+    /// just to a container name, because it runs `docker ps` anyway.
+    #[test]
+    fn doctor_stack_ladder_prefers_flag_then_env_then_detection() {
+        assert_eq!(
+            resolve_doctor_stack(Some(Stack::BareMetal), None, Some(Stack::EthDocker)),
+            Some(Stack::BareMetal)
+        );
+        assert_eq!(
+            resolve_doctor_stack(None, Some("rocketpool".to_string()), Some(Stack::EthDocker)),
+            Some(Stack::RocketPool)
+        );
+        assert_eq!(
+            resolve_doctor_stack(None, None, Some(Stack::EthDocker)),
+            Some(Stack::EthDocker)
+        );
+        assert_eq!(resolve_doctor_stack(None, None, None), None);
     }
 }

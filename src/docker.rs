@@ -5,11 +5,6 @@
 //! of what we ask Docker and what we make of the answer are both testable with
 //! no Docker installed.
 
-// The `doctor` command that calls into this module lands in a later task;
-// until then nothing outside this file's own tests uses these items. Same
-// pattern as `host.rs` when it was first added ahead of its own wiring.
-#![allow(dead_code)]
-
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 

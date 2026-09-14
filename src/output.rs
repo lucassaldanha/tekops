@@ -193,11 +193,6 @@ pub fn format_about() -> String {
     )
 }
 
-// `glyph`, `plural`, and `format_doctor_report` are only reached from this
-// module's own tests until `tekops doctor` wires them up in a later task -
-// same situation, and same fix, as `doctor.rs`'s module-level
-// `#![allow(dead_code)]`. Remove these once that wiring lands.
-#[allow(dead_code)]
 fn glyph(s: Status) -> char {
     match s {
         Status::Pass => '✔',
@@ -206,7 +201,6 @@ fn glyph(s: Status) -> char {
     }
 }
 
-#[allow(dead_code)]
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("{n} {word}")
@@ -220,7 +214,6 @@ fn plural(n: usize, word: &str) -> String {
 /// Deliberately not a `comfy-table`: pasting this into a chat when asking for
 /// help is a stated goal of the command, and box-drawing characters are noise
 /// there. No ANSI is emitted either, for the same reason.
-#[allow(dead_code)]
 pub fn format_doctor_report(f: &Facts, findings: &[Finding]) -> String {
     let mut s = String::new();
 
