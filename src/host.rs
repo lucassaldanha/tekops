@@ -90,6 +90,45 @@ pub fn df_argv(path: &Path) -> Vec<String> {
     ]
 }
 
+use std::process::Command;
+
+#[derive(Debug, Default)]
+pub struct HostFacts {
+    pub memory: Option<Memory>,
+    pub load: Option<Load>,
+    pub cpus: Option<usize>,
+    pub disk: Option<Disk>,
+}
+
+/// Gathers what this host will say about itself.
+///
+/// Every field is optional because every source is allowed to be missing:
+/// `/proc` does not exist on macOS, and `df` can fail on a path that is gone.
+/// Doctor reports an absent fact as a skipped check, never as an error.
+pub fn collect(data_dir: Option<&Path>) -> HostFacts {
+    HostFacts {
+        memory: std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(parse_meminfo),
+        load: std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .as_deref()
+            .and_then(parse_loadavg),
+        cpus: std::thread::available_parallelism().ok().map(|n| n.get()),
+        disk: data_dir.and_then(run_df),
+    }
+}
+
+fn run_df(path: &Path) -> Option<Disk> {
+    let argv = df_argv(path);
+    let out = Command::new(&argv[0]).args(&argv[1..]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_df(&String::from_utf8_lossy(&out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +207,31 @@ mod tests {
             df_argv(Path::new("/var/lib/teku")),
             vec!["df", "-Pk", "/var/lib/teku"]
         );
+    }
+
+    /// The collector must degrade rather than fail. On macOS there is no /proc at
+    /// all, and the dev machine is macOS while the node is Linux, so "absent"
+    /// has to be an ordinary outcome on both.
+    #[test]
+    fn collect_never_panics_and_reports_cpus_on_any_host() {
+        let got = collect(None);
+        assert!(got.cpus.unwrap_or(0) >= 1);
+        if cfg!(target_os = "linux") {
+            assert!(got.memory.is_some(), "/proc/meminfo should be readable");
+            assert!(got.load.is_some(), "/proc/loadavg should be readable");
+        }
+    }
+
+    #[test]
+    fn collect_reads_disk_for_a_path_that_exists() {
+        let got = collect(Some(Path::new("/")));
+        let disk = got.disk.expect("df should report on /");
+        assert!(disk.available_bytes > 0);
+    }
+
+    #[test]
+    fn collect_reports_no_disk_for_a_path_that_does_not_exist() {
+        let got = collect(Some(Path::new("/definitely/not/here/tekops")));
+        assert!(got.disk.is_none());
     }
 }
