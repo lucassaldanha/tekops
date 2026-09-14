@@ -246,7 +246,8 @@ pub fn run() -> ExitCode {
                 && logs_file_env.is_none();
             let detected = if needs_detection {
                 let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
-                docker_ps_names().and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
+                docker_ps_names(should_report_unaskable_docker(only))
+                    .and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
             } else {
                 None
             };
@@ -383,9 +384,15 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
     // `docker ps` runs only when nothing else has answered, matching the
     // `needs_detection` gate in `logs`, so a bare-metal operator never pays
     // for the spawn.
+    //
+    // This rung is speculative by construction - it is reached only when no
+    // stack has been named - so a `docker ps` that cannot answer is reported
+    // by neither `false` here nor the lookup below, whose gate has since
+    // resolved to bare-metal. That is issue #16: the two together are what
+    // keep a node with no containers from hearing about Docker.
     let given = resolve_stack(api.stack, stack_env.clone());
     let detected: Option<(Stack, String)> = if given.is_none() {
-        docker_ps_names().and_then(|ps| detect_or_note(&ps, None))
+        docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
     } else {
         None
     };
@@ -399,7 +406,10 @@ fn run_doctor(api: ApiArgs, metric_url: Option<String>, data_dir: Option<PathBuf
         Some((_, name)) => Some(name.clone()),
         None => stack
             .filter(|s| s.container_suffix().is_some())
-            .and_then(|s| docker_ps_names().and_then(|ps| detect_or_note(&ps, Some(s))))
+            .and_then(|s| {
+                docker_ps_names(should_report_unaskable_docker(Some(s)))
+                    .and_then(|ps| detect_or_note(&ps, Some(s)))
+            })
             .map(|(_, name)| name),
     };
 
@@ -460,25 +470,48 @@ fn resolve_metric_url(metric_url: Option<String>, stack: Option<Stack>) -> Strin
 
 /// The names of running containers, or `None` if Docker cannot be asked.
 ///
-/// Two different failures both end up `None`, but only one of them is silent.
+/// Two different failures both end up `None`, and neither is reported here.
 /// Docker being entirely absent (the `.output()` call itself errors - no
-/// `docker` on $PATH) says nothing: a bare-metal host that never wanted
+/// `docker` on $PATH) says nothing at all: a bare-metal host that never wanted
 /// Docker must not be nagged about it. Docker being present but refusing (not
-/// in the `docker` group, or the daemon down) is a different situation worth
-/// naming, so it prints a note instead of collapsing into the same silent
-/// case - this is safe to do unconditionally because detection only ever
-/// runs once nothing else (a path, `--container`, an env var) has already
-/// answered, so it can't nag an operator who supplied one of those.
-fn docker_ps_names() -> Option<String> {
+/// in the `docker` group, or the daemon down) is a different situation and can
+/// be worth naming - but only the caller knows whether this invocation needed
+/// an answer, which is what `report_if_unaskable` carries. Deciding that here
+/// is what made `tekops doctor` announce a Docker problem to an operator whose
+/// report is bare-metal (issue #16): the spawn happens *before* doctor's stack
+/// ladder resolves, so at this point there is nothing to gate on.
+fn docker_ps_names(report_if_unaskable: bool) -> Option<String> {
     let out = Command::new("docker")
         .args(["ps", "--format", "{{.Names}}"])
         .output()
         .ok()?;
     if !out.status.success() {
-        eprintln!("note: `docker ps` failed; container detection unavailable");
+        if report_if_unaskable {
+            eprintln!("note: `docker ps` failed; container detection unavailable");
+        }
         return None;
     }
     String::from_utf8(out.stdout).ok()
+}
+
+/// Whether a `docker ps` that could not answer is worth reporting, given the
+/// stack already in force for this invocation.
+///
+/// Split out for the same reason as `should_hint` just below: it is a couple
+/// of tokens of condition guarding a message, exactly the shape that drifts
+/// unnoticed, so the rule is machine-checked rather than inspection-checked.
+///
+/// The stack has to be both known *and* one that has containers. A stack still
+/// being undecided means this call is the speculative detection itself, whose
+/// failure just moves the ladder along to its next rung - reporting there is
+/// reporting a question, not an answer, and on a bare-metal host the answer
+/// turns out to be that Docker was never part of the picture. Bare-metal named
+/// outright is the same conclusion reached earlier. On eth-docker or
+/// rocketpool it is neither: doctor's container check is going to come up
+/// empty *because* of this failure, and without the note that reads as "no
+/// consensus container" rather than "Docker would not say".
+fn should_report_unaskable_docker(stack: Option<Stack>) -> bool {
+    stack.is_some_and(|s| s.container_suffix().is_some())
 }
 
 /// `detect_stack`, with an ambiguous result reported rather than swallowed.
@@ -536,8 +569,11 @@ fn hint_from_ps(ps: &str) -> Option<String> {
 /// failure path exclusively: putting a `docker ps` spawn on `tekops health`'s
 /// happy path would add a dependency and a process spawn to a command that has
 /// neither today.
+/// `false` because `should_hint` has already established that no stack was
+/// named: there is no Docker problem to report to an operator this code has
+/// yet to establish uses Docker at all, only a suggestion it now cannot make.
 fn docker_stack_hint() -> Option<String> {
-    hint_from_ps(&docker_ps_names()?)
+    hint_from_ps(&docker_ps_names(false)?)
 }
 
 /// Whether an unreachable-endpoint failure should carry a stack hint.
@@ -1664,6 +1700,30 @@ mod tests {
     #[test]
     fn detect_or_note_returns_none_when_nothing_matches() {
         assert_eq!(detect_or_note("postgres\nredis\n", None), None);
+    }
+
+    /// Issue #16. A Docker daemon that will not answer is only news to a node
+    /// that has containers; on the two stacks that have none it is a report
+    /// about software the node's operator never chose to involve.
+    #[test]
+    fn an_unaskable_docker_is_reported_only_on_a_stack_that_has_containers() {
+        assert!(should_report_unaskable_docker(Some(Stack::EthDocker)));
+        assert!(should_report_unaskable_docker(Some(Stack::RocketPool)));
+
+        assert!(!should_report_unaskable_docker(Some(Stack::BareMetal)));
+        // Undecided: this is the speculative detection rung itself, whose
+        // failure only moves the ladder along.
+        assert!(!should_report_unaskable_docker(None));
+    }
+
+    /// The rung `docker_ps_names(false)` in `run_doctor` is paired with: when
+    /// detection is what failed, the ladder terminates in bare-metal, so the
+    /// report that prints is one the note would have contradicted.
+    #[test]
+    fn failed_detection_leaves_doctor_on_a_stack_that_reports_no_docker() {
+        let stack = resolve_doctor_stack(None, None, None);
+        assert_eq!(stack, Some(Stack::BareMetal));
+        assert!(!should_report_unaskable_docker(stack));
     }
 
     #[test]
