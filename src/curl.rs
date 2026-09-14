@@ -14,6 +14,7 @@
 use crate::term::sanitize;
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::process::Command;
 
 const CURL: &str = "curl";
@@ -26,6 +27,18 @@ pub enum CurlError {
         status: String,
         stderr: String,
         hint: Option<&'static str>,
+    },
+    /// A POST that curl itself could not complete.
+    ///
+    /// Distinct from `Failed` only because that variant's wording is a
+    /// download's ("could not download ..."), which would be wrong here. An
+    /// HTTP *rejection* is not this: `post_file` omits `-f`, so a 4xx comes
+    /// back as a successful curl run and the caller decides what the status
+    /// means. This variant is a connection that never got that far.
+    PostFailed {
+        url: String,
+        status: String,
+        stderr: String,
     },
     Io(String),
 }
@@ -51,6 +64,11 @@ impl fmt::Display for CurlError {
                     None => Ok(()),
                 }
             }
+            CurlError::PostFailed {
+                url,
+                status,
+                stderr,
+            } => write!(f, "request to {url} failed ({status}): {stderr}"),
             CurlError::Io(msg) => write!(f, "{msg}"),
         }
     }
@@ -136,6 +154,98 @@ fn fetch_with(program: &str, url: &str, max_bytes: Option<u64>) -> Result<Vec<u8
             status: output.status.to_string(),
             stderr: sanitize(String::from_utf8_lossy(&output.stderr).trim()),
             hint: None,
+        });
+    }
+    Ok(output.stdout)
+}
+
+/// The argv for a POST whose body comes from a file and whose credentials come
+/// from a curl config file.
+///
+/// Returned as data rather than a spawned `Command`, the same shape as
+/// `logs::producer_argv` and `docker::inspect_argv`, so every property below is
+/// testable with no network.
+///
+/// Four choices here are load-bearing:
+///
+/// **`--config <path>` is how the caller passes a credential**, and the only
+/// reason a token never reaches argv. `/proc/<pid>/cmdline` is world-readable
+/// on Linux, so `-H "Authorization: Bearer ..."` would publish it to every user
+/// on the box for the life of the request - and this binary runs on a machine
+/// running a validator. A POST path that takes a secret any other way should
+/// not exist.
+///
+/// **`--data-binary @<path>`, never `-d @<path>`.** `-d` strips CR and LF out
+/// of `@file` content. That is documented behaviour of the form, and for
+/// well-formed JSON it is usually survivable because those bytes are
+/// inter-token whitespace - but a body built from arbitrary text is exactly
+/// where "usually" stops being good enough. Same class as the naive
+/// `find('}')` truncation `metrics.rs` documents: right on the happy path,
+/// silently lossy otherwise. Reading the body from a file rather than argv is
+/// also what keeps a payload larger than `ARG_MAX` possible at all.
+///
+/// **`-sS` without `-f`, plus `-w '\n%{http_code}'`.** `-f` makes curl discard
+/// the response body on an HTTP error, and for an API the body is where the
+/// actionable message lives. Dropping it means curl exits 0 on a 4xx and the
+/// *caller* owns deciding what a non-2xx means, which is the right place for
+/// that decision. The status therefore has to travel in-band, as a final line
+/// the caller splits back off. `--fail-with-body` would give both at once but
+/// needs curl >= 7.76, and Debian 11 ships 7.74.
+///
+/// **`--proto '=https'` and `stall_argv` apply unchanged**, exactly as they do
+/// to the GET. The protocol pin stops a redirect downgrading to http; the stall
+/// bound stops a black-hole host hanging the process forever with no output,
+/// since `-s` suppresses even the progress meter.
+///
+/// `headers` is caller-supplied because which `Accept` or `Content-Type` a
+/// request needs is the caller's semantics, not transport policy.
+pub fn post_argv(url: &str, config: &Path, body: &Path, headers: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "-sS".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        "--proto".to_string(),
+        "=https".to_string(),
+    ];
+    argv.extend(stall_argv(STALL_TIMEOUT_SECS));
+    for h in headers {
+        argv.push("-H".to_string());
+        argv.push((*h).to_string());
+    }
+    argv.push("--config".to_string());
+    argv.push(config.display().to_string());
+    argv.push("--data-binary".to_string());
+    argv.push(format!("@{}", body.display()));
+    argv.push("-w".to_string());
+    argv.push("\n%{http_code}".to_string());
+    argv.push(url.to_string());
+    argv
+}
+
+/// Runs `post_argv`. The one spawn site for a POST, mirroring `fetch_with`.
+///
+/// Returns curl's stdout, which is the response body followed by a final line
+/// carrying the HTTP status. Interpreting that status is the caller's job - see
+/// `post_argv` for why.
+pub fn post_file(
+    url: &str,
+    config: &Path,
+    body: &Path,
+    headers: &[&str],
+) -> Result<Vec<u8>, CurlError> {
+    let output = Command::new(CURL)
+        .args(post_argv(url, config, body, headers))
+        .output()
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => CurlError::Missing,
+            _ => CurlError::Io(e.to_string()),
+        })?;
+
+    if !output.status.success() {
+        return Err(CurlError::PostFailed {
+            url: url.to_string(),
+            status: output.status.to_string(),
+            stderr: sanitize(String::from_utf8_lossy(&output.stderr).trim()),
         });
     }
     Ok(output.stdout)
@@ -288,6 +398,109 @@ mod tests {
             .unwrap_or_else(|| panic!("--max-filesize missing from {argv:?}"));
         assert_eq!(argv[at + 1], "4096");
         assert_eq!(argv.last().unwrap(), "https://example.invalid/x");
+    }
+
+    /// The single most important property of the POST path.
+    /// `/proc/<pid>/cmdline` is world-readable on Linux, so a credential in
+    /// argv is a credential published to every user on the node - and the
+    /// node's other tenant is a validator. This is why `--config` exists.
+    #[test]
+    fn a_post_never_carries_the_credential_in_argv() {
+        let argv = post_argv(
+            "https://api.github.com/gists",
+            Path::new("/tmp/cfg"),
+            Path::new("/tmp/body"),
+            &["Accept: application/vnd.github+json"],
+        );
+        let joined = argv.join(" ").to_lowercase();
+        assert!(!joined.contains("authorization"));
+        assert!(!joined.contains("bearer"));
+        assert!(!joined.contains("ghp_"));
+        assert!(argv.contains(&"--config".to_string()));
+        assert!(argv.contains(&"/tmp/cfg".to_string()));
+    }
+
+    /// The sibling of `a_capped_fetch_keeps_the_stall_bound_and_the_protocol_pin`:
+    /// both invariants have to survive being carried onto a new verb, and
+    /// neither should rest on review attention.
+    #[test]
+    fn a_post_keeps_the_stall_bound_and_the_protocol_pin() {
+        let argv = post_argv(
+            "https://example.invalid/x",
+            Path::new("/tmp/cfg"),
+            Path::new("/tmp/body"),
+            &[],
+        );
+        for flag in [
+            "--proto",
+            "--connect-timeout",
+            "--speed-limit",
+            "--speed-time",
+        ] {
+            assert!(
+                argv.contains(&flag.to_string()),
+                "{flag} missing from {argv:?}"
+            );
+        }
+        let at = |flag: &str| {
+            argv.iter()
+                .position(|a| a == flag)
+                .map(|i| argv[i + 1].clone())
+                .unwrap_or_else(|| panic!("no {flag}"))
+        };
+        assert_eq!(at("--proto"), "=https");
+        assert_eq!(at("--connect-timeout"), CONNECT_TIMEOUT_SECS.to_string());
+        assert_eq!(at("--speed-limit"), "1");
+        assert_eq!(at("--speed-time"), STALL_TIMEOUT_SECS.to_string());
+    }
+
+    /// `-d @file` strips CR and LF out of the file's content - documented
+    /// behaviour of that form. Usually survivable for JSON, since those are
+    /// inter-token whitespace, but not for a body built from arbitrary text.
+    #[test]
+    fn a_post_sends_the_body_binary_so_newlines_are_not_stripped() {
+        let argv = post_argv(
+            "https://example.invalid/x",
+            Path::new("/tmp/cfg"),
+            Path::new("/tmp/body"),
+            &[],
+        );
+        assert!(argv.contains(&"--data-binary".to_string()));
+        assert!(argv.contains(&"@/tmp/body".to_string()));
+        assert!(!argv.iter().any(|a| a == "-d"));
+    }
+
+    /// `-f` would discard the response body, which for an API is where the
+    /// actionable message lives. Dropping it makes a non-2xx the caller's
+    /// decision, so the status has to travel in-band instead.
+    #[test]
+    fn a_post_omits_fail_and_asks_for_the_status_in_band() {
+        let argv = post_argv(
+            "https://example.invalid/x",
+            Path::new("/tmp/cfg"),
+            Path::new("/tmp/body"),
+            &[],
+        );
+        assert!(!argv.iter().any(|a| a == "-f" || a.contains("-fsS")));
+        assert!(argv.contains(&"-sS".to_string()));
+        assert!(argv.iter().any(|a| a.contains("%{http_code}")));
+    }
+
+    #[test]
+    fn post_headers_are_passed_through_in_order() {
+        let argv = post_argv(
+            "https://example.invalid/x",
+            Path::new("/tmp/cfg"),
+            Path::new("/tmp/body"),
+            &["Accept: a", "Content-Type: b"],
+        );
+        let hs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && argv[i - 1] == "-H")
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(hs, vec!["Accept: a", "Content-Type: b"]);
     }
 
     /// The cap is added to the same argv every fetch gets, not to a fresh one.

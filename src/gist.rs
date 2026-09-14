@@ -1,35 +1,29 @@
 //! GitHub gist semantics for `tekops dump-logs --gist`.
 //!
-//! Request shape, auth material and response parsing. The transport belongs to
-//! the shared curl boundary, because tekops builds ureq with no TLS backend on
-//! purpose and every HTTPS call shells out to curl - see the `upload_argv`
-//! note for why a copy of that policy currently sits here and when it leaves.
+//! Request shape, auth material and response parsing. **No transport policy
+//! lives here**: tekops builds ureq with no TLS backend on purpose, so every
+//! HTTPS call goes through `curl.rs`, and this module hands it a URL, a config
+//! file, a body file and the headers it wants. `curl::post_argv` owns the
+//! protocol pin, the stall bound, `--data-binary` and the absent `-f`.
 
+use crate::curl;
 use crate::term::sanitize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
-use std::process::Command;
 
 pub const GIST_API_URL: &str = "https://api.github.com/gists";
 
 const DESCRIPTION: &str = "tekops dump-logs";
 
-const CURL: &str = "curl";
-
-/// Seconds to wait for the connection, and seconds of zero progress before
-/// giving up.
-///
-/// TRANSPORT SHIM, TEMPORARY. These constants and `upload_argv` are a local
-/// copy of update.rs's policy, written here only because `src/curl.rs` does
-/// not exist in this branch yet - issue #11 lands it first. Once it does,
-/// `upload_argv` moves into it as `post_argv` and everything in this block is
-/// deleted. tekops must have exactly one transport boundary; this is not the
-/// final state.
-const CONNECT_TIMEOUT_SECS: u64 = 10;
-const STALL_TIMEOUT_SECS: u64 = 30;
+/// What GitHub's API wants on the request. Semantics, so they live here rather
+/// than in the transport.
+const GIST_HEADERS: [&str; 2] = [
+    "Accept: application/vnd.github+json",
+    "Content-Type: application/json",
+];
 
 #[derive(Debug)]
 pub enum GistError {
@@ -130,49 +124,6 @@ pub fn validate_token(token: &str) -> Result<(), GistError> {
     Ok(())
 }
 
-/// The argv for the upload, with the token deliberately absent.
-///
-/// `-sS` rather than `-f`, and that is a decision rather than an omission.
-/// `-f` makes curl discard the response body on an HTTP error, and GitHub's
-/// body is exactly where "Bad credentials" and the missing-scope message live.
-/// Dropping it means curl exits 0 on a 4xx and **this caller owns deciding
-/// what a non-2xx means** - `parse_gist_response` does, treating anything but
-/// 201 as a rejection carrying GitHub's own text. `-w` appends the status code
-/// on its own final line for it to split back off. `--fail-with-body` would
-/// give both at once but needs curl >= 7.76, and Debian 11 ships 7.74.
-///
-/// `--data-binary`, never `-d`: `-d @file` strips CR and LF out of the file's
-/// content. That is documented behaviour of the form, and while it is usually
-/// survivable for JSON, since those bytes are inter-token whitespace, this
-/// body is built from arbitrary log text and "usually" is not a property to
-/// rest a log dump on.
-pub fn upload_argv(config: &Path, body: &Path) -> Vec<String> {
-    vec![
-        "-sS".to_string(),
-        "-X".to_string(),
-        "POST".to_string(),
-        "--proto".to_string(),
-        "=https".to_string(),
-        "--connect-timeout".to_string(),
-        CONNECT_TIMEOUT_SECS.to_string(),
-        "--speed-limit".to_string(),
-        "1".to_string(),
-        "--speed-time".to_string(),
-        STALL_TIMEOUT_SECS.to_string(),
-        "-H".to_string(),
-        "Accept: application/vnd.github+json".to_string(),
-        "-H".to_string(),
-        "Content-Type: application/json".to_string(),
-        "--config".to_string(),
-        config.display().to_string(),
-        "--data-binary".to_string(),
-        format!("@{}", body.display()),
-        "-w".to_string(),
-        "\n%{http_code}".to_string(),
-        GIST_API_URL.to_string(),
-    ]
-}
-
 /// Parses curl's combined output: the response body, then a final line holding
 /// the HTTP status.
 pub fn parse_gist_response(raw: &str) -> Result<String, GistError> {
@@ -217,24 +168,9 @@ pub fn upload(token: &str, filename: &str, content: &str) -> Result<String, Gist
     write_private(&config_path, &config_file_contents(token))?;
     write_private(&body_path, &body)?;
 
-    let out = Command::new(CURL)
-        .args(upload_argv(&config_path, &body_path))
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                GistError::Transport("`curl` was not found on this host".to_string())
-            }
-            _ => GistError::Transport(e.to_string()),
-        })?;
-
-    if !out.status.success() {
-        return Err(GistError::Transport(format!(
-            "curl exited {}: {}",
-            out.status,
-            sanitize(String::from_utf8_lossy(&out.stderr).trim())
-        )));
-    }
-    parse_gist_response(&String::from_utf8_lossy(&out.stdout))
+    let out = curl::post_file(GIST_API_URL, &config_path, &body_path, &GIST_HEADERS)
+        .map_err(|e| GistError::Transport(e.to_string()))?;
+    parse_gist_response(&String::from_utf8_lossy(&out))
 }
 
 fn write_private(path: &Path, content: &str) -> Result<(), GistError> {
@@ -327,66 +263,5 @@ mod tests {
         let raw = "{\"message\":\"a\u{1b}[31mred\"}\n422";
         let err = parse_gist_response(raw).unwrap_err().to_string();
         assert!(!err.contains('\u{1b}'));
-    }
-
-    /// The single most important property in this module. `/proc/<pid>/cmdline`
-    /// is world-readable on Linux, so a token in argv is a token published to
-    /// every user on the node.
-    #[test]
-    fn the_token_never_appears_in_argv() {
-        let argv = upload_argv(Path::new("/tmp/cfg"), Path::new("/tmp/body"));
-        let joined = argv.join(" ").to_lowercase();
-        assert!(!joined.contains("ghp_"));
-        assert!(!joined.contains("authorization"));
-        assert!(!joined.contains("bearer"));
-    }
-
-    #[test]
-    fn upload_argv_posts_the_body_from_a_file_and_asks_for_the_status() {
-        let argv = upload_argv(Path::new("/tmp/cfg"), Path::new("/tmp/body"));
-        let at = |flag: &str| {
-            argv.iter()
-                .position(|a| a == flag)
-                .map(|i| argv[i + 1].clone())
-                .unwrap_or_else(|| panic!("no {flag}"))
-        };
-        assert_eq!(at("--config"), "/tmp/cfg");
-        assert_eq!(at("-X"), "POST");
-        assert!(argv.contains(&GIST_API_URL.to_string()));
-        // No -f: it would discard the error body we parse.
-        assert!(!argv.iter().any(|a| a == "-f" || a == "-fsS"));
-        // The status has to come back in-band.
-        assert!(argv.iter().any(|a| a.contains("%{http_code}")));
-    }
-
-    /// `-d @file` strips CR and LF out of the file's content - documented
-    /// behaviour of that form. For well-formed JSON it is usually survivable,
-    /// since those are inter-token whitespace, but this payload is built from
-    /// arbitrary log text. `--data-binary` sends the bytes untouched.
-    #[test]
-    fn the_body_is_sent_binary_so_newlines_are_not_stripped() {
-        let argv = upload_argv(Path::new("/tmp/cfg"), Path::new("/tmp/body"));
-        assert!(argv.contains(&"--data-binary".to_string()));
-        assert!(argv.contains(&"@/tmp/body".to_string()));
-        assert!(!argv.iter().any(|a| a == "-d"));
-    }
-
-    /// The two invariants that must survive being copied onto a new verb. The
-    /// protocol pin is what stops a redirect downgrading to http; the stall
-    /// bound is what stops a black-hole host hanging the process forever,
-    /// since -s suppresses even the progress meter.
-    #[test]
-    fn the_post_keeps_the_protocol_pin_and_the_stall_bound() {
-        let argv = upload_argv(Path::new("/tmp/cfg"), Path::new("/tmp/body"));
-        let at = |flag: &str| {
-            argv.iter()
-                .position(|a| a == flag)
-                .map(|i| argv[i + 1].clone())
-                .unwrap_or_else(|| panic!("no {flag}"))
-        };
-        assert_eq!(at("--proto"), "=https");
-        assert_eq!(at("--connect-timeout"), CONNECT_TIMEOUT_SECS.to_string());
-        assert_eq!(at("--speed-limit"), "1");
-        assert_eq!(at("--speed-time"), STALL_TIMEOUT_SECS.to_string());
     }
 }

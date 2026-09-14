@@ -315,7 +315,8 @@ pub fn run() -> ExitCode {
                 && logs_file_env.is_none();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
             let detected: Option<(Stack, String)> = if needs_detection {
-                docker_ps_names().and_then(|ps| detect_or_note(&ps, given_stack))
+                docker_ps_names(should_report_unaskable_docker(given_stack))
+                    .and_then(|ps| detect_or_note(&ps, given_stack))
             } else {
                 None
             };
