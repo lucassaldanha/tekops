@@ -510,21 +510,21 @@ fn resolve_doctor_stack(
 const DEFAULT_BARE_METAL_DATA_DIR: &str = "/var/lib/teku";
 
 /// The disk-free check's data-dir ladder: `--data-dir` > `$TEKOPS_DATA_DIR` >
-/// a bare-metal default, matching the ladder in spec.md's cross-stack table.
+/// the config file's `data_dir` > a bare-metal default.
 ///
 /// The default is gated to bare-metal specifically. `doctor::probe` layers a
-/// container-mount fallback beneath whatever this returns
-/// (`cfg.data_dir.clone().or_else(|| ... data_mount ...)`), so handing down a
+/// container-mount fallback beneath whatever this returns, so handing down a
 /// value unconditionally on a Docker stack would win over that mount and make
 /// eth-docker/rocketpool measure the wrong filesystem. On those stacks this
-/// stays `None` unless the operator passed the flag or env var explicitly, so
-/// the container's own mount is what answers.
+/// stays `None` unless the operator stated a path - by flag, variable, or
+/// config file, all three of which count as stating one.
 fn resolve_doctor_data_dir(
     flag: Option<PathBuf>,
     env: Option<String>,
+    cfg: Option<PathBuf>,
     stack: Option<Stack>,
 ) -> Option<PathBuf> {
-    flag.or_else(|| env.map(PathBuf::from)).or_else(|| {
+    flag.or_else(|| env.map(PathBuf::from)).or(cfg).or_else(|| {
         matches!(stack, Some(Stack::BareMetal)).then(|| PathBuf::from(DEFAULT_BARE_METAL_DATA_DIR))
     })
 }
@@ -610,7 +610,12 @@ fn doctor_probe_config(
             stack,
         ),
         container,
-        data_dir: resolve_doctor_data_dir(data_dir, env::var("TEKOPS_DATA_DIR").ok(), stack),
+        data_dir: resolve_doctor_data_dir(
+            data_dir,
+            env::var("TEKOPS_DATA_DIR").ok(),
+            cfg.data_dir.clone(),
+            stack,
+        ),
     }
 }
 
@@ -2456,7 +2461,7 @@ mod tests {
     #[test]
     fn doctor_data_dir_defaults_to_the_bare_metal_path_when_nothing_else_answers() {
         assert_eq!(
-            resolve_doctor_data_dir(None, None, Some(Stack::BareMetal)),
+            resolve_doctor_data_dir(None, None, None, Some(Stack::BareMetal)),
             Some(PathBuf::from(DEFAULT_BARE_METAL_DATA_DIR))
         );
     }
@@ -2464,7 +2469,12 @@ mod tests {
     #[test]
     fn doctor_data_dir_flag_beats_the_bare_metal_default() {
         assert_eq!(
-            resolve_doctor_data_dir(Some(PathBuf::from("/custom")), None, Some(Stack::BareMetal)),
+            resolve_doctor_data_dir(
+                Some(PathBuf::from("/custom")),
+                None,
+                None,
+                Some(Stack::BareMetal)
+            ),
             Some(PathBuf::from("/custom"))
         );
     }
@@ -2476,12 +2486,108 @@ mod tests {
     #[test]
     fn doctor_data_dir_stays_none_on_a_docker_stack_so_the_container_mount_can_answer() {
         assert_eq!(
-            resolve_doctor_data_dir(None, None, Some(Stack::EthDocker)),
+            resolve_doctor_data_dir(None, None, None, Some(Stack::EthDocker)),
             None
         );
         assert_eq!(
-            resolve_doctor_data_dir(None, None, Some(Stack::RocketPool)),
+            resolve_doctor_data_dir(None, None, None, Some(Stack::RocketPool)),
             None
         );
+    }
+
+    #[test]
+    fn the_data_dir_flag_beats_the_env_and_the_config() {
+        let got = resolve_doctor_data_dir(
+            Some(PathBuf::from("/flag")),
+            Some("/env".into()),
+            Some(PathBuf::from("/cfg")),
+            Some(Stack::BareMetal),
+        );
+        assert_eq!(got, Some(PathBuf::from("/flag")));
+    }
+
+    #[test]
+    fn the_data_dir_env_beats_the_config() {
+        let got = resolve_doctor_data_dir(
+            None,
+            Some("/env".into()),
+            Some(PathBuf::from("/cfg")),
+            Some(Stack::BareMetal),
+        );
+        assert_eq!(got, Some(PathBuf::from("/env")));
+    }
+
+    #[test]
+    fn the_config_data_dir_beats_the_bare_metal_default() {
+        let got = resolve_doctor_data_dir(
+            None,
+            None,
+            Some(PathBuf::from("/cfg")),
+            Some(Stack::BareMetal),
+        );
+        assert_eq!(got, Some(PathBuf::from("/cfg")));
+    }
+
+    /// On a Docker stack this stays None unless stated, so the container's own
+    /// mount answers. A config value counts as stated.
+    #[test]
+    fn the_config_data_dir_applies_on_a_docker_stack_too() {
+        let got = resolve_doctor_data_dir(
+            None,
+            None,
+            Some(PathBuf::from("/cfg")),
+            Some(Stack::EthDocker),
+        );
+        assert_eq!(got, Some(PathBuf::from("/cfg")));
+    }
+
+    #[test]
+    fn an_unstated_data_dir_still_stays_none_on_a_docker_stack() {
+        assert_eq!(
+            resolve_doctor_data_dir(None, None, None, Some(Stack::EthDocker)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unstated_data_dir_still_defaults_on_bare_metal() {
+        assert_eq!(
+            resolve_doctor_data_dir(None, None, None, Some(Stack::BareMetal)),
+            Some(PathBuf::from(DEFAULT_BARE_METAL_DATA_DIR))
+        );
+    }
+
+    /// Carried over from Task 1's review: `resolve_doctor_stack` must prefer a
+    /// configured stack over one `docker ps` detected, consistent with
+    /// `flag > env > config > detection`. `resolve_stack` (which this
+    /// delegates to) already folds the config rung in ahead of the `.or(detected)`
+    /// fallback, so a config value wins even when detection found something else.
+    #[test]
+    fn resolve_doctor_stack_prefers_the_config_over_detection() {
+        assert_eq!(
+            resolve_doctor_stack(None, None, Some(Stack::EthDocker), Some(Stack::RocketPool)),
+            Some(Stack::RocketPool)
+        );
+    }
+
+    /// Carried over from Task 1's review: a configured stack must suppress the
+    /// `docker ps` detection spawn in `doctor_probe_config`, the same way a
+    /// flag or env var already does. The spawn itself isn't observable without
+    /// mocking `Command` (out of scope here - `doctor_probe_config` calls
+    /// `docker_ps_names` directly), so this instead pins the condition that
+    /// gates it: `given.is_none()`, where `given` already folds in `cfg.stack`.
+    /// With `cfg.stack` set and no flag/env, `given` is `Some`, so the
+    /// production code's `if given.is_none()` branch - and the `docker ps`
+    /// spawn inside it - is never reached, regardless of what real `docker ps`
+    /// output would have said. This is deterministic on any host, Docker
+    /// installed or not, precisely because detection never runs.
+    #[test]
+    fn doctor_probe_config_config_stack_suppresses_docker_detection() {
+        let cfg = crate::config::Config {
+            stack: Some(Stack::RocketPool),
+            ..Default::default()
+        };
+        let probe_cfg = doctor_probe_config(None, None, None, None, &cfg);
+        assert_eq!(probe_cfg.stack, Some(Stack::RocketPool));
     }
 }
