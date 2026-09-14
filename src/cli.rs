@@ -1471,8 +1471,11 @@ mod tests {
     }
 
     /// `check` and `latest` are positional values, not subcommands. Declaring
-    /// them as subcommands alongside an optional positional version is the
-    /// same ambiguity that broke `tekops logs /var/log/x.log`.
+    /// them as subcommands alongside an optional positional version would
+    /// reproduce the same "one slot, two meanings" problem `tekops logs` used
+    /// to have historically: its first positional was typed as an enum of
+    /// source names, so clap rejected any value outside that set before the
+    /// command ever ran. `logs` no longer has a source argument at all.
     #[test]
     fn update_accepts_check_latest_and_a_version() {
         for arg in ["check", "latest", "0.3.0", "v0.3.0"] {

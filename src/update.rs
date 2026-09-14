@@ -59,11 +59,12 @@ pub enum UpdateTarget {
 ///
 /// `check` and `latest` are matched by hand rather than declared as clap
 /// subcommands. Declaring them as subcommands alongside an optional positional
-/// version reproduces exactly the ambiguity that used to break `tekops logs`:
-/// before its source argument was removed, `tekops logs /var/log/x.log` failed
-/// with `invalid value for [SOURCE]` because clap could not tell a path from a
-/// subcommand name. This mirrors the hand-matching that fixed it, down to the
-/// case-sensitivity.
+/// version would create the same "one slot, two meanings" problem that used
+/// to break `tekops logs`: its first positional was typed as an enum of
+/// source names, so clap rejected any value outside that set before the
+/// command ever ran - `tekops logs /var/log/x.log` failed with
+/// `invalid value for [SOURCE]: possible values teku, besu`. This mirrors the
+/// hand-matching that fixed that, down to the case-sensitivity.
 pub fn resolve_update_target(arg: Option<String>) -> UpdateTarget {
     match arg.as_deref() {
         None => UpdateTarget::Prompt,
