@@ -180,6 +180,58 @@ fn shape_of(tok: &str) -> Option<Category> {
     if is_peer_id(tok) {
         return Some(Category::Peer);
     }
+    // Exact lengths, not ranges. `0x` + 96 hex is uniquely a BLS pubkey and
+    // `0x` + 40 hex is uniquely an execution address, so both are safe on
+    // shape alone. `0x` + 64 hex is NOT: that is also every block root and
+    // state root in the file, which appear on nearly every line and are what
+    // make the dump readable. See `block_and_state_roots_are_preserved`.
+    if let Some(h) = tok.strip_prefix("0x") {
+        if h.chars().all(|c| c.is_ascii_hexdigit()) {
+            if h.len() == 96 {
+                return Some(Category::Pubkey);
+            }
+            if h.len() == 40 {
+                return Some(Category::Address);
+            }
+        }
+    }
+    None
+}
+
+/// Keywords that mark the *next* token as a validator index.
+const VALIDATOR_ANCHORS: [&str; 5] = [
+    "validator",
+    "validators",
+    "index",
+    "validator_index",
+    "validatorindex",
+];
+
+/// Keywords that mark the next token as a hostname.
+///
+/// `node` is deliberately absent even though it looks like an obvious member.
+/// Teku writes it constantly in ordinary prose ("node is syncing", "node
+/// started"), so anchoring on it would redact the following word line after
+/// line.
+const HOST_ANCHORS: [&str; 2] = ["host", "hostname"];
+
+/// Classification that depends on the preceding token.
+///
+/// Needed because a validator index has no shape of its own - it is a bare
+/// integer, indistinguishable from a slot, an epoch, a port or a count. The
+/// keyword before it is the only signal available.
+fn anchored(tok: &str, prev: Option<&str>) -> Option<Category> {
+    let prev = prev?;
+    if prev == "graffiti" {
+        return Some(Category::Graffiti);
+    }
+    if VALIDATOR_ANCHORS.contains(&prev) && !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(Category::Validator);
+    }
+    if HOST_ANCHORS.contains(&prev) && !tok.chars().all(|c| c.is_ascii_digit()) {
+        return Some(Category::Host);
+    }
     None
 }
 
@@ -241,7 +293,7 @@ impl Redactor {
         out
     }
 
-    fn replace_token(&mut self, tok: &str, _prev: Option<&str>) -> String {
+    fn replace_token(&mut self, tok: &str, prev: Option<&str>) -> String {
         // Checked before the plain shapes: `10.0.0.5:8551` is a single token
         // (`:` is not a delimiter, so IPv6 survives), and only the address
         // half of it is sensitive.
@@ -251,6 +303,9 @@ impl Redactor {
             }
         }
         if let Some(cat) = shape_of(tok) {
+            return self.token(cat, tok);
+        }
+        if let Some(cat) = anchored(tok, prev) {
             return self.token(cat, tok);
         }
         tok.to_string()
@@ -363,5 +418,86 @@ mod tests {
         let mut r = Redactor::new();
         assert_eq!(r.redact("Qm is short"), "Qm is short");
         assert_eq!(r.redact("16Uiu2HAshort"), "16Uiu2HAshort");
+    }
+
+    fn hex(n: usize) -> String {
+        "a1b2c3d4".repeat(n / 8)
+    }
+
+    #[test]
+    fn bls_pubkeys_are_redacted() {
+        let mut r = Redactor::new();
+        let pk = format!("0x{}", hex(96));
+        assert_eq!(
+            r.redact(&format!("validator {pk} active")),
+            "validator <pubkey-1> active"
+        );
+    }
+
+    #[test]
+    fn execution_addresses_are_redacted() {
+        let mut r = Redactor::new();
+        let addr = format!("0x{}", hex(40));
+        assert_eq!(
+            r.redact(&format!("fee recipient {addr}")),
+            "fee recipient <address-1>"
+        );
+    }
+
+    /// The single most destructive over-match available in this file. A block
+    /// root and a state root are both `0x` + 64 hex, they appear on nearly
+    /// every line, and redacting them makes the dump worthless. Pubkeys (96)
+    /// and addresses (40) are matched on *exact* length for this reason.
+    #[test]
+    fn block_and_state_roots_are_preserved() {
+        let mut r = Redactor::new();
+        let root = format!("0x{}", hex(64));
+        let line = format!("head {root} finalized {root}");
+        assert_eq!(r.redact(&line), line);
+        assert_eq!(r.summary().values, 0);
+    }
+
+    #[test]
+    fn validator_indices_are_redacted_when_a_keyword_anchors_them() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("Validator 471293 missed"),
+            "Validator <validator-1> missed"
+        );
+        assert_eq!(r.redact("index=471293"), "index=<validator-1>");
+        assert_eq!(r.redact("validator_index: 8"), "validator_index: <validator-2>");
+    }
+
+    /// Indices have no distinguishing shape - they are bare integers, exactly
+    /// like slots, epochs, ports and counts. Anchoring is the only thing that
+    /// separates them, so an unanchored integer must never be touched.
+    #[test]
+    fn unanchored_integers_are_preserved() {
+        let mut r = Redactor::new();
+        let line = "slot 12034887 epoch 376090 peers 42 took 1503 ms on port 9000";
+        assert_eq!(r.redact(line), line);
+        assert_eq!(r.summary().values, 0);
+    }
+
+    #[test]
+    fn graffiti_is_redacted() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("graffiti: \"my-node\""), "graffiti: \"<graffiti-1>\"");
+    }
+
+    #[test]
+    fn hostnames_are_redacted_when_anchored() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("host=validator-box-01"), "host=<host-1>");
+        assert_eq!(r.redact("hostname: beacon-1"), "hostname: <host-2>");
+    }
+
+    /// `node` is deliberately NOT a host anchor even though it reads like an
+    /// obvious one: Teku writes "node" constantly in ordinary prose, and
+    /// anchoring on it redacts the next word every time.
+    #[test]
+    fn node_is_not_a_host_anchor() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("node is syncing"), "node is syncing");
     }
 }
