@@ -4,12 +4,16 @@ use crate::beaconapi::{
 use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
 use crate::curl;
 use crate::http::ApiError;
+use crate::loglevel::{
+    self, resolve_log_level_target, LogLevelError, LogLevelSpec, LogLevelTarget,
+};
 use crate::logs::run_logs;
 use crate::metrics::MetricsClient;
 use crate::output::{
     format_about, format_attester_duties, format_doctor_report, format_duties_table,
-    format_head_table, format_health_table, format_peers_table, format_proposer_duties,
-    format_validator_metrics_table, format_validators_table, format_version_table, PeerRow,
+    format_head_table, format_health_table, format_log_level_preview, format_peers_table,
+    format_proposer_duties, format_validator_metrics_table, format_validators_table,
+    format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
 use crate::stack::{detect_stack, DetectError, Stack};
@@ -140,12 +144,17 @@ enum Commands {
     },
     /// Set the node's runtime log level, optionally scoped to specific loggers
     LogLevel {
-        /// Log level to set (e.g. INFO, DEBUG, WARN, TRACE)
-        level: String,
+        /// Log level to set (e.g. INFO, DEBUG, WARN, TRACE), or an https url
+        /// serving a prepared request body (e.g. a gist)
+        target: String,
         /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu);
-        /// omit to change the global level
+        /// omit to change the global level. Not valid with a url, which
+        /// carries its own filters
         #[arg(long = "filter")]
         log_filter: Vec<String>,
+        /// Apply a fetched body without asking for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
         #[command(flatten)]
         api: ApiArgs,
     },
@@ -290,17 +299,11 @@ pub fn run() -> ExitCode {
             exit_for_api(metrics_version(&client, metrics.json), stack)
         }
         Commands::LogLevel {
-            level,
+            target,
             log_filter,
+            yes,
             api,
-        } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
-            let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for_api(
-                beacon_log_level(&client, &level, log_filter, api.json),
-                stack,
-            )
-        }
+        } => run_log_level(target, log_filter, yes, api),
         Commands::Autocomplete { shell, print, yes } => {
             exit_for(run_autocomplete(shell, print, yes))
         }
@@ -796,17 +799,77 @@ fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Resu
     Ok(())
 }
 
+/// `log-level` gets a handler of its own, dispatched inline like `run_doctor`
+/// and for a related reason: its exit code comes from two different error
+/// channels. A body that could not be fetched or parsed is not an `ApiError`,
+/// so it cannot go through `exit_for_api` - and it must not, since the
+/// `--stack` hint that adds would point at the node's ports for a failure that
+/// happened at a gist. Only the request itself is handed to `exit_for_api`.
+fn run_log_level(target: String, log_filter: Vec<String>, yes: bool, api: ApiArgs) -> ExitCode {
+    let spec = match resolve_spec(target, log_filter, yes) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => {
+            eprintln!("aborted, nothing was sent");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
+    let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
+    exit_for_api(beacon_log_level(&client, &spec, api.json), stack)
+}
+
+/// Works out what to send, or `None` if the operator declined it.
+///
+/// Nothing is fetched for a level typed on the command line, so `tekops
+/// log-level debug` never touches the network and never prompts.
+fn resolve_spec(
+    target: String,
+    log_filter: Vec<String>,
+    yes: bool,
+) -> Result<Option<LogLevelSpec>, LogLevelError> {
+    let url = match resolve_log_level_target(target, log_filter)? {
+        LogLevelTarget::Direct(spec) => return Ok(Some(spec)),
+        LogLevelTarget::Url(url) => url,
+    };
+
+    let spec = loglevel::load(&url)?;
+    if yes {
+        return Ok(Some(spec));
+    }
+    // The premise of fetching a body is that the operator could not have
+    // written those logger names themselves, which is exactly why they get to
+    // see them before they land on the node.
+    eprint!("{}", format_log_level_preview(&url, &spec));
+    Ok(confirm_apply()?.then_some(spec))
+}
+
+/// Prompts on stderr rather than stdout, so `--json` still emits nothing but
+/// JSON on stdout.
+fn confirm_apply() -> Result<bool, LogLevelError> {
+    eprint!("apply? [y/N] ");
+    io::stderr()
+        .flush()
+        .map_err(|e| LogLevelError::Io(e.to_string()))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| LogLevelError::Io(e.to_string()))?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
+}
+
 fn beacon_log_level(
     client: &BeaconClient,
-    level: &str,
-    log_filter: Vec<String>,
+    spec: &LogLevelSpec,
     json: bool,
 ) -> Result<(), ApiError> {
-    let log_filter = if log_filter.is_empty() {
-        None
-    } else {
-        Some(log_filter)
-    };
+    let level = &spec.level;
+    let log_filter = spec.log_filter.clone();
     client.set_log_level(level, log_filter.clone())?;
     if json {
         let payload = LogLevelJson { level, log_filter };
@@ -815,7 +878,7 @@ fn beacon_log_level(
             serde_json::to_string(&payload).expect("serialize log level json")
         );
     } else {
-        match &log_filter {
+        match &spec.log_filter {
             Some(loggers) => println!("log level set to {level} for: {}", loggers.join(", ")),
             None => println!("log level set to {level} (global)"),
         }
@@ -1221,15 +1284,50 @@ mod tests {
         let cli = Cli::try_parse_from(["tekops", "log-level", "DEBUG"]).unwrap();
         match cli.command {
             Commands::LogLevel {
-                level,
+                target,
                 log_filter,
+                yes,
                 api,
             } => {
-                assert_eq!(level, "DEBUG");
+                assert_eq!(target, "DEBUG");
                 assert!(log_filter.is_empty());
+                assert!(!yes);
                 assert_eq!(api.api_url, None);
                 assert!(!api.json);
             }
+            _ => panic!("expected LogLevel command"),
+        }
+    }
+
+    /// The positional takes a level or a URL, hand-matched by
+    /// `resolve_log_level_target` - clap must not try to type it as either.
+    #[test]
+    fn log_level_accepts_a_url_in_place_of_a_level() {
+        let cli = Cli::try_parse_from([
+            "tekops",
+            "log-level",
+            "https://gist.github.com/someone/abc123",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::LogLevel { target, .. } => {
+                assert_eq!(target, "https://gist.github.com/someone/abc123");
+            }
+            _ => panic!("expected LogLevel command"),
+        }
+    }
+
+    #[test]
+    fn log_level_accepts_a_confirmation_skip() {
+        let cli = Cli::try_parse_from([
+            "tekops",
+            "log-level",
+            "https://gist.github.com/someone/abc123",
+            "-y",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::LogLevel { yes, .. } => assert!(yes),
             _ => panic!("expected LogLevel command"),
         }
     }
@@ -1248,9 +1346,9 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::LogLevel {
-                level, log_filter, ..
+                target, log_filter, ..
             } => {
-                assert_eq!(level, "DEBUG");
+                assert_eq!(target, "DEBUG");
                 assert_eq!(log_filter, vec!["org.a".to_string(), "org.b".to_string()]);
             }
             _ => panic!("expected LogLevel command"),

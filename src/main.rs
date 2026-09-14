@@ -7,6 +7,7 @@ mod doctor;
 mod host;
 mod http;
 mod logfmt;
+mod loglevel;
 mod logs;
 mod metrics;
 mod output;

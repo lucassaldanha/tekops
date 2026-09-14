@@ -655,6 +655,31 @@ mod tests {
             .unwrap();
     }
 
+    /// Closes the seam between the two halves of the gist path: what
+    /// `loglevel::parse_spec` makes of a prepared body, and what actually goes
+    /// on the wire. Each side is tested on its own, so only a test spanning
+    /// both catches them agreeing on different things.
+    #[test]
+    fn a_body_parsed_from_a_gist_reaches_the_wire_unchanged() {
+        let spec = crate::loglevel::parse_spec(
+            br#"{"level": "DEBUG", "log_filter": ["tech.pegasys.teku.sync"]}"#,
+            "https://gist.github.com/someone/abc123",
+        )
+        .expect("the prepared body must parse");
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("PUT", "/teku/v1/admin/log_level")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "level": "DEBUG",
+                "log_filter": ["tech.pegasys.teku.sync"],
+            })))
+            .with_status(200)
+            .create();
+        let client = BeaconClient::new(server.url());
+        client.set_log_level(&spec.level, spec.log_filter).unwrap();
+    }
+
     #[test]
     fn set_log_level_errors_on_non_2xx_status() {
         let mut server = mockito::Server::new();

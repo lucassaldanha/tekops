@@ -3,8 +3,10 @@ use crate::beaconapi::{
     ValidatorInfo,
 };
 use crate::doctor::{Facts, Finding, Status};
+use crate::loglevel::LogLevelSpec;
 use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
 use crate::protocol::Protocol;
+use crate::term::sanitize;
 use comfy_table::Table;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -197,6 +199,33 @@ pub fn format_about() -> String {
         "tekops {}\nMade with love by Lucas \u{2764}\u{fe0f}\nhttps://github.com/lucassaldanha/tekops",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// Renders what a fetched body would apply, for the operator to read before it
+/// is sent.
+///
+/// Plain aligned text rather than `comfy-table`, for a reason close to
+/// `format_doctor_report`'s: this is the body of a prompt rather than the
+/// command's output, and it is printed to stderr so `--json` leaves stdout
+/// parseable.
+///
+/// Every value in it arrived over the network on its way to a terminal, so all
+/// three go through `sanitize` - the same channel `logfmt::format_log_line` and
+/// `map_ureq_error` guard. A forged line here would be read as tekops's own.
+pub fn format_log_level_preview(url: &str, spec: &LogLevelSpec) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("fetched from {}\n", sanitize(url)));
+    out.push_str(&format!("  level:  {}\n", sanitize(&spec.level)));
+    match &spec.log_filter {
+        None => out.push_str("  filter: none, this is a global change\n"),
+        Some(loggers) => {
+            for (i, logger) in loggers.iter().enumerate() {
+                let label = if i == 0 { "  filter:" } else { "         " };
+                out.push_str(&format!("{label} {}\n", sanitize(logger)));
+            }
+        }
+    }
+    out
 }
 
 fn glyph(s: Status) -> char {
@@ -588,5 +617,54 @@ mod tests {
         let out = format_doctor_report(&facts_for_output(), &[]);
         assert!(out.contains("eth-docker"));
         assert!(out.contains("linux"));
+    }
+
+    #[test]
+    fn a_preview_names_the_url_the_level_and_every_filter() {
+        let preview = format_log_level_preview(
+            "https://gist.github.com/someone/abc123",
+            &LogLevelSpec {
+                level: "DEBUG".to_string(),
+                log_filter: Some(vec![
+                    "tech.pegasys.teku.sync".to_string(),
+                    "tech.pegasys.teku.networking".to_string(),
+                ]),
+            },
+        );
+        assert!(preview.contains("https://gist.github.com/someone/abc123"));
+        assert!(preview.contains("DEBUG"));
+        assert!(preview.contains("tech.pegasys.teku.sync"));
+        assert!(
+            preview.contains("tech.pegasys.teku.networking"),
+            "every filter must be shown, not just the first: {preview}"
+        );
+    }
+
+    /// A global change and a change scoped to loggers the operator cannot see
+    /// must not look the same on screen.
+    #[test]
+    fn a_preview_says_so_when_the_change_is_global() {
+        let preview = format_log_level_preview(
+            "https://example.com/x",
+            &LogLevelSpec {
+                level: "INFO".to_string(),
+                log_filter: None,
+            },
+        );
+        assert!(preview.to_lowercase().contains("global"), "got {preview}");
+    }
+
+    /// The level and the logger names came off the network, and this text goes
+    /// straight to a terminal - the channel `term::sanitize` exists for.
+    #[test]
+    fn a_preview_cannot_carry_escape_sequences_to_the_terminal() {
+        let preview = format_log_level_preview(
+            "https://example.com/\u{1b}[2Jx",
+            &LogLevelSpec {
+                level: "DEBUG\u{1b}[31m".to_string(),
+                log_filter: Some(vec!["org.a\u{1b}[2J".to_string()]),
+            },
+        );
+        assert!(!preview.contains('\u{1b}'), "escape survived: {preview:?}");
     }
 }
