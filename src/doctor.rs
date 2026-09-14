@@ -14,13 +14,15 @@
 // their own wiring.
 #![allow(dead_code)]
 
-use crate::beaconapi::{FinalityCheckpoints, HealthState, PeerInfo, SyncingStatus};
+use crate::beaconapi::{BeaconClient, FinalityCheckpoints, HealthState, PeerInfo, SyncingStatus};
 use crate::docker::ContainerState;
 use crate::host::{Disk, Load, Memory};
 use crate::http::ApiError;
-use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
+use crate::metrics::{DutiesMetrics, MetricsClient, ValidatorMetrics, VersionInfo};
 use crate::stack::Stack;
 use serde::Serialize;
+use std::path::PathBuf;
+use std::process::Command;
 
 // Thresholds.
 //
@@ -535,6 +537,108 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
+pub struct ProbeConfig {
+    pub stack: Option<Stack>,
+    pub api_url: String,
+    pub metric_url: String,
+    /// The consensus container to inspect, when there is one.
+    pub container: Option<String>,
+    /// Bare-metal disk target. On a Docker stack the container's own mounts
+    /// answer this, and a value here overrides them (flags beat detection).
+    pub data_dir: Option<PathBuf>,
+}
+
+const API_DOWN: &str = "skipped: the beacon api is unreachable";
+const METRICS_DOWN: &str = "skipped: the metrics endpoint is unreachable";
+
+/// Every I/O doctor performs, and nothing else.
+///
+/// Nothing here returns early. The short-circuits are per endpoint and are a
+/// latency bound, not a control-flow shortcut: seven calls at a 10 second
+/// timeout is 70 seconds of silence against a dead node.
+pub fn probe(cfg: &ProbeConfig) -> Facts {
+    let bn = BeaconClient::new(cfg.api_url.clone());
+    let health = Probe::from_result(bn.health());
+
+    let (syncing, finality, peers) = if health.is_unreachable() {
+        (
+            Probe::Skipped(API_DOWN),
+            Probe::Skipped(API_DOWN),
+            Probe::Skipped(API_DOWN),
+        )
+    } else {
+        (
+            Probe::from_result(bn.syncing()),
+            Probe::from_result(bn.finality_checkpoints()),
+            Probe::from_result(bn.peers()),
+        )
+    };
+
+    let mc = MetricsClient::new(cfg.metric_url.clone());
+    let version = Probe::from_result(mc.version());
+    let (duties, validators) = if version.is_unreachable() {
+        (Probe::Skipped(METRICS_DOWN), Probe::Skipped(METRICS_DOWN))
+    } else {
+        (
+            Probe::from_result(mc.duties()),
+            Probe::from_result(mc.validators()),
+        )
+    };
+
+    // `Probe`, not a bare Vec: an empty list on a Docker stack means "docker
+    // told us nothing", which is a reportable failure, and it must stay
+    // distinguishable from bare-metal's "there was never anything to list".
+    let containers: Probe<Vec<ContainerState>> = match cfg.container.as_deref() {
+        None => Probe::Skipped(NO_CONTAINER),
+        Some(name) => match inspect_container(name) {
+            Some(c) => Probe::Ok(vec![c]),
+            None => Probe::Failed(crate::term::sanitize(&format!(
+                "docker inspect {name} failed or returned nothing"
+            ))),
+        },
+    };
+
+    // Flags beat detection: an explicit --data-dir wins even on a stack whose
+    // container could have answered.
+    let data_dir: Option<PathBuf> = cfg.data_dir.clone().or_else(|| {
+        containers
+            .ok()
+            .and_then(|v| v.first())
+            .and_then(crate::docker::data_mount)
+            .map(PathBuf::from)
+    });
+    let host = crate::host::collect(data_dir.as_deref());
+
+    Facts {
+        stack: cfg.stack,
+        api_url: cfg.api_url.clone(),
+        metric_url: cfg.metric_url.clone(),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        health,
+        syncing,
+        finality,
+        peers,
+        version,
+        duties,
+        validators,
+        containers,
+        disk: host.disk,
+        memory: host.memory,
+        load: host.load,
+        cpus: host.cpus,
+    }
+}
+
+fn inspect_container(name: &str) -> Option<ContainerState> {
+    let argv = crate::docker::inspect_argv(name);
+    let out = Command::new(&argv[0]).args(&argv[1..]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    crate::docker::parse_inspect(&String::from_utf8_lossy(&out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,5 +1127,52 @@ mod tests {
             status_of(&evaluate(&f), "metrics endpoint"),
             Some(Status::Fail)
         );
+    }
+
+    // --- probe ---
+
+    #[test]
+    fn a_dead_beacon_api_skips_the_rest_instead_of_timing_out_once_per_call() {
+        use std::time::Instant;
+
+        // A port nothing listens on: the connection is refused immediately,
+        // but the point is that only ONE call is attempted per endpoint.
+        let cfg = ProbeConfig {
+            stack: Some(Stack::BareMetal),
+            api_url: "http://127.0.0.1:1".to_string(),
+            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            container: None,
+            data_dir: None,
+        };
+
+        let started = Instant::now();
+        let f = probe(&cfg);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "probe took {:?}; it must short-circuit rather than time out per call",
+            started.elapsed()
+        );
+
+        assert!(matches!(f.health, Probe::Failed(_)));
+        assert!(matches!(f.syncing, Probe::Skipped(_)));
+        assert!(matches!(f.finality, Probe::Skipped(_)));
+        assert!(matches!(f.peers, Probe::Skipped(_)));
+        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(matches!(f.duties, Probe::Skipped(_)));
+        assert!(matches!(f.validators, Probe::Skipped(_)));
+    }
+
+    #[test]
+    fn probe_records_the_urls_it_used_so_findings_can_name_them() {
+        let cfg = ProbeConfig {
+            stack: Some(Stack::EthDocker),
+            api_url: "http://127.0.0.1:1".to_string(),
+            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            container: None,
+            data_dir: None,
+        };
+        let f = probe(&cfg);
+        assert_eq!(f.api_url, "http://127.0.0.1:1");
+        assert_eq!(f.stack, Some(Stack::EthDocker));
     }
 }
