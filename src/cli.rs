@@ -295,16 +295,8 @@ pub fn run() -> ExitCode {
             container,
             stack,
         } => {
-            // Detection only runs when nothing else has answered, so a
-            // configured operator never pays for a `docker ps` spawn.
-            //
-            // This condition must stay the logical negation of every branch
-            // in `logs::resolve_log_target` that fires before its `detected`
-            // parameter - nothing ties the two together at compile time, so
-            // a change to that ladder has to be mirrored here by hand. The
-            // two config rungs are part of that list: an operator who set
-            // `container` or `logs_file` in the file has already answered,
-            // and a spawn here could not change the result.
+            // Detection only runs when nothing else has answered - see
+            // `needs_detection`.
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let detected = if needs_detection(
@@ -340,9 +332,7 @@ pub fn run() -> ExitCode {
             container,
             stack,
         } => {
-            // The same detection gate `logs` uses, and it must stay the
-            // logical negation of every branch in `resolve_log_target` that
-            // fires before its `detected` parameter.
+            // The same detection gate `logs` uses - see `needs_detection`.
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);

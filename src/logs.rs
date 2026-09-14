@@ -89,10 +89,10 @@ pub enum LogTarget {
 /// Every input arrives as a parameter rather than being read here, so the whole
 /// ladder is testable with no environment races and no Docker installed.
 ///
-/// `cli.rs` has two `needs_detection` gates that are this function's
-/// precedence list negated by hand. Adding a rung above `detected` means
-/// adding a clause to both, or a configured operator pays for a `docker ps`
-/// spawn whose answer cannot be used.
+/// `cli.rs::needs_detection` is this function's precedence list negated by
+/// hand. Adding a rung above `detected` means adding a clause there, or a
+/// configured operator pays for a `docker ps` spawn whose answer cannot be
+/// used.
 pub fn resolve_log_target(
     path: Option<PathBuf>,
     container_flag: Option<String>,
@@ -703,6 +703,24 @@ mod tests {
     fn container_flag_wins_over_everything_below_it() {
         let t = target(None, Some("mine"), Some("env"), Some("/x.log"), Some("det"));
         assert_eq!(t, LogTarget::Container("mine".into()));
+    }
+
+    /// The `target()` helper is frozen at `None, None` for the two config
+    /// rungs, so it cannot exercise flag-versus-config ordering. Called
+    /// directly here so a future edit that moved the config rungs above the
+    /// flag check would fail a test.
+    #[test]
+    fn container_flag_beats_both_config_rungs() {
+        let got = resolve_log_target(
+            None,
+            Some("mine".into()),
+            None,
+            None,
+            Some("cfg-container".into()),
+            Some(PathBuf::from("/cfg/teku.log")),
+            None,
+        );
+        assert_eq!(got, LogTarget::Container("mine".into()));
     }
 
     /// The case that pins the ordering: naming a file on a host that also runs
