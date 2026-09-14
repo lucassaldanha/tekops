@@ -3,6 +3,7 @@
 Every command. See the [README](README.md) for installing and building.
 
     tekops logs [path]
+    tekops dump-logs [path] [-n N] [-o FILE] [--gist] [--header] [--doctor]
     tekops peers
     tekops health
     tekops head
@@ -75,6 +76,126 @@ stops following and says so in-band:
 The buffer is a real file rather than a pipe, which is what lets `less`
 answer a failed search immediately instead of blocking forever waiting for
 output that may never arrive.
+
+## dump-logs
+
+    tekops dump-logs                       # last 1000 lines -> ./tekops-dump-<timestamp>.txt
+    tekops dump-logs -n 2000               # 2000 lines instead
+    tekops dump-logs -o ./teku-issue.txt   # write somewhere specific
+    tekops dump-logs --header              # prepend a provenance block
+    tekops dump-logs --doctor              # embed a doctor report above the logs
+    tekops dump-logs --gist                # upload to a secret gist instead of writing a file
+
+`dump-logs` produces one artifact you can hand to a maintainer: the last N log
+lines with sensitive values anonymised. The source is resolved exactly as for
+[`logs`](#logs) - the same optional path, the same `--container`, the same
+`$TEKOPS_CONTAINER` / `$TEKOPS_LOGS_FILE` / `docker ps` ladder - so anything
+that works there works here.
+
+Where the output goes:
+
+| Flags | Result |
+| --- | --- |
+| neither | writes `./tekops-dump-<timestamp>.txt` |
+| `-o PATH` | writes `PATH` |
+| `--gist` | uploads, writes no file |
+| `--gist -o PATH` | writes `PATH` **and** uploads |
+
+The file is written with owner-only permissions (0600). With no flags the
+contents are exactly the redacted lines and nothing else, so the file stays
+pipeable and diffable; `--header` and `--doctor` each add a labelled block
+above them.
+
+### What gets anonymised
+
+Every byte written passes through the anonymiser - the header and the doctor
+report included, not just the log lines.
+
+| Replaced | Becomes |
+| --- | --- |
+| IPv4 and IPv6 addresses, including inside multiaddrs | `<ip-1>` |
+| libp2p peer ids (`16Uiu2HA…`, `12D3KooW…`, `Qm…`) | `<peer-1>` |
+| ENRs (`enr:-…`) | `<enr-1>` |
+| BLS validator pubkeys (`0x` + 96 hex) | `<pubkey-1>` |
+| Execution addresses (`0x` + 40 hex): fee recipient, withdrawal, deposit | `<address-1>` |
+| Validator indices, when a keyword names them (`Validator 471293`, `index=…`) | `<validator-1>` |
+| Graffiti | `<graffiti-1>` |
+| Usernames in `/home/<user>/…` and `/Users/<user>/…` | `<user-1>` |
+| Hostnames, when a keyword names them (`host=…`, `hostname: …`) | `<host-1>` |
+| Credentials in URLs: `user:pass@`, and API keys in the path | `<secret-1>` |
+
+**Placeholders are stable within one dump.** The same peer is `<peer-1>` every
+time it appears, so "this peer disconnected, then reconnected" and "this
+validator missed two attestations" survive anonymisation. That is the whole
+reason values are pseudonymised rather than blanked - a flat `<redacted>`
+destroys exactly the correlations that make a log diagnosable.
+
+Ports, hostnames of well-known providers and the rest of a path are kept. An
+endpoint URL comes out as `https://mainnet.infura.io/v3/<secret-1>`: which
+provider the node talks to is diagnostic, the key is not.
+
+### What is deliberately not anonymised
+
+Block roots, state roots, slots, epochs, ports, peer counts, byte counts,
+durations, timestamps, version strings, logger and exception class names.
+
+These are left alone on purpose. Block and state roots are `0x` + 64 hex and
+appear on nearly every line; a validator index is a bare integer,
+indistinguishable in shape from a slot or a port. Redacting them would make
+the dump unreadable, which is why validator indices are matched by the keyword
+in front of them rather than by their shape, and why pubkeys and addresses are
+matched on an exact hex length rather than a range.
+
+**The anonymiser is pattern matching, not a guarantee.** It is good at the
+shapes Teku and Besu actually emit, and it can miss something unusual. Read
+the file before you share it - that is what the `--gist` confirmation exists
+for.
+
+### Uploading to a gist
+
+    export GITHUB_TOKEN=ghp_...     # a PAT with the 'gist' scope
+    tekops dump-logs --gist
+
+`--gist` needs a GitHub token, read from `$GITHUB_TOKEN` and then `$GH_TOKEN`.
+GitHub removed anonymous gist creation in 2018, so there is no token-free
+path. The token is checked before a single log line is read, so a missing one
+fails immediately rather than after the work.
+
+Gists are created **secret**: unlisted and not indexed, but still readable by
+anyone who has the link. There is no `--public` flag. Treat the link as the
+secret.
+
+Before uploading, `dump-logs` shows the redaction summary and the first few
+lines and asks:
+
+    about to upload 1000 lines (214 KB) to a secret gist
+    redacted 47 values across 9 categories
+
+      2026-09-14 21:14:09.884 INFO  - Peer <peer-1> at /ip4/<ip-1>/tcp/9000 connected
+      ...
+
+    upload? [y/N]
+
+`-y`/`--yes` skips the prompt. Writing a local file never prompts - nothing
+has been published, and the file is the thing you would inspect.
+
+On success the gist URL is the only thing printed to stdout, so
+`tekops dump-logs --gist | pbcopy` does the obvious thing; the redaction
+summary goes to stderr. Dumps over 2 MB are refused rather than uploaded,
+because GitHub truncates large gist files in the web view and a silently
+truncated dump is worse than an error.
+
+### --doctor
+
+`--doctor` runs the same checks as [`tekops doctor`](#doctor) and embeds the
+report above the logs, so one paste carries both the symptom and the node's
+state. It is opt-in because it is the one flag that costs real time: doctor
+makes up to seven calls against the node, which on a node that is not
+answering is around twenty seconds.
+
+A doctor failure never fails the dump. If the probes cannot reach the node the
+report says so and the logs are still written - this command exists for the
+case where the node is sick.
 
 ## Beacon API commands
 
