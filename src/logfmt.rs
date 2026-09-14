@@ -20,12 +20,19 @@ const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
 /// One log record's fields, however they were parsed.
 ///
-/// `thread` and `class` are empty for console records, which carry neither.
+/// `middle` is the already-rendered `[thread] class ` segment (or empty),
+/// decided by the parser rather than by `render`. The JSON layout always
+/// carries a thread and a class, so `parse_json` builds `middle`
+/// unconditionally; Teku's console layout carries neither, so `parse_console`
+/// leaves it empty. Deciding this in `render` instead - e.g. omitting the
+/// brackets when a field happens to be empty - is what let the JSON path
+/// silently drift from its pre-console-parser output; putting the decision in
+/// the parser makes the JSON path byte-identical by construction instead of by
+/// convention.
 struct Fields {
     timestamp: String,
     level: String,
-    thread: String,
-    class: String,
+    middle: String,
     message: String,
     throwable: String,
 }
@@ -70,8 +77,8 @@ fn parse_console(raw: &str) -> Option<Fields> {
     Some(Fields {
         timestamp: sanitize(timestamp),
         level: sanitize(level),
-        thread: String::new(),
-        class: String::new(),
+        // No thread, no class in this layout - see the note on `Fields::middle`.
+        middle: String::new(),
         message: sanitize(message),
         // The console layout has no throwable field. Log4j appends stack traces
         // as separate physical lines, which reach `format_log_line` on their own
@@ -93,31 +100,27 @@ fn parse_json(value: &Value) -> Fields {
             .map(sanitize)
             .unwrap_or_default()
     };
+    let thread = get("thread");
+    let class = get("class");
     Fields {
         timestamp: get("@timestamp"),
         level: get("level"),
-        thread: get("thread"),
-        class: get("class"),
+        // Built unconditionally, brackets and all, even when thread/class are
+        // empty - see the note on `Fields::middle` for why this can't move
+        // into `render`.
+        middle: format!("[{thread}] {class} "),
         message: get("message"),
         throwable: get("throwable"),
     }
 }
 
-/// Renders one parsed record, omitting the thread and class when absent.
-///
-/// Omitting rather than emitting empty `[] ` placeholders is what lets a console
-/// record render as `<timestamp> <LEVEL> - <message>`, the shape Teku itself
-/// prints, while leaving the JSON path's output byte-identical to what it was
-/// before the two paths shared a renderer.
+/// Renders one parsed record. `f.middle` is already whatever the parser
+/// decided it should be (see `Fields::middle`) - `render` just interpolates
+/// it, with no knowledge of thread/class at all, so it cannot reintroduce the
+/// drift that putting that decision here once caused.
 fn render(f: &Fields) -> String {
     let color = color_for_level(&f.level);
-    let mut middle = String::new();
-    if !f.thread.is_empty() {
-        middle.push_str(&format!("[{}] ", f.thread));
-    }
-    if !f.class.is_empty() {
-        middle.push_str(&format!("{} ", f.class));
-    }
+    let middle = &f.middle;
     let throwable_suffix = if f.throwable.is_empty() {
         String::new()
     } else {
@@ -360,5 +363,23 @@ mod tests {
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"a - b","class":"C","message":"m"}"#;
         let out = format_log_line(raw);
         assert!(out.contains("[a - b] C - m"), "got: {out:?}");
+    }
+
+    /// Pins the JSON path's byte-identity in the corner the shared renderer
+    /// could have changed: an empty thread still renders as empty brackets,
+    /// exactly as it did before the console parser existed.
+    #[test]
+    fn json_with_an_empty_thread_still_renders_empty_brackets() {
+        let raw = r#"{"@timestamp":"t","level":"INFO","thread":"","class":"C","message":"m"}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
+    }
+
+    /// The same corner with the key absent rather than empty.
+    #[test]
+    fn json_with_no_thread_key_still_renders_empty_brackets() {
+        let raw = r#"{"@timestamp":"t","level":"INFO","class":"C","message":"m"}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
     }
 }
