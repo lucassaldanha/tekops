@@ -253,32 +253,32 @@ pub fn run() -> ExitCode {
         Commands::Peers { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for(beacon_peers(&client, api.json))
+            exit_for_api(beacon_peers(&client, api.json))
         }
         Commands::Health { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for(beacon_health(&client, api.json))
+            exit_for_api(beacon_health(&client, api.json))
         }
         Commands::Head { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for(beacon_head(&client, api.json))
+            exit_for_api(beacon_head(&client, api.json))
         }
         Commands::Duties { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for(metrics_duties(&client, metrics.json))
+            exit_for_api(metrics_duties(&client, metrics.json))
         }
         Commands::Validators { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for(metrics_validators(&client, metrics.json))
+            exit_for_api(metrics_validators(&client, metrics.json))
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok());
             let client = MetricsClient::new(resolve_metric_url(metrics.metric_url, stack));
-            exit_for(metrics_version(&client, metrics.json))
+            exit_for_api(metrics_version(&client, metrics.json))
         }
         Commands::LogLevel {
             level,
@@ -287,7 +287,7 @@ pub fn run() -> ExitCode {
         } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
-            exit_for(beacon_log_level(&client, &level, log_filter, api.json))
+            exit_for_api(beacon_log_level(&client, &level, log_filter, api.json))
         }
         Commands::Autocomplete { shell, print, yes } => {
             exit_for(run_autocomplete(shell, print, yes))
@@ -352,6 +352,50 @@ fn exit_for<E: fmt::Display>(result: Result<(), E>) -> ExitCode {
     }
 }
 
+/// The hint text for a given `docker ps` output, or `None` if there is nothing
+/// confident to say.
+///
+/// Split from `docker_stack_hint` so the message is testable without Docker.
+fn hint_from_ps(ps: &str) -> Option<String> {
+    let (stack, _) = detect_stack(ps, None).ok()?;
+    let name = stack.to_possible_value()?;
+    Some(format!(
+        "hint: detected a {} stack; try --stack {} or set $TEKOPS_STACK",
+        name.get_name(),
+        name.get_name()
+    ))
+}
+
+/// Probes Docker once to suggest a stack, for use only on a connection failure.
+///
+/// This is the one place an HTTP command touches Docker, and it is on the
+/// failure path exclusively: putting a `docker ps` spawn on `tekops health`'s
+/// happy path would add a dependency and a process spawn to a command that has
+/// neither today.
+fn docker_stack_hint() -> Option<String> {
+    hint_from_ps(&docker_ps_names()?)
+}
+
+/// The exit path for commands that talk to a node over HTTP.
+///
+/// Identical to `exit_for` except that an unreachable endpoint gets a stack
+/// hint appended, since "could not reach endpoint" on a Docker host almost
+/// always means the ports are the default bare-metal ones.
+fn exit_for_api(result: Result<(), ApiError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            if matches!(e, ApiError::Unreachable(_)) {
+                if let Some(hint) = docker_stack_hint() {
+                    eprintln!("{hint}");
+                }
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct HealthJson<'a> {
     health: &'a HealthState,
@@ -384,7 +428,7 @@ fn run_beacon(client: BeaconClient, command: BeaconCommand, json: bool) -> ExitC
             DutiesKind::Proposer { epoch } => beacon_duties_proposer(&client, epoch, json),
         },
     };
-    exit_for(result)
+    exit_for_api(result)
 }
 
 fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
@@ -1395,5 +1439,28 @@ mod tests {
             Commands::Duties { metrics } => assert_eq!(metrics.stack, Some(Stack::EthDocker)),
             _ => panic!("expected Duties"),
         }
+    }
+
+    #[test]
+    fn hint_names_the_detected_stack_and_the_flag_that_fixes_it() {
+        let ps = "rocketpool_node\nrocketpool_eth2\n";
+        let hint = hint_from_ps(ps).expect("expected a hint");
+        assert!(hint.contains("rocketpool"), "got: {hint}");
+        assert!(hint.contains("--stack"), "got: {hint}");
+    }
+
+    #[test]
+    fn no_hint_when_no_docker_stack_is_present() {
+        assert_eq!(hint_from_ps("postgres\nredis\n"), None);
+    }
+
+    #[test]
+    fn no_hint_when_detection_is_ambiguous() {
+        // Suggesting one of two stacks would be a guess, and the operator is
+        // better served by the plain connection error.
+        assert_eq!(
+            hint_from_ps("eth-docker-consensus-1\nrocketpool_eth2\n"),
+            None
+        );
     }
 }
