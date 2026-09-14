@@ -1,5 +1,4 @@
 use crate::logfmt::format_log_line;
-use clap::ValueEnum;
 use std::env;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
@@ -56,56 +55,8 @@ pub fn stream_logs_capped<R: BufRead, W: Write>(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum LogSource {
-    Teku,
-    Besu,
-}
-
-impl LogSource {
-    pub fn default_path(&self) -> PathBuf {
-        match self {
-            LogSource::Teku => PathBuf::from("/var/log/teku/teku.log"),
-            LogSource::Besu => PathBuf::from("/var/log/besu/besu.log"),
-        }
-    }
-}
-
-/// Splits the two positionals of `tekops logs` into a source and an optional
-/// path. The first one is either a source name or a path, which is why `cli`
-/// takes it as a `String` rather than letting clap type it as a `LogSource`:
-/// doing that made `tekops logs /var/log/x.log` fail with "invalid value for
-/// [SOURCE]" even though it is the form USAGE.md documents.
-///
-/// A file actually named `teku` or `besu` is read as a source, not a path.
-/// That ambiguity is inherent to the two-meanings-one-slot design; `./teku`
-/// disambiguates it.
-pub fn resolve_logs_target(
-    first: Option<String>,
-    second: Option<PathBuf>,
-) -> Result<(LogSource, Option<PathBuf>), String> {
-    let Some(first) = first else {
-        return Ok((LogSource::Teku, None));
-    };
-
-    // Matched by hand, and case-sensitively, to keep exactly the set of names
-    // the `ValueEnum` accepted before this function existed.
-    let source = match first.as_str() {
-        "teku" => Some(LogSource::Teku),
-        "besu" => Some(LogSource::Besu),
-        _ => None,
-    };
-
-    match (source, second) {
-        (Some(source), second) => Ok((source, second)),
-        (None, None) => Ok((LogSource::Teku, Some(PathBuf::from(first)))),
-        (None, Some(second)) => Err(format!(
-            "expected a source (teku or besu) or a single path, but got two paths: '{}' and '{}'",
-            first,
-            second.display()
-        )),
-    }
-}
+/// The path the old bashrc function tailed.
+const DEFAULT_TEKU_LOG: &str = "/var/log/teku/teku.log";
 
 /// Where one `tekops logs` session reads from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,9 +69,8 @@ pub enum LogTarget {
 ///
 /// Precedence, highest first: the `--container` flag or positional path (clap
 /// keeps those mutually exclusive, so there is no ordering question between
-/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE` (Teku only, since
-/// that is the source its own fallback value describes), then `docker ps`
-/// detection, then the source's hardcoded default.
+/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then `docker ps`
+/// detection, then the hardcoded default.
 ///
 /// The principle is: flags beat environment beats detection beats hardcoded
 /// default. Detection sits below everything the operator stated and above the
@@ -132,7 +82,6 @@ pub enum LogTarget {
 /// Every input arrives as a parameter rather than being read here, so the whole
 /// ladder is testable with no environment races and no Docker installed.
 pub fn resolve_log_target(
-    source: LogSource,
     path: Option<PathBuf>,
     container_flag: Option<String>,
     container_env: Option<String>,
@@ -148,26 +97,13 @@ pub fn resolve_log_target(
     if let Some(c) = container_env {
         return LogTarget::Container(c);
     }
-    if let LogSource::Teku = source {
-        if let Some(p) = teku_logs_file_env {
-            return LogTarget::File(PathBuf::from(p));
-        }
+    if let Some(p) = teku_logs_file_env {
+        return LogTarget::File(PathBuf::from(p));
     }
-    // Detection only ever finds a *consensus* container - `stack.rs` has no
-    // suffix for either stack's execution client, and
-    // `does_not_match_rocket_pools_execution_container` pins that on purpose.
-    // Applying a detected name to a besu session would render Teku's logs
-    // while claiming to show Besu, the exact inverse of what the operator
-    // asked for and with nothing in the output to reveal the swap. So a
-    // detected container only ever answers a teku session; besu falls through
-    // to its own default path (or an explicit --container/$TEKOPS_CONTAINER,
-    // both handled above).
-    if let LogSource::Teku = source {
-        if let Some(c) = detected {
-            return LogTarget::Container(c);
-        }
+    if let Some(c) = detected {
+        return LogTarget::Container(c);
     }
-    LogTarget::File(source.default_path())
+    LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
 }
 
 /// The command that produces raw log lines for one session.
@@ -218,14 +154,12 @@ pub fn producer_argv(target: &LogTarget, lines: u32) -> (String, Vec<String>) {
 }
 
 pub fn run_logs(
-    source: LogSource,
     path: Option<PathBuf>,
     lines: u32,
     container: Option<String>,
     detected: Option<String>,
 ) -> ExitCode {
     let target = resolve_log_target(
-        source,
         path,
         container,
         env::var("TEKOPS_CONTAINER").ok(),
@@ -490,73 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn default_paths_match_existing_bashrc_function() {
-        assert_eq!(
-            LogSource::Teku.default_path(),
-            PathBuf::from("/var/log/teku/teku.log")
-        );
-        assert_eq!(
-            LogSource::Besu.default_path(),
-            PathBuf::from("/var/log/besu/besu.log")
-        );
-    }
-
-    // The first positional of `tekops logs` is either a source name or a
-    // path. Typing it as LogSource made `tekops logs /var/log/x.log` fail
-    // with "invalid value for [SOURCE]" even though USAGE.md documented
-    // exactly that form.
-
-    #[test]
-    fn resolve_logs_target_defaults_to_teku_with_no_positionals() {
-        let (source, path) = resolve_logs_target(None, None).unwrap();
-        assert!(matches!(source, LogSource::Teku));
-        assert_eq!(path, None);
-    }
-
-    #[test]
-    fn resolve_logs_target_reads_a_bare_path_as_a_teku_path() {
-        let (source, path) = resolve_logs_target(Some("/var/log/x.log".into()), None).unwrap();
-        assert!(matches!(source, LogSource::Teku));
-        assert_eq!(path, Some(PathBuf::from("/var/log/x.log")));
-    }
-
-    #[test]
-    fn resolve_logs_target_still_reads_an_explicit_source() {
-        let (source, path) = resolve_logs_target(Some("besu".into()), None).unwrap();
-        assert!(matches!(source, LogSource::Besu));
-        assert_eq!(path, None);
-    }
-
-    #[test]
-    fn resolve_logs_target_reads_a_source_and_path_pair() {
-        let (source, path) =
-            resolve_logs_target(Some("besu".into()), Some(PathBuf::from("/b.log"))).unwrap();
-        assert!(matches!(source, LogSource::Besu));
-        assert_eq!(path, Some(PathBuf::from("/b.log")));
-    }
-
-    #[test]
-    fn resolve_logs_target_rejects_two_paths() {
-        let err =
-            resolve_logs_target(Some("/a.log".into()), Some(PathBuf::from("/b.log"))).unwrap_err();
-        assert!(err.contains("/a.log"), "got {err:?}");
-        assert!(err.contains("/b.log"), "got {err:?}");
-    }
-
-    #[test]
-    fn resolve_logs_target_treats_an_unknown_word_as_a_relative_path() {
-        // Not a source name, so it is a path, even without a leading slash.
-        let (source, path) = resolve_logs_target(Some("teku.log".into()), None).unwrap();
-        assert!(matches!(source, LogSource::Teku));
-        assert_eq!(path, Some(PathBuf::from("teku.log")));
-    }
-
-    #[test]
-    fn resolve_logs_target_is_case_sensitive_like_the_old_value_enum() {
-        // "TEKU" was rejected before this change; it stays a path rather than
-        // silently gaining a case-insensitive match the old parser never had.
-        let (_, path) = resolve_logs_target(Some("TEKU".into()), None).unwrap();
-        assert_eq!(path, Some(PathBuf::from("TEKU")));
+    fn default_path_matches_existing_bashrc_function() {
+        assert_eq!(DEFAULT_TEKU_LOG, "/var/log/teku/teku.log");
     }
 
     /// Stands in for `tail -F`: a child that never exits on its own and whose
@@ -655,7 +524,7 @@ mod tests {
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(LogSource::Teku, Some(missing), 500, None, None);
+        let code = run_logs(Some(missing), 500, None, None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
@@ -667,7 +536,6 @@ mod tests {
         detected: Option<&str>,
     ) -> LogTarget {
         resolve_log_target(
-            LogSource::Teku,
             path.map(PathBuf::from),
             container_flag.map(String::from),
             container_env.map(String::from),
@@ -719,48 +587,26 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_the_sources_default_path_when_nothing_is_known() {
+    fn falls_back_to_the_default_path_when_nothing_is_known() {
         assert_eq!(
             target(None, None, None, None, None),
-            LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))
-        );
-        let besu = resolve_log_target(LogSource::Besu, None, None, None, None, None);
-        assert_eq!(
-            besu,
-            LogTarget::File(PathBuf::from("/var/log/besu/besu.log"))
+            LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
         );
     }
 
-    /// `$TEKOPS_LOGS_FILE` describes a Teku log, so it must not redirect a besu
-    /// session. This preserves the behaviour `resolve_log_target`'s predecessor had.
+    /// `$TEKOPS_LOGS_FILE` now applies unconditionally - there is no source to
+    /// gate it on any more.
     #[test]
-    fn logs_file_env_does_not_apply_to_besu() {
-        let t = resolve_log_target(
-            LogSource::Besu,
-            None,
-            None,
-            None,
-            Some("/teku.log".into()),
-            None,
-        );
-        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/besu/besu.log")));
+    fn teku_logs_file_env_is_honoured() {
+        let t = target(None, None, None, Some("/x.log"), None);
+        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
     }
 
-    /// Detection only ever finds a consensus container (see
-    /// `stack::does_not_match_rocket_pools_execution_container`), so applying
-    /// it to a besu session would silently show Teku logs to someone who asked
-    /// for Besu. A successful detection must not redirect a besu session.
+    /// A detected container now applies unconditionally as well.
     #[test]
-    fn detection_does_not_apply_to_besu() {
-        let t = resolve_log_target(
-            LogSource::Besu,
-            None,
-            None,
-            None,
-            None,
-            Some("rocketpool_eth2".into()),
-        );
-        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/besu/besu.log")));
+    fn a_detected_container_is_honoured() {
+        let t = target(None, None, None, None, Some("rocketpool_eth2"));
+        assert_eq!(t, LogTarget::Container("rocketpool_eth2".into()));
     }
 
     /// A custom stack tekops does not recognize is a supported deployment: the

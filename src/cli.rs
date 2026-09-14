@@ -3,7 +3,7 @@ use crate::beaconapi::{
 };
 use crate::completions::{self, detect_shell, CompletionError, RcOutcome};
 use crate::http::ApiError;
-use crate::logs::{resolve_logs_target, run_logs, LogSource};
+use crate::logs::run_logs;
 use crate::metrics::MetricsClient;
 use crate::output::{
     format_about, format_attester_duties, format_doctor_report, format_duties_table,
@@ -81,19 +81,12 @@ struct MetricArgs {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Tail and colorize a Teku or Besu log file, or a container's logs
+    /// Tail and colorize the Teku log, or a container's logs
     Logs {
-        /// teku, besu, or a path to a log file (defaults to teku)
+        /// Path to a log file (defaults to the Teku log)
         //
-        // `conflicts_with` goes on BOTH positionals, not just `path`. A lone
-        // positional path lands in `source`, not `path` (see
-        // `resolve_logs_target`), so guarding only `path` would let
-        // `tekops logs /a.log --container c` parse with two answers to one
-        // question. Naming a container fully determines what gets read, which
-        // makes a source or a path alongside it meaningless rather than merely
-        // redundant.
-        #[arg(conflicts_with = "container")]
-        source: Option<String>,
+        // Naming a container fully determines what gets read, so a path
+        // alongside it is meaningless.
         #[arg(conflicts_with = "container")]
         path: Option<PathBuf>,
         /// Lines of existing log to show before following new output
@@ -234,54 +227,31 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Logs {
-            source,
             path,
             lines,
             container,
             stack,
-        } => match resolve_logs_target(source, path) {
-            Ok((source, path)) => {
-                // Detection only runs when nothing else has answered, so a
-                // configured operator never pays for a `docker ps` spawn. Note
-                // `path` here is the *resolved* path, which is what catches the
-                // lone-positional case where a path arrived in `source`.
-                //
-                // This condition must stay the logical negation of every branch
-                // in `logs::resolve_log_target` that fires before its `detected`
-                // parameter - nothing ties the two together at compile time, so
-                // a change to that ladder has to be mirrored here by hand.
-                //
-                // `matches!(source, LogSource::Teku)` mirrors the same gate
-                // `resolve_log_target` now applies to `detected`: detection only
-                // ever finds a consensus container, so a besu session has no use
-                // for it and skips the `docker ps` spawn entirely. This is a
-                // latency nicety only - the correctness fix lives in
-                // `resolve_log_target`, which is the tested ladder.
-                let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
-                let needs_detection = container.is_none()
-                    && path.is_none()
-                    && env::var("TEKOPS_CONTAINER").is_err()
-                    && !(matches!(source, LogSource::Teku) && logs_file_env.is_some())
-                    && matches!(source, LogSource::Teku);
-                // Ambiguity here falls through to the rest of `resolve_log_target`'s
-                // ladder rather than hard-failing the session, which would apply
-                // `detect_or_note`'s own refusal one layer too aggressively on a
-                // mixed host that also has a real /var/log/teku/teku.log - if the
-                // fallback file is also missing, `detect_or_note`'s note plus that
-                // error together say exactly what happened.
-                let detected = if needs_detection {
-                    let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
-                    docker_ps_names().and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
-                } else {
-                    None
-                };
-                run_logs(source, path, lines, container, detected)
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        } => {
+            // Detection only runs when nothing else has answered, so a
+            // configured operator never pays for a `docker ps` spawn.
+            //
+            // This condition must stay the logical negation of every branch
+            // in `logs::resolve_log_target` that fires before its `detected`
+            // parameter - nothing ties the two together at compile time, so
+            // a change to that ladder has to be mirrored here by hand.
+            let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
+            let needs_detection = container.is_none()
+                && path.is_none()
+                && env::var("TEKOPS_CONTAINER").is_err()
+                && logs_file_env.is_none();
+            let detected = if needs_detection {
+                let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok());
+                docker_ps_names().and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
+            } else {
+                None
+            };
+            run_logs(path, lines, container, detected)
+        }
         Commands::Beacon { command, api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok());
             let client = BeaconClient::new(resolve_base_url(api.api_url, stack));
@@ -989,42 +959,28 @@ mod tests {
     }
 
     #[test]
-    fn logs_without_source_parses_with_source_none() {
+    fn logs_without_a_path_parses_with_path_none() {
         let cli = Cli::try_parse_from(["tekops", "logs"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Logs {
-                source: None,
-                path: None,
-                ..
-            }
-        ));
+        assert!(matches!(cli.command, Commands::Logs { path: None, .. }));
     }
 
+    // `teku` and `besu` are now ordinary path arguments - the source concept
+    // is gone, so this word carries no special meaning any more.
     #[test]
-    fn logs_with_explicit_source_still_parses() {
+    fn logs_besu_now_parses_as_an_ordinary_path() {
         let cli = Cli::try_parse_from(["tekops", "logs", "besu"]).unwrap();
         match cli.command {
-            Commands::Logs { source, path, .. } => {
-                assert_eq!(source.as_deref(), Some("besu"));
-                assert_eq!(path, None);
-            }
+            Commands::Logs { path, .. } => assert_eq!(path, Some(PathBuf::from("besu"))),
             _ => panic!("expected a Logs command"),
         }
     }
 
-    // Regression: clap used to type this positional as a LogSource, so a bare
-    // path was rejected outright with "invalid value for [SOURCE]" despite
-    // being the form USAGE.md documents. Meaning is assigned by
-    // logs::resolve_logs_target, which is where the behaviour is tested; this
-    // only asserts the parser lets a path through at all.
     #[test]
     fn logs_accepts_a_bare_path_as_the_first_positional() {
         let cli = Cli::try_parse_from(["tekops", "logs", "/var/log/x.log"]).unwrap();
         match cli.command {
-            Commands::Logs { source, path, .. } => {
-                assert_eq!(source.as_deref(), Some("/var/log/x.log"));
-                assert_eq!(path, None);
+            Commands::Logs { path, .. } => {
+                assert_eq!(path, Some(PathBuf::from("/var/log/x.log")))
             }
             _ => panic!("expected a Logs command"),
         }
@@ -1052,16 +1008,10 @@ mod tests {
     }
 
     #[test]
-    fn logs_line_count_combines_with_source_and_path() {
-        let cli = Cli::try_parse_from(["tekops", "logs", "besu", "/tmp/x.log", "-n", "7"]).unwrap();
+    fn logs_line_count_combines_with_a_path() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "/tmp/x.log", "-n", "7"]).unwrap();
         match cli.command {
-            Commands::Logs {
-                source,
-                path,
-                lines,
-                ..
-            } => {
-                assert_eq!(source.as_deref(), Some("besu"));
+            Commands::Logs { path, lines, .. } => {
                 assert_eq!(path, Some(PathBuf::from("/tmp/x.log")));
                 assert_eq!(lines, 7);
             }
@@ -1632,18 +1582,9 @@ mod tests {
 
     /// A path and a container name are two answers to one question, so clap
     /// rejects them together rather than leaving a precedence rule to invent.
-    /// Both positionals are guarded: a lone path arrives in `source`, not
-    /// `path`, so guarding only the latter would miss the common spelling.
     #[test]
     fn a_path_and_a_container_cannot_both_be_given() {
-        assert!(
-            Cli::try_parse_from(["tekops", "logs", "/a.log", "--container", "c"]).is_err(),
-            "a lone positional path lands in `source` and must still conflict"
-        );
-        assert!(
-            Cli::try_parse_from(["tekops", "logs", "teku", "/a.log", "--container", "c"]).is_err(),
-            "both positionals given must also conflict"
-        );
+        assert!(Cli::try_parse_from(["tekops", "logs", "/a.log", "--container", "c"]).is_err());
     }
 
     #[test]
