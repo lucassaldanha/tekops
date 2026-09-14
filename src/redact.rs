@@ -77,12 +77,17 @@ pub struct Redactor {
 
 /// The characters that end a token.
 ///
-/// `.` `:` `-` `_` and `@` are deliberately *not* here: they have to stay
-/// inside tokens so an IPv4 address, an IPv6 address, a `user:pass@host` and a
-/// hostname each arrive as one piece. `/` is here so the addresses inside a
-/// multiaddr (`/ip4/1.2.3.4/tcp/9000`) split out on their own; the two things
-/// that genuinely need `/` kept (URLs and `/home/<user>` paths) are handled by
+/// `.` `:` `-` and `_` are deliberately *not* here: they have to stay inside
+/// tokens so an IPv4 address, an IPv6 address and a hostname each arrive as
+/// one piece. `/` is here so the addresses inside a multiaddr
+/// (`/ip4/1.2.3.4/tcp/9000`) split out on their own; the two things that
+/// genuinely need `/` kept (URLs and `/home/<user>` paths) are handled by
 /// pre-passes that run before this tokenizer ever sees them.
+///
+/// `@` *is* a delimiter, which is not obvious: keeping it would make
+/// `user:pass@host` one token, but `redact_urls` has already replaced any
+/// userinfo by the time this runs, so all keeping it achieves is gluing a
+/// leading `@` onto the host and stopping that host being recognised as an IP.
 ///
 /// `|` is included because Teku puts literal pipes inside its own messages
 /// (`Configuration | Network: hoodi`).
@@ -90,7 +95,21 @@ fn is_delim(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,
-            '/' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '=' | '<' | '>' | ';' | '|'
+            '/' | ','
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '"'
+                | '\''
+                | '='
+                | '<'
+                | '>'
+                | ';'
+                | '|'
+                | '@'
         )
 }
 
@@ -215,6 +234,23 @@ const VALIDATOR_ANCHORS: [&str; 5] = [
 /// line.
 const HOST_ANCHORS: [&str; 2] = ["host", "hostname"];
 
+/// Whether a URL path segment looks like a credential rather than a word.
+///
+/// Long, alphanumeric-plus-`-_`, and mixing digits and letters: that is the
+/// shape of an Infura project id, an Alchemy key or a signed token, and it is
+/// not the shape of `eth`, `v1`, `node` or `syncing`.
+fn is_opaque_secret(seg: &str) -> bool {
+    seg.len() >= 20
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && seg.chars().any(|c| c.is_ascii_digit())
+        && seg.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The path prefixes whose next segment is a username.
+const HOME_PREFIXES: [&str; 2] = ["/home/", "/Users/"];
+
 /// Classification that depends on the preceding token.
 ///
 /// Needed because a validator index has no shape of its own - it is a bare
@@ -225,7 +261,9 @@ fn anchored(tok: &str, prev: Option<&str>) -> Option<Category> {
     if prev == "graffiti" {
         return Some(Category::Graffiti);
     }
-    if VALIDATOR_ANCHORS.contains(&prev) && !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit())
+    if VALIDATOR_ANCHORS.contains(&prev)
+        && !tok.is_empty()
+        && tok.chars().all(|c| c.is_ascii_digit())
     {
         return Some(Category::Validator);
     }
@@ -264,8 +302,118 @@ impl Redactor {
         format!("<{}-{}>", cat.prefix(), n)
     }
 
+    /// URLs first, then home paths, then the tokenizer.
+    ///
+    /// Both pre-passes need `/` to still be part of the text, which the
+    /// tokenizer destroys. They emit `<secret-1>`-style placeholders whose
+    /// `<` and `>` are delimiters, so the tokenizer re-splits them into inert
+    /// words and leaves them alone.
     pub fn redact(&mut self, line: &str) -> String {
-        self.redact_tokens(line)
+        let urls = self.redact_urls(line);
+        let homes = self.redact_home_paths(&urls);
+        self.redact_tokens(&homes)
+    }
+
+    /// Replaces the username segment of `/home/<user>/…` and `/Users/<user>/…`.
+    ///
+    /// A pre-pass rather than a tokenizer rule, because `/` has to stay a
+    /// delimiter for multiaddrs, which means the tokenizer can never see a
+    /// path as one piece. Running before it also keeps the rule precise: only
+    /// a segment directly following one of these two literal prefixes is a
+    /// username, so the word after a bare "home" in prose is untouched.
+    fn redact_home_paths(&mut self, line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some((at, plen)) = HOME_PREFIXES
+            .iter()
+            .filter_map(|p| rest.find(p).map(|i| (i, p.len())))
+            .min_by_key(|(i, _)| *i)
+        {
+            let seg_start = at + plen;
+            let seg_end = rest[seg_start..]
+                .find(|c: char| c == '/' || is_delim(c))
+                .map(|i| seg_start + i)
+                .unwrap_or(rest.len());
+            out.push_str(&rest[..seg_start]);
+            let seg = &rest[seg_start..seg_end];
+            if !seg.is_empty() {
+                let replacement = self.token(Category::User, seg);
+                out.push_str(&replacement);
+            }
+            rest = &rest[seg_end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Replaces credentials inside URLs.
+    ///
+    /// Also a pre-pass, and for a sharper reason than home paths: the secret
+    /// is a *path segment*, and the tokenizer splits on `/`, so by the time it
+    /// runs the segment has lost the context that made it a secret. Judging a
+    /// long opaque token by shape alone anywhere in a line would be far too
+    /// eager and would eventually eat a hash that matters.
+    fn redact_urls(&mut self, line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(pos) = rest.find("://") {
+            // Walk back over the scheme by char, never by byte, so a
+            // multi-byte character before the scheme cannot split a boundary.
+            let mut scheme_start = pos;
+            for (i, c) in rest[..pos].char_indices().rev() {
+                if c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-' {
+                    scheme_start = i;
+                } else {
+                    break;
+                }
+            }
+            let after = pos + 3;
+            let end = rest[after..]
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '"' | '\'' | '<' | '>' | ',' | ';' | ')' | ']' | '}' | '|'
+                        )
+                })
+                .map(|i| after + i)
+                .unwrap_or(rest.len());
+            out.push_str(&rest[..scheme_start]);
+            let url = rest[scheme_start..end].to_string();
+            out.push_str(&self.redact_one_url(&url));
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn redact_one_url(&mut self, url: &str) -> String {
+        let Some((scheme, remainder)) = url.split_once("://") else {
+            return url.to_string();
+        };
+        let auth_end = remainder.find('/').unwrap_or(remainder.len());
+        let (authority, path) = remainder.split_at(auth_end);
+        // The host is left for the tokenizer, which redacts it only if it is
+        // an IP. Which provider a node talks to is diagnostic; the key is not.
+        let authority = match authority.rsplit_once('@') {
+            Some((userinfo, host)) if !userinfo.is_empty() => {
+                format!("{}@{}", self.token(Category::Secret, userinfo), host)
+            }
+            _ => authority.to_string(),
+        };
+        let mut path_out = String::new();
+        for (i, seg) in path.split('/').enumerate() {
+            if i > 0 {
+                path_out.push('/');
+            }
+            if is_opaque_secret(seg) {
+                let replacement = self.token(Category::Secret, seg);
+                path_out.push_str(&replacement);
+            } else {
+                path_out.push_str(seg);
+            }
+        }
+        format!("{scheme}://{authority}{path_out}")
     }
 
     /// Splits on delimiters, classifies each token, and re-emits every
@@ -362,7 +510,10 @@ mod tests {
     #[test]
     fn ipv4_addresses_are_redacted() {
         let mut r = Redactor::new();
-        assert_eq!(r.redact("peer at 93.184.216.34 left"), "peer at <ip-1> left");
+        assert_eq!(
+            r.redact("peer at 93.184.216.34 left"),
+            "peer at <ip-1> left"
+        );
     }
 
     /// The addresses inside a multiaddr have to come out even though the whole
@@ -388,7 +539,10 @@ mod tests {
     fn ipv6_addresses_are_redacted() {
         let mut r = Redactor::new();
         assert_eq!(r.redact("peer at 2001:db8::1 left"), "peer at <ip-1> left");
-        assert_eq!(r.redact("2001:0db8:0000:0000:0000:ff00:0042:8329"), "<ip-2>");
+        assert_eq!(
+            r.redact("2001:0db8:0000:0000:0000:ff00:0042:8329"),
+            "<ip-2>"
+        );
     }
 
     /// The dangerous IPv6 false positive. `01:16:54` is two colons and three
@@ -465,7 +619,10 @@ mod tests {
             "Validator <validator-1> missed"
         );
         assert_eq!(r.redact("index=471293"), "index=<validator-1>");
-        assert_eq!(r.redact("validator_index: 8"), "validator_index: <validator-2>");
+        assert_eq!(
+            r.redact("validator_index: 8"),
+            "validator_index: <validator-2>"
+        );
     }
 
     /// Indices have no distinguishing shape - they are bare integers, exactly
@@ -482,7 +639,10 @@ mod tests {
     #[test]
     fn graffiti_is_redacted() {
         let mut r = Redactor::new();
-        assert_eq!(r.redact("graffiti: \"my-node\""), "graffiti: \"<graffiti-1>\"");
+        assert_eq!(
+            r.redact("graffiti: \"my-node\""),
+            "graffiti: \"<graffiti-1>\""
+        );
     }
 
     #[test]
@@ -499,5 +659,118 @@ mod tests {
     fn node_is_not_a_host_anchor() {
         let mut r = Redactor::new();
         assert_eq!(r.redact("node is syncing"), "node is syncing");
+    }
+
+    #[test]
+    fn a_username_in_a_home_path_is_redacted_and_the_rest_of_the_path_survives() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("data dir /home/lucas/teku/beacon"),
+            "data dir /home/<user-1>/teku/beacon"
+        );
+        assert_eq!(
+            r.redact("/Users/lucas/Library/teku"),
+            "/Users/<user-1>/Library/teku"
+        );
+    }
+
+    #[test]
+    fn a_bare_home_prefix_with_no_segment_is_left_alone() {
+        let mut r = Redactor::new();
+        assert_eq!(r.redact("under /home/ somewhere"), "under /home/ somewhere");
+    }
+
+    /// The sleeper case. A hosted execution endpoint carries its API key in
+    /// the URL path, and Teku logs its EL endpoint at startup.
+    #[test]
+    fn an_api_key_in_a_url_path_is_redacted_and_the_provider_survives() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("eth1-endpoint https://mainnet.infura.io/v3/9f2c1a4b7d3e5f6a8b9c0d1e2f3a4b5c"),
+            "eth1-endpoint https://mainnet.infura.io/v3/<secret-1>"
+        );
+    }
+
+    #[test]
+    fn url_userinfo_is_redacted_and_the_host_is_still_classified() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("connecting to http://user:hunter2@10.0.0.5:8551"),
+            "connecting to http://<secret-1>@<ip-1>:8551"
+        );
+    }
+
+    /// Ordinary URL path words must survive, or every log line mentioning an
+    /// endpoint turns to soup.
+    #[test]
+    fn ordinary_url_paths_are_preserved() {
+        let mut r = Redactor::new();
+        let line = "GET http://localhost:5051/eth/v1/node/syncing";
+        assert_eq!(r.redact(line), line);
+        assert_eq!(r.summary().values, 0);
+    }
+
+    #[test]
+    fn trailing_punctuation_after_a_url_is_not_swallowed() {
+        let mut r = Redactor::new();
+        assert_eq!(
+            r.redact("see (http://localhost:5051/eth), ok"),
+            "see (http://localhost:5051/eth), ok"
+        );
+    }
+
+    /// Everything a maintainer needs in order to read the dump at all.
+    ///
+    /// Over-redaction and under-redaction are both failures of this module,
+    /// and this is the over-redaction half. If any of these starts being
+    /// replaced, the command has stopped being useful even though it is still
+    /// "safe".
+    #[test]
+    fn diagnostic_values_are_never_redacted() {
+        let cases = [
+            "2026-09-14 21:14:02.117 INFO  - Syncing",
+            "01:16:54.217 WARN  - slow",
+            "teku/v25.1.0",
+            "besu/v24.9.1/linux-x86_64/openjdk-java-21",
+            "slot 12034887 epoch 376090",
+            "peers 42 in 8 out",
+            "took 1503 ms, 4096 bytes",
+            "port 9000 tcp 9001 udp",
+            "0xa1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+            "java.lang.IllegalStateException: not ready",
+            "tech.pegasys.teku.networking.p2p.libp2p.LibP2PNetwork",
+            "Configuration | Network: hoodi",
+            "GET /eth/v1/node/syncing 200",
+            "MemAvailable: 16384 kB",
+            "node is syncing",
+        ];
+        for case in cases {
+            let mut r = Redactor::new();
+            assert_eq!(
+                r.redact(case),
+                case,
+                "should not have been redacted: {case}"
+            );
+            assert_eq!(r.summary().values, 0, "unexpected redaction in: {case}");
+        }
+    }
+
+    /// The mirror of the table above: each category still fires. Guards
+    /// against "fixing" an over-match by quietly disabling a rule outright.
+    #[test]
+    fn every_category_still_fires() {
+        let mut r = Redactor::new();
+        r.redact("93.184.216.34");
+        r.redact("2001:db8::1");
+        r.redact("16Uiu2HAmPk9dR3aBcDeFgHjKmNpQrStUvWxYz1234567");
+        r.redact("enr:-AAA");
+        r.redact(&format!("0x{}", hex(96)));
+        r.redact(&format!("0x{}", hex(40)));
+        r.redact("/home/lucas/x");
+        r.redact("https://h.io/v3/9f2c1a4b7d3e5f6a8b9c0d1e");
+        r.redact("validator 12");
+        r.redact("graffiti: hi");
+        r.redact("host=box");
+        assert_eq!(r.summary().categories, 10);
     }
 }
