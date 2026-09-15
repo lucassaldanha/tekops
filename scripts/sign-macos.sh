@@ -134,40 +134,47 @@ if ! printf '%s' "$submit_output" | grep -q "status: Accepted"; then
   exit 1
 fi
 
-# -R "=notarized" asks whether a ticket for this exact code is visible. On an
-# unstapled binary there is nothing on disk to read, so it is resolved over the
-# network and then cached locally - which makes it a *propagation* check, not
-# the authority. `status: Accepted` above is the authority: that is Apple
-# stating the ticket was issued.
+# Gatekeeper's own assessment, which is the only check here that asks the
+# question an end user's machine will actually ask. `spctl` performs the live
+# ticket lookup against Apple rather than reading local state.
 #
-# The lag between the two is real and was measured here, not assumed: minutes
-# after a submission came back Accepted this failed on the built binary, and
-# passed on the same unchanged bytes shortly after. A cold CI runner checking
-# seconds after Accepted is the likeliest case of all to see it.
+# Two details are load-bearing and both were established by experiment against
+# the real v0.8.0 asset, not read off a man page:
 #
-# So: retry, and then warn rather than fail. Failing a release over propagation
-# lag would block it in exactly the case where everything worked, and the thing
-# this script exists to prevent - shipping a binary that was never notarized -
-# is already caught by the Accepted check above, which cannot lag.
+#   `-t open --context context:primary-signature` is the assessment for a plain
+#   file. The more obvious `-t exec` answers "rejected (the code is valid but
+#   does not seem to be an app)" on a bare command-line binary whether or not it
+#   is notarized, because it expects a bundle - a false negative that looks
+#   exactly like a real one.
+#
+#   `codesign -R "=notarized"` is NOT a substitute and was wrong here before.
+#   It consults only locally-held state: a stapled ticket, or a result some
+#   earlier assessment already cached. It never performs the lookup itself. So
+#   on any machine that has not already assessed this exact code - every fresh
+#   CI runner, and anyone verifying a download - it reports failure for a binary
+#   that is genuinely notarized. Measured on the v0.8.0 asset: codesign said no,
+#   Apple's ticket service returned a signed DeveloperIDTicket for that cdhash,
+#   and spctl said "accepted / source=Notarized Developer ID". Running spctl
+#   first is what makes a subsequent codesign check pass, which is also what
+#   made this look like propagation lag when it is nothing of the kind.
+#
+# Retried only to ride out a network blip. A settled rejection is fatal, since
+# it means the binary is not notarized, which is the one outcome this script
+# exists to prevent.
 notarized=""
-for attempt in 1 2 3 4 5; do
-  if codesign --verify --strict -R "=notarized" --verbose=2 "$binary"; then
+for attempt in 1 2 3; do
+  if spctl --assess -vv -t open --context context:primary-signature "$binary"; then
     notarized="yes"
     break
   fi
-  if [ "$attempt" != "5" ]; then
-    echo "macos signing: ticket not visible yet (attempt $attempt of 5), retrying in 15s"
-    sleep 15
+  if [ "$attempt" != "3" ]; then
+    echo "macos signing: assessment failed (attempt $attempt of 3), retrying in 10s"
+    sleep 10
   fi
 done
 
-if [ -n "$notarized" ]; then
-  echo "macos signing: $binary is signed and notarized (unstapled by design)"
-else
-  echo "macos signing: WARNING - notarization was Accepted but the ticket is not yet" >&2
-  echo "macos signing: WARNING - visible to this machine. The binary is signed and the" >&2
-  echo "macos signing: WARNING - submission succeeded; Gatekeeper resolves the ticket" >&2
-  echo "macos signing: WARNING - online on first run. Re-check with:" >&2
-  echo "macos signing: WARNING -   codesign --verify --strict -R \"=notarized\" -vv <binary>" >&2
-  echo "macos signing: $binary is signed and notarized (ticket not yet visible here)"
+if [ -z "$notarized" ]; then
+  echo "macos signing: Gatekeeper did not accept $binary as notarized" >&2
+  exit 1
 fi
+echo "macos signing: $binary is signed and notarized (unstapled by design)"
