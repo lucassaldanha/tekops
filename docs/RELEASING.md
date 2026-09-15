@@ -170,7 +170,15 @@ has to be there and stay there. This is the whole list.
    covers it, and a target added outside the pinned toolchain is a second place
    for it to go stale. **Do not `brew install rust`.** A Homebrew Rust ignores
    `rust-toolchain.toml` in silence, which is the exact condition
-   `scripts/check-toolchain.sh` fails the release on.
+   `scripts/check-toolchain.sh` fails the release on, and on an Intel Mac it
+   installs into `/usr/local/bin`, which is on launchd's default `PATH` and can
+   therefore end up ahead of the rustup shim.
+
+   `brew install rustup` is a real rustup and does work, but it is the worse
+   path here: the formula is keg-only because it conflicts with `rust`, so it
+   symlinks nothing and needs `$(brew --prefix rustup)/bin` on `PATH` on top of
+   the `~/.cargo/bin` the toolchains still install into. Two entries to get
+   right instead of one, for no gain.
 
 4. **`~/.cargo/bin` on the *runner's* `PATH`, which is not your shell's.** This
    is the sharp edge, and it produces a failure that reads as if Rust were
