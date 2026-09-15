@@ -290,7 +290,9 @@ at its first step otherwise.
 
 `scripts/test-prepare-release.sh` exercises the bump script against a
 throwaway clone with a bare repository standing in for origin, so the
-validation rules can be changed without a real release as the test.
+validation rules can be changed without a real release as the test. It is a
+standalone script, like `scripts/test-check-version.sh` - neither is part of
+`scripts/check.sh`, so neither runs on pre-push.
 
 Then:
 
@@ -315,6 +317,193 @@ Then:
    `spctl -t exec` is also wrong here: on a bare command-line binary it reports
    `rejected (the code is valid but does not seem to be an app)` regardless of
    notarization, because it expects a bundle.
+
+## Building and the local gate
+
+These two are day-to-day rather than release-day, but they are the same
+machinery and the reasoning belongs next to it.
+
+### `scripts/check.sh`
+
+Work happens directly on `master` pre-1.0 - worktrees to keep parallel work
+separate, not branches-plus-PRs - so nothing between the editor and `origin`
+reviews a change. `check.sh` is that review: it runs the same three gates as
+`ci.yml`, in the same order, and `.githooks/pre-push` runs it on every push.
+`git push --no-verify` skips it.
+
+The hook is versioned in `.githooks/` rather than living in `.git/hooks/`, so it
+travels with the repo. `git config core.hooksPath .githooks` is what activates
+it and has to be run once per clone. A push that only deletes refs exits early
+rather than building anything.
+
+`tests/ci_gates.rs` is what keeps the promise honest. `check.sh` is only useful
+if passing it locally means CI passes too, and the two files are in different
+languages with nothing reading the other, so the test parses the cargo
+invocations out of both and asserts they are the same list in the same order. A
+gate added, removed or reworded on one side fails there rather than as a
+surprise red build after a push that was supposed to be pre-verified. Its
+failure message prints both lists, so the drift is visible without opening
+either file.
+
+### Cross-compiling for the node
+
+    scripts/build-release.sh x86_64-unknown-linux-musl
+    scp dist/tekops-v*-x86_64-linux.tar.gz <node>:
+
+Don't hand-roll a `docker run` for this; the script is what CI runs, and a
+hand-typed variant produces a binary that won't hash the same.
+
+**The dev machine's Rust is Homebrew-installed, not `rustup`.** There is no
+`rustup target add` there, and the `cross` tool doesn't work either - it shells
+out to `rustup toolchain list` even though the actual build runs in Docker -
+which is why the Linux targets build inside a container at all. The script
+forces `--platform linux/amd64`, since that machine is Apple Silicon and Docker
+would otherwise pick an `aarch64` image.
+
+Both Linux binaries are statically linked with no runtime deps on the node
+(`file` confirms `static-pie linked` for x86_64 and `statically linked` for
+aarch64), so nothing but that one file has to reach it.
+
+## How the workflows are shaped
+
+Everything above is what to type. This section is why the pieces are arranged
+the way they are, for whoever next changes `release.yml`, `ci.yml` or the
+scripts they call.
+
+### `prepare` is a job, not steps on `verify`
+
+A dispatched run bumps the version first; a hand-pushed `v*` tag has already
+had that done. `prepare` is the one place the two paths differ, so it exists as
+a job that both resolve through, emitting the same pair of outputs (`tag`,
+`sha`) that every later job checks out and publishes. Nothing downstream
+special-cases the trigger.
+
+Three things about that shape are load-bearing:
+
+- **The tag is created last**, by `gh release create --target <sha>` in the
+  `release` job, so a failed build leaves a revertable bump commit rather than a
+  tag pointing at a release that was never published - and the same version can
+  be dispatched again without deleting anything.
+- **Every job checks out `needs.prepare.outputs.sha` explicitly.** A
+  `workflow_dispatch` run's default ref is the branch as it stood when the run
+  started, which is the commit *before* the bump. The default checkout would
+  build the old version and fail `check-version.sh`.
+- **The bump commit is pushed with the default `GITHUB_TOKEN`**, which by design
+  does not trigger workflows, so `prepare` pushing to master cannot set off a
+  second release run. If that push is ever switched to a PAT, it will.
+
+`prepare-release.sh` refuses a version that is not `X.Y.Z`, one whose tag
+already exists, or one that does not `sort -V` above the current manifest - the
+typo case, which the tag check cannot see because that tag genuinely does not
+exist yet. It also runs `cargo metadata --locked` before pushing, so a
+`Cargo.lock` that `--locked` would reject fails there rather than in `verify`,
+after the commit has landed.
+
+### Pins
+
+- **Container images are pinned by `@sha256:` digest, never by tag.**
+  `clux/muslrust:stable` moves whenever Rust ships, so the same tag yields a
+  different compiler and the published checksums stop meaning anything. Refresh
+  a digest with `docker pull` followed by
+  `docker inspect --format='{{index .RepoDigests 0}}'`.
+- **`rust-toolchain.toml` pins an exact version, never `stable`.** It is a
+  rustup feature, and the dev machine runs Homebrew Rust, so it is silently
+  ignored on a bare host build and governs only CI and the containers - verified:
+  the image bundles Rust 1.96.1 but `rustc --version` inside it reports the
+  pinned 1.98.0. Local reproducibility checks must therefore go through
+  `scripts/build-release.sh`, not a host `cargo build`. Neither workflow
+  installs a toolchain of its own, precisely so this file stays the only source
+  of truth.
+
+  That silence is why `scripts/check-toolchain.sh` exists and why the macOS
+  build calls it. A GitHub-hosted runner ships rustup, so the pin binds for free
+  and the check can only pass there; the self-hosted builder's Rust is whatever
+  was installed on it, and the macOS leg is the only job that compiles on the
+  host rather than inside the pinned container. An unpinned compiler produces a
+  working binary and reports nothing, so without the check the drift has no
+  symptom at all - it just ships. The check reads the effective
+  `rustc --version` rather than `rustup show`, since something ahead of the shim
+  on `PATH` is what cargo would actually run. On the dev machine it fails by
+  design, and the version it names (Homebrew's 1.98.1 against the pinned
+  1.98.0) is the drift it is built to catch.
+- **Every build passes `--locked`**, so a drifted `Cargo.lock` fails the build
+  instead of quietly resolving a different dependency graph.
+
+### `release` depends on every build job
+
+A macOS failure means no release at all, including the Linux binaries. Assets
+that disagree about which platforms a version supports are worse than no assets.
+
+That is also why the signing step is **not** allowed to soft-fail. The
+certificate expires (Developer ID certificates last five years) and the API key
+can be revoked; either one lapsing blocks the Linux assets too, which is the
+same trade this line already makes deliberately. A release whose macOS asset is
+silently unsigned is the assets-disagree failure in a quieter form.
+
+### What `sign-macos.sh` guarantees
+
+It runs from `build-release.sh`'s `aarch64-apple-darwin` arm, between the
+`cargo build` and the packaging, so the tarball carries the signed binary and
+`SHA256SUMS` - computed later, in the `release` job - covers it with no change.
+
+- **An absent `MACOS_CERT_P12` is a no-op with a printed note, but a *partial*
+  environment is a hard failure.** The script sits in the same
+  `build-release.sh` that runs on the dev machine, which has none of the
+  material and must keep building that target. A half-set environment, by
+  contrast, can only mean the workflow's secrets drifted, and quietly shipping
+  an unsigned binary is the exact outcome the script exists to prevent.
+- **`release.yml` names the secrets in a second, `if:`-gated build step rather
+  than on the shared one.** Both steps run the same command. Naming the secrets
+  once unconditionally would put the signing key in the environment of the two
+  Linux runners as well, which sign nothing.
+- **The notarization result is read out of notarytool's output, not from its
+  exit code.** Older `notarytool submit --wait` exits 0 on a submission it
+  waited for and that came back `Invalid`. The script greps for
+  `status: Accepted`, which is the authority here: that is Apple stating a
+  ticket was issued, and it cannot lag.
+- **The assessment is `spctl -t open --context context:primary-signature`.** The
+  reasoning, including why `codesign -R "=notarized"` and `-t exec` are both
+  wrong for it, is under [Cutting a release](#cutting-a-release) - it was got
+  wrong twice before settling. `spctl` performs a live lookup, so it needs
+  network and is retried for blips only; a settled rejection is fatal.
+- **The signing identity is read back out of the throwaway keychain, not passed
+  in as a sixth secret.** That keychain holds exactly the certificate just
+  imported, so "not exactly one Developer ID Application identity" means the
+  `.p12` was not what it claimed to be, and is an error rather than a guess.
+  `security set-key-partition-list` is what keeps `codesign` from hanging on a
+  confirmation dialog no runner could answer, and the keychain search list is
+  saved and restored by the `EXIT` trap because the script can also run on a
+  real machine.
+
+### `ci.yml`
+
+`cargo fmt --all -- --check`, then tests, then clippy, on every push and PR. The
+formatting gate goes first because it is the cheapest to fail, and it exists
+because without it the tree silently drifted to 166 rustfmt hunks across 11
+files. `rustfmt` is listed in `rust-toolchain.toml`'s components so that step
+does not depend on the runner image happening to ship it.
+
+### What "reproducible" covers
+
+The claim covers the **binary**, not the tarball, and Linux only. tar metadata
+differs between GNU tar in the container and bsdtar on macOS, and the macOS
+runner image (Xcode, SDK) drifts on GitHub's schedule and cannot be pinned.
+
+The macOS binary is additionally **not reproducible by construction**, not
+merely in practice: `codesign --timestamp` embeds a secure timestamp fetched
+from Apple's server at signing time, so two builds of the same commit differ in
+bytes no matter what else is pinned.
+
+### Asset names
+
+**Release assets are named `<arch>-<os>`, not by the cargo target triple.**
+`scripts/build-release.sh` still *takes* a triple - it has to, it passes it to
+`cargo build --target` - but each arm of its `case` also sets `asset_target`, so
+`x86_64-unknown-linux-musl` ships as `tekops-v<version>-x86_64-linux.tar.gz`.
+The triple's vendor field ("unknown") carries no information, and "musl" is
+implied because every Linux build here is static. The strings in that `case`
+must match `src/update.rs`'s `TARGET` constants exactly or `tekops update` 404s;
+see that module's entry in `docs/ARCHITECTURE.md` for the rest.
 
 ## Troubleshooting
 
