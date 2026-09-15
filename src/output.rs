@@ -1,7 +1,4 @@
-use crate::beaconapi::{
-    AttesterDuty, BlockHeader, FinalityCheckpoints, HealthState, ProposerDuty, SyncingStatus,
-    ValidatorInfo,
-};
+use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
 use crate::doctor::{Facts, Finding, Status};
 use crate::loglevel::LogLevelSpec;
 use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
@@ -145,47 +142,6 @@ pub fn format_peers_table(rows: &[PeerRow]) -> String {
             protocol.to_string(),
             count.to_string(),
             total.to_string(),
-        ]);
-    }
-    table.to_string()
-}
-
-pub fn format_validators_table(validators: &[ValidatorInfo]) -> String {
-    let mut table = Table::new();
-    table.set_header(vec!["Index", "Pubkey", "Balance", "Status"]);
-    for v in validators {
-        table.add_row(vec![
-            v.index.clone(),
-            v.pubkey.clone(),
-            v.balance.clone(),
-            v.status.clone(),
-        ]);
-    }
-    table.to_string()
-}
-
-pub fn format_attester_duties(duties: &[AttesterDuty]) -> String {
-    let mut table = Table::new();
-    table.set_header(vec!["Slot", "Validator Index", "Committee Index", "Pubkey"]);
-    for d in duties {
-        table.add_row(vec![
-            d.slot.clone(),
-            d.validator_index.clone(),
-            d.committee_index.clone(),
-            d.pubkey.clone(),
-        ]);
-    }
-    table.to_string()
-}
-
-pub fn format_proposer_duties(duties: &[ProposerDuty]) -> String {
-    let mut table = Table::new();
-    table.set_header(vec!["Slot", "Validator Index", "Pubkey"]);
-    for d in duties {
-        table.add_row(vec![
-            d.slot.clone(),
-            d.validator_index.clone(),
-            d.pubkey.clone(),
         ]);
     }
     table.to_string()
@@ -383,49 +339,6 @@ mod tests {
         assert!(table.contains('3'));
         assert!(!table.contains("p1"));
         assert!(!table.contains("connected"));
-    }
-
-    #[test]
-    fn formats_validators_table() {
-        use crate::beaconapi::ValidatorInfo;
-        let validators = vec![ValidatorInfo {
-            index: "1".to_string(),
-            pubkey: "0xabc".to_string(),
-            balance: "32000000000".to_string(),
-            status: "active_ongoing".to_string(),
-        }];
-        let table = format_validators_table(&validators);
-        assert!(table.contains("1"));
-        assert!(table.contains("0xabc"));
-        assert!(table.contains("32000000000"));
-        assert!(table.contains("active_ongoing"));
-    }
-
-    #[test]
-    fn formats_attester_duties() {
-        use crate::beaconapi::AttesterDuty;
-        let duties = vec![AttesterDuty {
-            pubkey: "0xabc".to_string(),
-            validator_index: "1".to_string(),
-            committee_index: "2".to_string(),
-            slot: "100".to_string(),
-        }];
-        let table = format_attester_duties(&duties);
-        assert!(table.contains("0xabc"));
-        assert!(table.contains("100"));
-    }
-
-    #[test]
-    fn formats_proposer_duties() {
-        use crate::beaconapi::ProposerDuty;
-        let duties = vec![ProposerDuty {
-            pubkey: "0xdef".to_string(),
-            validator_index: "3".to_string(),
-            slot: "101".to_string(),
-        }];
-        let table = format_proposer_duties(&duties);
-        assert!(table.contains("0xdef"));
-        assert!(table.contains("101"));
     }
 
     #[test]

@@ -731,7 +731,7 @@ mod tests {
             "2026-09-14 21:14:02.117 INFO  - Syncing",
             "01:16:54.217 WARN  - slow",
             "teku/v25.1.0",
-            "besu/v24.9.1/linux-x86_64/openjdk-java-21",
+            "teku/v25.1.0/linux-x86_64/openjdk-java-21",
             "slot 12034887 epoch 376090",
             "peers 42 in 8 out",
             "took 1503 ms, 4096 bytes",

@@ -16,9 +16,6 @@ config file instead - see [Configuration file](#configuration-file).
     tekops version
     tekops log-level <LEVEL> [--filter=org.example ...]
     tekops log-level <URL> [-y]
-    tekops beacon validators <index-or-pubkey>...
-    tekops beacon duties attester --epoch=N <index>...
-    tekops beacon duties proposer --epoch=N
     tekops about
     tekops autocomplete [bash|zsh|fish]
     tekops update [check|latest|<version>]
@@ -37,13 +34,12 @@ new output. `-n`/`--lines` changes that count; it is passed straight to
 next". The pre-loaded lines go into the scrollback buffer, not just on
 screen, so searching covers all of them from the moment the session starts.
 
-**`tekops logs teku` no longer works.** The `[teku|besu]` source argument was
-removed: the first positional is now always a path. Typing `teku` there reads
-as a file named `./teku` in the current directory, which almost never exists,
-so it fails with a bare "no such file" error that gives no hint why. Drop the
-word - `tekops logs` alone already tails the Teku log (or a detected
-container). Execution-client logs (Besu, or any other EL) are not supported;
-see issue #3 for that decision.
+**`tekops logs teku` no longer works.** The source-name argument was removed:
+the first positional is now always a path. Typing `teku` there reads as a file
+named `./teku` in the current directory, which almost never exists, so it fails
+with a bare "no such file" error that gives no hint why. Drop the word -
+`tekops logs` alone already tails the Teku log (or a detected container).
+Execution-client logs are not supported; see issue #3 for that decision.
 
 Under Docker the source is a container rather than a file. See
 [Docker deployments](#docker-deployments).
@@ -150,7 +146,7 @@ in front of them rather than by their shape, and why pubkeys and addresses are
 matched on an exact hex length rather than a range.
 
 **The anonymiser is pattern matching, not a guarantee.** It is good at the
-shapes Teku and Besu actually emit, and it can miss something unusual. Read
+shapes Teku actually emits, and it can miss something unusual. Read
 the file before you share it - that is what the `--gist` confirmation exists
 for.
 
@@ -202,9 +198,9 @@ case where the node is sick.
 
 ## Beacon API commands
 
-`peers`, `health`, `head`, `log-level`, and every `beacon` subcommand read the
-Beacon API. They accept `--api-url` (or `$TEKOPS_API_URL`) to point at a
-non-default endpoint (default: `http://localhost:5051`).
+`peers`, `health`, `head`, and `log-level` read the Beacon API. They accept
+`--api-url` (or `$TEKOPS_API_URL`) to point at a non-default endpoint
+(default: `http://localhost:5051`).
 
 ### peers
 
@@ -344,16 +340,6 @@ finding (versions, mount paths, container names, node error text) is
 sanitized first, the same as everything else tekops prints from data it
 didn't author.
 
-### beacon validators, beacon duties
-
-    tekops beacon validators <index-or-pubkey>...
-    tekops beacon duties attester --epoch=N <index>...
-    tekops beacon duties proposer --epoch=N
-
-`beacon validators` looks up individual validators' on-chain status via the
-Beacon API. Not to be confused with `tekops validators`, which reads local
-validator-client metrics instead.
-
 ### log-level
 
     tekops log-level info                                  # global change
@@ -365,7 +351,8 @@ Sends a `PUT` to `/teku/v1/admin/log_level` to change the node's runtime log
 level - the only mutating command `tekops` has. The level is a positional
 argument, e.g. `tekops log-level info`, sent to the API exactly as typed (no
 case normalization). Repeat `--filter` to scope the change to one or more
-logger names (e.g. `org.hyperledger.besu`, or a fully-qualified class); omit
+logger names (e.g. `tech.pegasys.teku.networking`, or a fully-qualified
+class); omit
 it entirely to change the global log level - `log_filter` is left out of the
 request body in that case rather than sent as `null` or `[]`.
 
@@ -577,9 +564,9 @@ tekops does not store credentials.
 
 ### --json
 
-Every `beacon` subcommand, plus `peers`, `health`, `head`, `log-level`,
-`duties`, `validators`, and `version`, accepts `--json` to print a
-JSON-serialized version of the parsed response instead of the table. This is
+`peers`, `health`, `head`, `log-level`, `duties`, `validators`, and `version`
+all accept `--json` to print a JSON-serialized version of the parsed response
+instead of the table. This is
 not a raw passthrough of the wire response - e.g. `peers --json` includes a
 `protocol` field that's derived locally, not sent by the API.
 

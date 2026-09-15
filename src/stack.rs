@@ -24,7 +24,7 @@ use std::fmt;
 /// `serde_matches_clap_values_for_every_variant` below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum Stack {
-    /// Teku and Besu running directly on the host.
+    /// Teku running directly on the host.
     #[value(name = "bare-metal")]
     #[serde(rename = "bare-metal")]
     BareMetal,
@@ -340,8 +340,8 @@ mod tests {
     }
 
     /// Rocket Pool's execution container is `_eth1`, one character from the
-    /// consensus one. Matching it would point `tekops logs` at Besu while
-    /// claiming to show Teku.
+    /// consensus one. Matching it would point `tekops logs` at the execution
+    /// client while claiming to show Teku.
     #[test]
     fn does_not_match_rocket_pools_execution_container() {
         let err = detect_stack("rocketpool_eth1\n", None).unwrap_err();

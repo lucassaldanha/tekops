@@ -10,10 +10,9 @@ use crate::loglevel::{
 use crate::logs::run_logs;
 use crate::metrics::MetricsClient;
 use crate::output::{
-    format_about, format_attester_duties, format_doctor_report, format_duties_table,
-    format_head_table, format_health_table, format_log_level_preview, format_peers_table,
-    format_proposer_duties, format_validator_metrics_table, format_validators_table,
-    format_version_table, PeerRow,
+    format_about, format_doctor_report, format_duties_table, format_head_table,
+    format_health_table, format_log_level_preview, format_peers_table,
+    format_validator_metrics_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
 use crate::stack::{detect_stack, DetectError, Stack};
@@ -30,7 +29,7 @@ use std::process::{Command, ExitCode};
 #[derive(Parser)]
 #[command(
     name = "tekops",
-    about = "Helper tools for operating a Teku/Besu node",
+    about = "Helper tools for operating a Teku node",
     // Reports the tekops build itself, which is distinct from `tekops version`
     // (the running Teku's version, read from the metrics endpoint). The deploy
     // model is a hand-copied binary, so a node's build is otherwise unknowable.
@@ -52,21 +51,16 @@ pub fn command() -> clap::Command {
 
 /// The Beacon API connection flags, shared by every command that talks to it
 /// rather than repeated per command.
-///
-/// `global` keeps `tekops beacon validators 1 --json` working - the flags used
-/// to be declared that way on the `beacon` command specifically, so dropping it
-/// here would silently break trailing flags on its subcommands. On the leaf
-/// commands, which have no subcommands to propagate to, it's a no-op.
 #[derive(clap::Args)]
 struct ApiArgs {
     /// Beacon API base URL (default: http://localhost:5051, or $TEKOPS_API_URL)
-    #[arg(long, global = true)]
+    #[arg(long)]
     api_url: Option<String>,
     /// Deployment to take port defaults from (or $TEKOPS_STACK)
-    #[arg(long, global = true)]
+    #[arg(long)]
     stack: Option<Stack>,
     /// Print a JSON-serialized summary instead of a formatted table
-    #[arg(long, global = true)]
+    #[arg(long)]
     json: bool,
 }
 
@@ -74,13 +68,13 @@ struct ApiArgs {
 #[derive(clap::Args)]
 struct MetricArgs {
     /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
-    #[arg(long, global = true)]
+    #[arg(long)]
     metric_url: Option<String>,
     /// Deployment to take port defaults from (or $TEKOPS_STACK)
-    #[arg(long, global = true)]
+    #[arg(long)]
     stack: Option<Stack>,
     /// Print a JSON-serialized summary instead of a formatted table
-    #[arg(long, global = true)]
+    #[arg(long)]
     json: bool,
 }
 
@@ -134,13 +128,6 @@ enum Commands {
         #[arg(long)]
         stack: Option<Stack>,
     },
-    /// Query the node's Beacon API
-    Beacon {
-        #[command(subcommand)]
-        command: BeaconCommand,
-        #[command(flatten)]
-        api: ApiArgs,
-    },
     /// List connected peers, grouped by direction/protocol, with peer counts
     Peers {
         #[command(flatten)]
@@ -177,7 +164,7 @@ enum Commands {
         /// Log level to set (e.g. INFO, DEBUG, WARN, TRACE), or an https url
         /// serving a prepared request body (e.g. a gist)
         target: String,
-        /// Logger name(s) to scope the change to (e.g. org.hyperledger.besu);
+        /// Logger name(s) to scope the change to (e.g. tech.pegasys.teku.networking);
         /// omit to change the global level. Not valid with a url, which
         /// carries its own filters
         #[arg(long = "filter")]
@@ -230,36 +217,6 @@ enum Commands {
         // overrides them, matching the repo's flags-beat-detection rule.
         #[arg(long)]
         data_dir: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum BeaconCommand {
-    /// Show status for one or more validators (by index or pubkey)
-    Validators {
-        #[arg(required = true)]
-        ids: Vec<String>,
-    },
-    /// Attester or proposer duties for a given epoch
-    Duties {
-        #[command(subcommand)]
-        kind: DutiesKind,
-    },
-}
-
-#[derive(Subcommand)]
-enum DutiesKind {
-    /// Attester duties for a set of validator indices in a given epoch
-    Attester {
-        #[arg(long)]
-        epoch: u64,
-        #[arg(required = true)]
-        indices: Vec<String>,
-    },
-    /// Proposer duties for a given epoch
-    Proposer {
-        #[arg(long)]
-        epoch: u64,
     },
 }
 
@@ -384,16 +341,6 @@ pub fn run() -> ExitCode {
                 doctor: probe,
                 now,
             }))
-        }
-        Commands::Beacon { command, api } => {
-            let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = BeaconClient::new(resolve_base_url(
-                api.api_url,
-                env::var("TEKOPS_API_URL").ok(),
-                cfg.api_url.clone(),
-                stack,
-            ));
-            run_beacon(client, command, api.json, stack)
         }
         Commands::Peers { api } => {
             let stack = resolve_stack(api.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
@@ -902,24 +849,6 @@ struct LogLevelJson<'a> {
     log_filter: Option<Vec<String>>,
 }
 
-fn run_beacon(
-    client: BeaconClient,
-    command: BeaconCommand,
-    json: bool,
-    stack: Option<Stack>,
-) -> ExitCode {
-    let result = match command {
-        BeaconCommand::Validators { ids } => beacon_validators(&client, &ids, json),
-        BeaconCommand::Duties { kind } => match kind {
-            DutiesKind::Attester { epoch, indices } => {
-                beacon_duties_attester(&client, epoch, &indices, json)
-            }
-            DutiesKind::Proposer { epoch } => beacon_duties_proposer(&client, epoch, json),
-        },
-    };
-    exit_for_api(result, stack)
-}
-
 fn beacon_health(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
     let syncing = client.syncing()?;
     let health = client.health()?;
@@ -1013,50 +942,6 @@ fn beacon_peers(client: &BeaconClient, json: bool) -> Result<(), ApiError> {
         );
     } else {
         println!("{}", format_peers_table(&rows));
-    }
-    Ok(())
-}
-
-fn beacon_validators(client: &BeaconClient, ids: &[String], json: bool) -> Result<(), ApiError> {
-    let validators = client.validators(ids)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(&validators).expect("serialize validators json")
-        );
-    } else {
-        println!("{}", format_validators_table(&validators));
-    }
-    Ok(())
-}
-
-fn beacon_duties_attester(
-    client: &BeaconClient,
-    epoch: u64,
-    indices: &[String],
-    json: bool,
-) -> Result<(), ApiError> {
-    let duties = client.duties_attester(epoch, indices)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(&duties).expect("serialize attester duties json")
-        );
-    } else {
-        println!("{}", format_attester_duties(&duties));
-    }
-    Ok(())
-}
-
-fn beacon_duties_proposer(client: &BeaconClient, epoch: u64, json: bool) -> Result<(), ApiError> {
-    let duties = client.duties_proposer(epoch)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(&duties).expect("serialize proposer duties json")
-        );
-    } else {
-        println!("{}", format_proposer_duties(&duties));
     }
     Ok(())
 }
@@ -1331,15 +1216,8 @@ fn refresh_completions(binary: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beaconapi::{AttesterDuty, ProposerDuty, ValidatorInfo};
     use crate::protocol::Protocol;
     use clap::CommandFactory;
-
-    #[test]
-    fn validators_requires_at_least_one_id() {
-        let result = Cli::try_parse_from(["tekops", "beacon", "validators"]);
-        assert!(result.is_err());
-    }
 
     #[test]
     fn logs_without_a_path_parses_with_path_none() {
@@ -1347,13 +1225,13 @@ mod tests {
         assert!(matches!(cli.command, Commands::Logs { path: None, .. }));
     }
 
-    // `teku` and `besu` are now ordinary path arguments - the source concept
-    // is gone, so this word carries no special meaning any more.
+    // `teku` used to be a source name rather than a path. The source concept
+    // is gone, so a bare word now carries no special meaning any more.
     #[test]
-    fn logs_besu_now_parses_as_an_ordinary_path() {
-        let cli = Cli::try_parse_from(["tekops", "logs", "besu"]).unwrap();
+    fn logs_a_bare_word_parses_as_an_ordinary_path() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "teku"]).unwrap();
         match cli.command {
-            Commands::Logs { path, .. } => assert_eq!(path, Some(PathBuf::from("besu"))),
+            Commands::Logs { path, .. } => assert_eq!(path, Some(PathBuf::from("teku"))),
             _ => panic!("expected a Logs command"),
         }
     }
@@ -1571,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn validators_is_a_top_level_command_distinct_from_beacon_validators() {
+    fn validators_is_a_top_level_command() {
         let cli = Cli::try_parse_from(["tekops", "validators"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -1645,13 +1523,6 @@ mod tests {
     fn about_is_a_top_level_command_taking_no_arguments() {
         let cli = Cli::try_parse_from(["tekops", "about"]).unwrap();
         assert!(matches!(cli.command, Commands::About));
-    }
-
-    #[test]
-    fn duties_attester_requires_at_least_one_index() {
-        let result =
-            Cli::try_parse_from(["tekops", "beacon", "duties", "attester", "--epoch", "1"]);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -1733,26 +1604,6 @@ mod tests {
                 assert_eq!(log_filter, vec!["org.a".to_string(), "org.b".to_string()]);
             }
             _ => panic!("expected LogLevel command"),
-        }
-    }
-
-    /// The `beacon` flags were declared `global` before they were flattened
-    /// into `ApiArgs`; without that, a flag after the subcommand stops parsing.
-    #[test]
-    fn beacon_subcommand_accepts_flags_after_the_subcommand() {
-        let cli = Cli::try_parse_from(["tekops", "beacon", "validators", "1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Beacon { api, .. } => assert!(api.json),
-            _ => panic!("expected Beacon command"),
-        }
-    }
-
-    #[test]
-    fn beacon_subcommand_accepts_flags_before_the_subcommand() {
-        let cli = Cli::try_parse_from(["tekops", "beacon", "--json", "validators", "1"]).unwrap();
-        match cli.command {
-            Commands::Beacon { api, .. } => assert!(api.json),
-            _ => panic!("expected Beacon command"),
         }
     }
 
@@ -1868,32 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn validators_json_output_is_valid_json() {
-        let validators = vec![ValidatorInfo {
-            index: "1".to_string(),
-            pubkey: "0xabc".to_string(),
-            balance: "32000000000".to_string(),
-            status: "active_ongoing".to_string(),
-        }];
-        let json = serde_json::to_string(&validators).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value[0]["index"], "1");
-    }
-
-    #[test]
-    fn attester_duties_json_output_is_valid_json() {
-        let duties = vec![AttesterDuty {
-            pubkey: "0xabc".to_string(),
-            validator_index: "1".to_string(),
-            committee_index: "2".to_string(),
-            slot: "100".to_string(),
-        }];
-        let json = serde_json::to_string(&duties).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value[0]["slot"], "100");
-    }
-
-    #[test]
     fn duties_metrics_json_output_is_valid_json() {
         use crate::metrics::DutiesMetrics;
         let metrics = DutiesMetrics {
@@ -1935,18 +1760,6 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["versions"][0], "teku/v24.9.0");
-    }
-
-    #[test]
-    fn proposer_duties_json_output_is_valid_json() {
-        let duties = vec![ProposerDuty {
-            pubkey: "0xdef".to_string(),
-            validator_index: "3".to_string(),
-            slot: "101".to_string(),
-        }];
-        let json = serde_json::to_string(&duties).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value[0]["pubkey"], "0xdef");
     }
 
     #[test]

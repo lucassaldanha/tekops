@@ -107,90 +107,11 @@ pub struct PeerInfo {
     pub direction: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ValidatorsResponse {
-    data: Vec<ValidatorEntry>,
-}
-#[derive(Debug, Deserialize)]
-struct ValidatorEntry {
-    index: String,
-    balance: String,
-    status: String,
-    validator: ValidatorDetail,
-}
-#[derive(Debug, Deserialize)]
-struct ValidatorDetail {
-    pubkey: String,
-}
-
-#[derive(Serialize)]
-pub struct ValidatorInfo {
-    pub index: String,
-    pub pubkey: String,
-    pub balance: String,
-    pub status: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AttesterDutiesResponse {
-    data: Vec<AttesterDutyEntry>,
-}
-#[derive(Debug, Deserialize)]
-struct AttesterDutyEntry {
-    pubkey: String,
-    validator_index: String,
-    committee_index: String,
-    slot: String,
-}
-
-#[derive(Serialize)]
-pub struct AttesterDuty {
-    pub pubkey: String,
-    pub validator_index: String,
-    pub committee_index: String,
-    pub slot: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProposerDutiesResponse {
-    data: Vec<ProposerDutyEntry>,
-}
-#[derive(Debug, Deserialize)]
-struct ProposerDutyEntry {
-    pubkey: String,
-    validator_index: String,
-    slot: String,
-}
-
-#[derive(Serialize)]
-pub struct ProposerDuty {
-    pub pubkey: String,
-    pub validator_index: String,
-    pub slot: String,
-}
-
 #[derive(Serialize)]
 struct LogLevelRequest {
     level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     log_filter: Option<Vec<String>>,
-}
-
-/// Percent-encodes a single query-string value. Validator ids are indices or
-/// hex pubkeys in practice, so the unreserved set covers every legitimate
-/// input untouched and only malformed ones get escaped - which is the point:
-/// they reach the server as one value instead of as extra parameters.
-fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 impl BeaconClient {
@@ -218,20 +139,6 @@ impl BeaconClient {
             .agent
             .get(&self.url(path))
             .call()
-            .map_err(map_ureq_error)?;
-        resp.into_json()
-            .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
-    }
-
-    fn post_json<T: for<'de> serde::Deserialize<'de>>(
-        &self,
-        path: &str,
-        body: impl serde::Serialize,
-    ) -> Result<T, ApiError> {
-        let resp = self
-            .agent
-            .post(&self.url(path))
-            .send_json(body)
             .map_err(map_ureq_error)?;
         resp.into_json()
             .map_err(|e| ApiError::Malformed(format!("invalid JSON: {e}")))
@@ -300,66 +207,8 @@ impl BeaconClient {
             .collect())
     }
 
-    pub fn validators(&self, ids: &[String]) -> Result<Vec<ValidatorInfo>, ApiError> {
-        // Ids are percent-encoded individually, then joined on a literal comma
-        // (which the Beacon API uses as the list separator, so it must not
-        // itself be encoded). Interpolating them raw lets an id containing `&`
-        // or `#` split into extra query parameters and silently query
-        // something other than what was asked for.
-        let query = ids
-            .iter()
-            .map(|id| percent_encode(id))
-            .collect::<Vec<_>>()
-            .join(",");
-        let path = format!("/eth/v1/beacon/states/head/validators?id={query}");
-        let parsed: ValidatorsResponse = self.get_json(&path)?;
-        Ok(parsed
-            .data
-            .into_iter()
-            .map(|v| ValidatorInfo {
-                index: v.index,
-                pubkey: v.validator.pubkey,
-                balance: v.balance,
-                status: v.status,
-            })
-            .collect())
-    }
-
-    pub fn duties_attester(
-        &self,
-        epoch: u64,
-        indices: &[String],
-    ) -> Result<Vec<AttesterDuty>, ApiError> {
-        let path = format!("/eth/v1/validator/duties/attester/{epoch}");
-        let parsed: AttesterDutiesResponse = self.post_json(&path, indices)?;
-        Ok(parsed
-            .data
-            .into_iter()
-            .map(|d| AttesterDuty {
-                pubkey: d.pubkey,
-                validator_index: d.validator_index,
-                committee_index: d.committee_index,
-                slot: d.slot,
-            })
-            .collect())
-    }
-
-    pub fn duties_proposer(&self, epoch: u64) -> Result<Vec<ProposerDuty>, ApiError> {
-        let path = format!("/eth/v1/validator/duties/proposer/{epoch}");
-        let parsed: ProposerDutiesResponse = self.get_json(&path)?;
-        Ok(parsed
-            .data
-            .into_iter()
-            .map(|d| ProposerDuty {
-                pubkey: d.pubkey,
-                validator_index: d.validator_index,
-                slot: d.slot,
-            })
-            .collect())
-    }
-
     /// Sets the node's runtime log level. `log_filter` scopes the change to
-    /// specific logger names (e.g. `org.hyperledger.besu`); `None` changes
+    /// specific logger names (e.g. `tech.pegasys.teku.networking`); `None` changes
     /// the global level, and must be omitted from the request body entirely
     /// rather than sent as `null` or `[]`.
     pub fn set_log_level(
@@ -506,107 +355,6 @@ mod tests {
         assert_eq!(peers[0].peer_id, "p1");
         assert_eq!(peers[0].last_seen_p2p_address, "/ip4/1.2.3.4/udp/9001/quic");
         assert_eq!(peers[1].last_seen_p2p_address, "/ip4/5.6.7.8/tcp/9000");
-    }
-
-    #[test]
-    fn validators_parses_list() {
-        let mut server = mockito::Server::new();
-        let body = r#"{"data":[
-            {"index":"1","balance":"32000000000","status":"active_ongoing","validator":{"pubkey":"0xabc"}}
-        ]}"#;
-        let _m = server
-            .mock("GET", "/eth/v1/beacon/states/head/validators?id=1")
-            .with_status(200)
-            .with_body(body)
-            .create();
-        let client = BeaconClient::new(server.url());
-        let validators = client.validators(&["1".to_string()]).unwrap();
-        assert_eq!(validators.len(), 1);
-        assert_eq!(validators[0].index, "1");
-        assert_eq!(validators[0].pubkey, "0xabc");
-        assert_eq!(validators[0].balance, "32000000000");
-        assert_eq!(validators[0].status, "active_ongoing");
-    }
-
-    #[test]
-    fn percent_encode_leaves_realistic_ids_untouched() {
-        assert_eq!(percent_encode("123"), "123");
-        assert_eq!(percent_encode("0xabcDEF0123"), "0xabcDEF0123");
-    }
-
-    #[test]
-    fn percent_encode_escapes_query_delimiters() {
-        assert_eq!(percent_encode("1&injected=yes"), "1%26injected%3Dyes");
-        assert_eq!(percent_encode("a b"), "a%20b");
-        assert_eq!(percent_encode("a#b"), "a%23b");
-    }
-
-    #[test]
-    fn validators_does_not_let_an_id_forge_extra_query_parameters() {
-        let mut server = mockito::Server::new();
-        // Matching on the encoded form asserts the whole hostile id arrived as
-        // a single `id` value rather than splitting into a second parameter.
-        let _m = server
-            .mock(
-                "GET",
-                "/eth/v1/beacon/states/head/validators?id=1%26injected%3Dyes",
-            )
-            .with_status(200)
-            .with_body(r#"{"data":[]}"#)
-            .create();
-        let client = BeaconClient::new(server.url());
-        client.validators(&["1&injected=yes".to_string()]).unwrap();
-        _m.assert();
-    }
-
-    #[test]
-    fn validators_joins_multiple_ids_on_an_unencoded_comma() {
-        let mut server = mockito::Server::new();
-        let _m = server
-            .mock("GET", "/eth/v1/beacon/states/head/validators?id=1,2")
-            .with_status(200)
-            .with_body(r#"{"data":[]}"#)
-            .create();
-        let client = BeaconClient::new(server.url());
-        client
-            .validators(&["1".to_string(), "2".to_string()])
-            .unwrap();
-        _m.assert();
-    }
-
-    #[test]
-    fn duties_attester_posts_indices_and_parses_response() {
-        let mut server = mockito::Server::new();
-        let body = r#"{"data":[{"pubkey":"0xabc","validator_index":"1","committee_index":"2","slot":"100"}]}"#;
-        let _m = server
-            .mock("POST", "/eth/v1/validator/duties/attester/5")
-            .with_status(200)
-            .with_body(body)
-            .create();
-        let client = BeaconClient::new(server.url());
-        let duties = client.duties_attester(5, &["1".to_string()]).unwrap();
-        assert_eq!(duties.len(), 1);
-        assert_eq!(duties[0].pubkey, "0xabc");
-        assert_eq!(duties[0].validator_index, "1");
-        assert_eq!(duties[0].committee_index, "2");
-        assert_eq!(duties[0].slot, "100");
-    }
-
-    #[test]
-    fn duties_proposer_parses_response() {
-        let mut server = mockito::Server::new();
-        let body = r#"{"data":[{"pubkey":"0xdef","validator_index":"3","slot":"101"}]}"#;
-        let _m = server
-            .mock("GET", "/eth/v1/validator/duties/proposer/5")
-            .with_status(200)
-            .with_body(body)
-            .create();
-        let client = BeaconClient::new(server.url());
-        let duties = client.duties_proposer(5).unwrap();
-        assert_eq!(duties.len(), 1);
-        assert_eq!(duties[0].pubkey, "0xdef");
-        assert_eq!(duties[0].validator_index, "3");
-        assert_eq!(duties[0].slot, "101");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # tekops
 
-Helper CLI for operating a Teku/Besu node, run directly on the node over SSH.
+Helper CLI for operating a Teku node, run directly on the node over SSH.
 
     tekops logs                  # tail and colorize the node's logs
     tekops health                # health and sync status

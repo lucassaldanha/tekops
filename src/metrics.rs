@@ -17,7 +17,7 @@ struct Sample {
     value: f64,
 }
 
-/// Parses a Prometheus text-exposition body (as served by Teku/Besu's own
+/// Parses a Prometheus text-exposition body (as served by Teku's own
 /// `/metrics` endpoint) into samples, skipping HELP/TYPE comments and blank
 /// lines. Not a general-purpose parser - just enough to read simple counter
 /// and gauge lines like `metric_name{label="value"} 42`.

@@ -580,7 +580,7 @@ mod tests {
         // emitted only the bare skeleton would still fail. `log-level` is here
         // because its kebab-case rename is the kind of thing a hand-maintained
         // script gets wrong.
-        assert!(script.contains("beacon"));
+        assert!(script.contains("dump-logs"));
         assert!(script.contains("log-level"));
         assert!(script.contains("autocomplete"));
     }

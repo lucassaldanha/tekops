@@ -62,8 +62,8 @@ pub enum UpdateTarget {
 /// to break `tekops logs`: its first positional was typed as an enum of
 /// source names, so clap rejected any value outside that set before the
 /// command ever ran - `tekops logs /var/log/x.log` failed with
-/// `invalid value for [SOURCE]: possible values teku, besu`. This mirrors the
-/// hand-matching that fixed that, down to the case-sensitivity.
+/// `invalid value for [SOURCE]`. This mirrors the hand-matching that fixed
+/// that, down to the case-sensitivity.
 pub fn resolve_update_target(arg: Option<String>) -> UpdateTarget {
     match arg.as_deref() {
         None => UpdateTarget::Prompt,
