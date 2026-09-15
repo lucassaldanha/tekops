@@ -66,6 +66,11 @@ case "$target" in
     # underneath is whatever the runner ships.
     RUSTFLAGS="--remap-path-prefix=$repo_root=." \
       cargo build --locked --release --target "$target"
+    # Sign and notarize before packaging, so the tarball carries the signed
+    # binary rather than needing a second pass over the archive. A no-op with a
+    # printed note unless MACOS_CERT_P12 and friends are in the environment,
+    # which only the release workflow arranges - see scripts/sign-macos.sh.
+    scripts/sign-macos.sh "target/$target/release/tekops"
     ;;
   *)
     echo "unsupported target: $target" >&2
@@ -90,9 +95,12 @@ cp README.md USAGE.md LICENSE config.example.toml "$stage/"
 tarball="dist/tekops-v$version-$asset_target.tar.gz"
 tar -czf "$tarball" -C "$stage" tekops README.md USAGE.md LICENSE config.example.toml
 
-# The reproducibility claim is about the binary, not the archive: tar
+# The reproducibility claim is about the Linux binaries, not the archive: tar
 # metadata differs between GNU tar in the container and bsdtar on macOS.
 # The tarball is transport; SHA256SUMS covers it for download integrity.
+# The macOS binary is not reproducible at all, by construction - the signature
+# embeds a secure timestamp fetched from Apple at signing time, so two builds
+# of the same commit differ.
 echo "built   $tarball"
 echo -n "binary sha256: "
 if command -v sha256sum >/dev/null 2>&1; then

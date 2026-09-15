@@ -1,2 +1,8 @@
 /target
 /dist
+
+# Signing material for docs/RELEASING.md. Never belongs in the tree; these
+# patterns are the backstop for a copy that lands here by accident during a
+# local signing dry run.
+*.p12
+*.p8

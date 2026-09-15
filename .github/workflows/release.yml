@@ -51,7 +51,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Two steps for one command, so the signing secrets are only ever put in
+      # the environment of the one runner that needs them. Naming them
+      # unconditionally would hand them to both Linux jobs as well, which sign
+      # nothing.
       - name: Build
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: scripts/build-release.sh "${{ matrix.target }}"
+
+      - name: Build, sign and notarize
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: scripts/build-release.sh "${{ matrix.target }}"
 
       - uses: actions/upload-artifact@v7

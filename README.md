@@ -36,10 +36,15 @@ Verify what you downloaded against `SHA256SUMS` from the same release:
     curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/SHA256SUMS"
     sha256sum -c SHA256SUMS --ignore-missing
 
-**macOS:** the binary is not signed or notarized. Downloaded with `curl` as
-above it runs normally. If you download it through a browser instead, macOS
-quarantines it and reports that the developer cannot be verified; clear that
-with:
+**macOS:** the binary is signed with a Developer ID certificate and notarized by
+Apple, so it runs without the "developer cannot be verified" prompt. It is not
+stapled, because a bare executable cannot carry a stapled notarization ticket,
+so a browser-downloaded copy needs the machine to be online the first time it
+runs while macOS checks the ticket with Apple. Downloaded with `curl` or `gh` as
+above it is never quarantined and that check never happens.
+
+Releases up to v0.7.0 are unsigned. If macOS refuses to open one of those, clear
+the quarantine flag:
 
     xattr -d com.apple.quarantine tekops
 

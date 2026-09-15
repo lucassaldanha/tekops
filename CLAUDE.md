@@ -23,6 +23,15 @@ because the on-node copy is the one an operator reads over SSH, and a README
 that only explains how to install a binary they already have would be useless
 there.
 
+`docs/RELEASING.md` is the third doc and the only one aimed at the maintainer
+rather than the operator: creating the Apple Developer ID certificate and the
+App Store Connect API key, the five repository secrets they become, the local
+dry run, and cutting a tag. **It deliberately does not ship in the tarball** -
+an operator on the node has no use for certificate renewal steps. It exists
+because that procedure is needed about once every five years, when the
+certificate expires, which is far too rare to hold in anyone's head and far too
+load-bearing to rediscover under a broken release.
+
 ## Commands
 
 ```bash
@@ -80,7 +89,19 @@ Four things here are load-bearing and each closes a specific hole:
 
 **Release assets are named `<arch>-<os>`, not by the cargo target triple.** `scripts/build-release.sh` still *takes* a triple (it has to - it passes it to `cargo build --target`), but each arm of its `case` also sets `asset_target`, so `x86_64-unknown-linux-musl` ships as `tekops-v<version>-x86_64-linux.tar.gz`. The triple's vendor field ("unknown") carries no information, and "musl" is implied because every Linux build here is static. Two consequences worth knowing before touching either side: the strings in that `case` must match `update.rs`'s `TARGET` constants exactly or `tekops update` 404s, which is why `target_matches_the_names_build_release_publishes` reads the script and asserts they agree - without it the unit tests compare the constant against itself and stay green through a rename. And releases up to v0.3.1 used triple names, so `tekops update <those versions>` cannot reach them; the change was made in the same release that introduced `tekops update`, when no shipped binary could do a rollback anyway, because every later moment would strand more releases.
 
-The reproducibility claim covers the **binary**, not the tarball, and Linux only. tar metadata differs between GNU tar in the container and bsdtar on macOS, and the macOS runner image (Xcode, SDK) drifts on GitHub's schedule and cannot be pinned, so that target is deterministic in practice rather than guaranteed.
+The reproducibility claim covers the **binary**, not the tarball, and Linux only. tar metadata differs between GNU tar in the container and bsdtar on macOS, and the macOS runner image (Xcode, SDK) drifts on GitHub's schedule and cannot be pinned. The macOS binary is additionally **not reproducible by construction**, not merely in practice: `codesign --timestamp` embeds a secure timestamp fetched from Apple's server at signing time, so two builds of the same commit differ in bytes no matter what else is pinned.
+
+**The macOS binary is signed and notarized; `scripts/sign-macos.sh` is where that happens.** It runs from `build-release.sh`'s `aarch64-apple-darwin` arm, between the `cargo build` and the packaging, so the tarball carries the signed binary and `SHA256SUMS` (computed later, in the `release` job) covers it with no change. Five things here are load-bearing:
+
+- **An absent `MACOS_CERT_P12` is a no-op with a printed note, but a *partial* environment is a hard failure.** The script sits in the same `build-release.sh` that runs on the dev machine, which has none of the material and must keep building that target; a half-set environment, by contrast, can only mean the workflow's secrets drifted, and quietly shipping an unsigned binary is the exact outcome the script exists to prevent.
+- **`release.yml` names the secrets in a second, `if:`-gated build step rather than on the shared one.** Both steps run the same command. Naming the secrets once unconditionally would put the signing key in the environment of the two Linux runners as well, which sign nothing.
+- **The binary is notarized but deliberately never stapled.** `xcrun stapler` handles `.app`, `.dmg` and `.pkg`; a bare Mach-O cannot carry a ticket, and there is no flag that changes this. Gatekeeper therefore resolves the ticket online, and only for a quarantined copy - which `curl` and `gh release download` never produce, so the documented install path never reaches that check. Shipping a stapled `.pkg` instead would work offline but changes the asset shape that `update.rs`'s `TARGET` constants and `download_url` both encode.
+- **The notarization result is read out of notarytool's output, not from its exit code.** Older `notarytool submit --wait` exits 0 on a submission it waited for and that came back `Invalid`. The script greps for `status: Accepted` and then re-verifies with `codesign -R "=notarized"`, which asks Apple whether a ticket for this exact code actually exists - the only check that separates a real acceptance from a well-formed signature.
+- **The signing identity is read back out of the throwaway keychain, not passed in as a sixth secret.** That keychain holds exactly the certificate just imported, so "not exactly one Developer ID Application identity" means the `.p12` was not what it claimed to be, and is an error rather than a guess. `security set-key-partition-list` is what keeps `codesign` from hanging on a confirmation dialog no runner could answer, and the keychain search list is saved and restored by the `EXIT` trap because the script can also run on a real machine.
+
+The certificate expires (Developer ID certificates last five years) and the API key can be revoked. Either one lapsing fails the macOS build, and since the `release` job depends on every build job, that blocks the Linux assets too. That is the same trade the `needs: build` line already makes deliberately, so the signing step is **not** allowed to soft-fail: a release whose macOS asset is silently unsigned is the assets-disagree failure in a quieter form.
+
+**The operator-facing half of this lives in `docs/RELEASING.md`** - how to create the certificate and the API key, what the five secrets are called, and the local dry run (`scripts/build-release.sh aarch64-apple-darwin` with the five variables exported) that exercises the real signing and notarization path before a tag does. Keep the two in sync in one direction only: this file explains *why* the pieces are shaped as they are, that one explains *what to type*. Don't duplicate the step-by-step here.
 
 ## Architecture
 
