@@ -127,8 +127,15 @@ you. The `gh secret list` check is what closes that gap.
 
        codesign --verify --strict -R "=notarized" -vv tekops
 
-   This asks Apple whether a notarization ticket for that exact binary actually
-   exists, rather than only checking that the signature is well-formed.
+   The binary is unstapled, so this resolves the ticket over the network and
+   caches it. **It can legitimately fail for a few minutes after notarization
+   and then pass on the same unchanged bytes.** If it fails, wait and run it
+   again before concluding anything is wrong. `sign-macos.sh` retries this five
+   times and then warns rather than failing, for the same reason.
+
+   Do not reach for `spctl -a -t exec` instead. On a bare command-line
+   executable it reports `rejected (the code is valid but does not seem to be an
+   app)` whether or not the binary is notarized, because it expects a bundle.
 
 ## Troubleshooting
 
@@ -139,6 +146,7 @@ you. The `gh secret list` check is what closes that gap.
 | `expected 1 Developer ID Application identity, found 2` | More than one identity was exported into the `.p12` |
 | `MACOS_CERT_P12 is set but <VAR> is not` | One secret is missing or misspelled |
 | `notarization was not accepted` | The notarytool output printed directly above says why |
+| `WARNING - ... the ticket is not yet visible` | Not a failure. Notarization succeeded and the binary shipped; only the online ticket lookup had not propagated within 75 seconds. Re-run the step 5 command later to confirm |
 | Build succeeds, log reads `no MACOS_CERT_P12, leaving ... unsigned` | The secret is not reaching the runner. Check the name against `release.yml` |
 
 ## Why the macOS binary is not stapled

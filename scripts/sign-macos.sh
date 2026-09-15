@@ -134,8 +134,40 @@ if ! printf '%s' "$submit_output" | grep -q "status: Accepted"; then
   exit 1
 fi
 
-# -R "=notarized" asks Apple whether a ticket for this exact code actually
-# exists, which is the only check that distinguishes a real acceptance from a
-# signature that merely looks well-formed.
-codesign --verify --strict -R "=notarized" --verbose=2 "$binary"
-echo "macos signing: $binary is signed and notarized (unstapled by design)"
+# -R "=notarized" asks whether a ticket for this exact code is visible. On an
+# unstapled binary there is nothing on disk to read, so it is resolved over the
+# network and then cached locally - which makes it a *propagation* check, not
+# the authority. `status: Accepted` above is the authority: that is Apple
+# stating the ticket was issued.
+#
+# The lag between the two is real and was measured here, not assumed: minutes
+# after a submission came back Accepted this failed on the built binary, and
+# passed on the same unchanged bytes shortly after. A cold CI runner checking
+# seconds after Accepted is the likeliest case of all to see it.
+#
+# So: retry, and then warn rather than fail. Failing a release over propagation
+# lag would block it in exactly the case where everything worked, and the thing
+# this script exists to prevent - shipping a binary that was never notarized -
+# is already caught by the Accepted check above, which cannot lag.
+notarized=""
+for attempt in 1 2 3 4 5; do
+  if codesign --verify --strict -R "=notarized" --verbose=2 "$binary"; then
+    notarized="yes"
+    break
+  fi
+  if [ "$attempt" != "5" ]; then
+    echo "macos signing: ticket not visible yet (attempt $attempt of 5), retrying in 15s"
+    sleep 15
+  fi
+done
+
+if [ -n "$notarized" ]; then
+  echo "macos signing: $binary is signed and notarized (unstapled by design)"
+else
+  echo "macos signing: WARNING - notarization was Accepted but the ticket is not yet" >&2
+  echo "macos signing: WARNING - visible to this machine. The binary is signed and the" >&2
+  echo "macos signing: WARNING - submission succeeded; Gatekeeper resolves the ticket" >&2
+  echo "macos signing: WARNING - online on first run. Re-check with:" >&2
+  echo "macos signing: WARNING -   codesign --verify --strict -R \"=notarized\" -vv <binary>" >&2
+  echo "macos signing: $binary is signed and notarized (ticket not yet visible here)"
+fi
