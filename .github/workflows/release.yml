@@ -114,6 +114,21 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
+      # The builder runs its runner as a LaunchAgent, which inherits launchd's
+      # PATH and never reads the ~/.zprofile line rustup's installer appends -
+      # so an installed, working rustup is invisible to the job and the check
+      # below reports "no rustc at all" on a machine where `rustup --version`
+      # answers fine in a terminal. The runner can be told this with a `.path`
+      # file in its own root directory, but that is state on a machine nobody
+      # can see from here and it is lost the next time the runner is
+      # reinstalled. Saying it in the workflow costs one line and cannot go
+      # missing. Adding a directory that does not exist is harmless, so the
+      # GitHub-hosted legs would not care either - the `if:` is only because
+      # they have no reason to run it.
+      - name: Put rustup's shims on PATH
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       # Only the macOS leg compiles on the host; the Linux legs compile inside
       # a digest-pinned container that carries its own toolchain. This is the
       # one place rust-toolchain.toml can be silently ignored, because the

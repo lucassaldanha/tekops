@@ -180,9 +180,12 @@ has to be there and stay there. This is the whole list.
    the `~/.cargo/bin` the toolchains still install into. Two entries to get
    right instead of one, for no gain.
 
-4. **`~/.cargo/bin` on the *runner's* `PATH`, which is not your shell's.** This
-   is the sharp edge, and it produces a failure that reads as if Rust were
-   missing when it is installed and working:
+4. **rustup in `~/.cargo/bin`, which is where its own installer puts it.**
+   Nothing else on the builder has to be configured for this, because
+   `release.yml` adds that directory to the job's `PATH` itself - but the
+   reason it has to is worth knowing, since it is the sharp edge here and it
+   produces a failure that reads as if Rust were missing when it is installed
+   and working:
 
        rustup is not installed, so rust-toolchain.toml's '1.98.0' pin does nothing here
        this host would build with: no rustc at all
@@ -192,17 +195,19 @@ has to be there and stay there. This is the whole list.
    inherits launchd's `PATH` and sees no `rustc`. `rustup --version` in your
    terminal proves nothing about what the job sees.
 
-   The runner reads a `.path` file from its own root directory and uses it as
-   `PATH` for every job. Write one, with the cargo directory first:
+   The runner can be told this on the machine - it reads a `.path` file from
+   its own root directory and uses it as `PATH` for every job - and that is
+   still how a proxy or any other variable gets in (via a `.env` file in the
+   same directory). It is the wrong place for this one: it is state on a
+   machine nobody can inspect from the repo, and reinstalling the runner
+   silently takes it away again.
 
-       printf '%s\n' "$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-         > ~/actions-runner/.path
-       cd ~/actions-runner && ./svc.sh stop && ./svc.sh start
-
-   (A `.env` file in the same directory sets other variables the same way, and
-   is where a proxy configuration would go.) To tell the two causes apart
-   before writing anything: if `command -v rustup` works in a terminal as the
-   runner's user, it is this; if it does not, it is step 3.
+   So if you see that message *after* this change, `PATH` is not the cause.
+   Either rustup is not installed (step 3), or it is installed somewhere other
+   than `~/.cargo/bin` - `brew install rustup` being the way that happens.
+   `check-toolchain.sh` tells the two apart: it adds a `note:` line naming
+   `~/.cargo/bin/rustup` when the binary is there and only the `PATH` was
+   wrong.
 
 5. **A logged-in user session.** `sign-macos.sh` creates a throwaway keychain
    and imports the certificate into it. Keychain operations need a user

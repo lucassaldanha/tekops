@@ -25,6 +25,15 @@ if ! command -v rustup >/dev/null 2>&1; then
   found="$(rustc --version 2>/dev/null)" || found="no rustc at all"
   echo "rustup is not installed, so rust-toolchain.toml's '$pinned' pin does nothing here" >&2
   echo "this host would build with: $found" >&2
+  # An installed rustup that is merely invisible looks identical to an absent
+  # one from here, and the two need opposite fixes: install it, or put its
+  # shims on the PATH of whatever ran this. Say which it is rather than
+  # leaving the reader to guess from a message that only describes the
+  # symptom.
+  if [ -x "${HOME:-}/.cargo/bin/rustup" ]; then
+    echo "note: $HOME/.cargo/bin/rustup exists - it is installed, just not on this process's PATH" >&2
+    echo "note: PATH=$PATH" >&2
+  fi
   exit 1
 fi
 
