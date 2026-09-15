@@ -525,7 +525,9 @@ or `$XDG_CONFIG_HOME/tekops/config.toml` when that variable is set. An absent
 file is not an error, and neither is an absent `$HOME`.
 
 `config.example.toml` ships in the release tarball and documents all six keys.
-Copy it and delete whatever you do not need:
+Its keys are commented out, so copying it verbatim changes nothing - uncomment
+only the lines you want. Be deliberate about `stack` in particular: uncommenting
+it changes every default port at once.
 
 | Key          | Variable             | What it sets                         |
 |--------------|----------------------|--------------------------------------|

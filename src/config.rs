@@ -286,6 +286,48 @@ data_dir = "/var/lib/teku"
         assert!(err.to_string().contains(&dir.path().display().to_string()));
     }
 
+    fn read_sample() -> String {
+        let sample_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        std::fs::read_to_string(&sample_path)
+            .expect("config.example.toml must exist at the repo root")
+    }
+
+    /// Reads the sample's commented-out keys back as live TOML.
+    ///
+    /// The sample distinguishes the two kinds of comment by a single character:
+    /// a key is written `#key = value` with no space after the hash, prose is
+    /// written `# text` with one. That convention is what makes the file both
+    /// safe to copy verbatim (every key inert) and still checkable here.
+    ///
+    /// The `contains(" = ")` guard means a prose line that happened to omit the
+    /// space stays a comment rather than becoming malformed TOML.
+    fn uncomment_keys(text: &str) -> String {
+        text.lines()
+            .map(|line| match line.strip_prefix('#') {
+                Some(rest)
+                    if rest.starts_with(|c: char| c.is_ascii_lowercase())
+                        && rest.contains(" = ") =>
+                {
+                    rest
+                }
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The convention `uncomment_keys` relies on is itself worth pinning: if the
+    /// sample ever switches to `# key = value`, the keys stop being read back
+    /// and the drift check silently starts comparing against an empty set.
+    #[test]
+    fn uncomment_keys_reads_keys_back_and_leaves_prose_alone() {
+        let got = uncomment_keys("# Prose, with a space.\n#stack = \"eth-docker\"\n# more = prose");
+        assert_eq!(
+            got,
+            "# Prose, with a space.\nstack = \"eth-docker\"\n# more = prose"
+        );
+    }
+
     /// The committed sample must stay in step with the struct it documents.
     ///
     /// A sample kept in sync by discipline drifts. This repo already solves that
@@ -302,6 +344,12 @@ data_dir = "/var/lib/teku"
     /// The assertion is set *equality*, in both directions: adding a field to
     /// `Config` without documenting it fails here, and so does leaving a removed
     /// one behind in the sample.
+    ///
+    /// The sample's keys are commented out, so copying the file verbatim is a
+    /// no-op rather than a silent commitment to whichever stack the example
+    /// happens to show - uncommenting a line is the operator's affirmative act.
+    /// That is why `uncomment_keys` exists: a commented key *can* be checked,
+    /// it just has to be read back first.
     #[test]
     fn the_sample_documents_exactly_the_configurable_keys() {
         use std::collections::BTreeSet;
@@ -323,12 +371,9 @@ data_dir = "/var/lib/teku"
             .cloned()
             .collect();
 
-        let sample_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let text = std::fs::read_to_string(&sample_path)
-            .expect("config.example.toml must exist at the repo root");
-        let from_sample: BTreeSet<String> = text
+        let from_sample: BTreeSet<String> = uncomment_keys(&read_sample())
             .parse::<toml::Table>()
-            .expect("config.example.toml must be valid TOML")
+            .expect("config.example.toml must be valid TOML once its keys are read back")
             .keys()
             .cloned()
             .collect();
@@ -340,12 +385,24 @@ data_dir = "/var/lib/teku"
     }
 
     /// The sample is not merely key-correct: every value in it is of the type the
-    /// real parser accepts.
+    /// real parser accepts, checked by reading the commented keys back.
     #[test]
-    fn the_sample_parses_into_a_config() {
-        let sample_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
-        let text = std::fs::read_to_string(&sample_path).unwrap();
-        let cfg = parse(&text, &sample_path).expect("the shipped sample must parse");
+    fn the_samples_values_are_all_of_the_right_type() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let cfg = parse(&uncomment_keys(&read_sample()), &path)
+            .expect("every value in the shipped sample must be well typed");
         assert_eq!(cfg.stack, Some(Stack::EthDocker));
+        assert!(cfg.api_url.is_some());
+        assert!(cfg.data_dir.is_some());
+    }
+
+    /// Copying the sample verbatim must configure nothing at all. This is the
+    /// property the commenting buys, and it is the whole reason the sync test
+    /// goes to the trouble of reading the keys back.
+    #[test]
+    fn the_sample_as_shipped_configures_nothing() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let cfg = parse(&read_sample(), &path).expect("the shipped sample must parse as-is");
+        assert_eq!(cfg, Config::default());
     }
 }
