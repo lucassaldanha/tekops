@@ -38,7 +38,11 @@ fn stopped_daemon() -> tempfile::TempDir {
 /// this builds for: the endpoint checks are noise for this test, and a port
 /// that merely happens to be closed could cost the 10s request timeout twice.
 /// Every `$TEKOPS_*` variable is cleared so a developer's own shell cannot
-/// answer a rung of the ladder under test.
+/// answer a rung of the ladder under test. `$HOME` is cleared and
+/// `$XDG_CONFIG_HOME` is pointed at `dir` (which holds the `docker` stub and no
+/// `tekops/` subdirectory) for the same reason: the config file is a rung of
+/// that same ladder, so a real `~/.config/tekops/config.toml` on the developer's
+/// machine would otherwise decide the stack this test is asserting about.
 fn doctor(dir: &Path, args: &[&str]) -> Output {
     let path = format!(
         "{}:{}",
@@ -56,6 +60,8 @@ fn doctor(dir: &Path, args: &[&str]) -> Output {
         .env_remove("TEKOPS_METRIC_URL")
         .env_remove("TEKOPS_CONTAINER")
         .env_remove("TEKOPS_DATA_DIR")
+        .env_remove("HOME")
+        .env("XDG_CONFIG_HOME", dir)
         .output()
         .expect("run tekops doctor")
 }

@@ -29,6 +29,11 @@ const LOG: &str = concat!(
 /// `$GITHUB_TOKEN` is set rather than inherited so the gist path is selected
 /// on a machine that has no token, and `$GH_TOKEN` is cleared so a developer's
 /// own shell cannot supply a different one.
+///
+/// `$HOME` is cleared and `$XDG_CONFIG_HOME` points at an empty tempdir because
+/// `run()` now loads the config file before dispatch and exits 1 on a malformed
+/// one. Without this, a typo in the developer's own `config.toml` would fail all
+/// three tests here with a message about a file none of them are testing.
 fn dump_logs(answer: &str) -> Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = dir.path().join("teku.log");
@@ -42,6 +47,8 @@ fn dump_logs(answer: &str) -> Output {
         .env_remove("GH_TOKEN")
         .env_remove("TEKOPS_CONTAINER")
         .env_remove("TEKOPS_STACK")
+        .env_remove("HOME")
+        .env("XDG_CONFIG_HOME", dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

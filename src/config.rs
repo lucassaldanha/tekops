@@ -79,8 +79,17 @@ impl fmt::Display for ConfigError {
 /// `$XDG_CONFIG_HOME` beats `$HOME/.config`. `None` means neither variable is
 /// set, which is "no config file" rather than an error: a config that cannot
 /// be located must not stop a command that was never going to read it.
+///
+/// A non-absolute `$XDG_CONFIG_HOME` is treated as unset, which the XDG base
+/// directory spec requires and which the empty string is the common way to hit:
+/// scripts and systemd units routinely "unset" a variable by exporting it
+/// empty. Honouring it would resolve the config to a *cwd-relative*
+/// `tekops/config.toml`, so tekops would silently ignore the operator's real
+/// `~/.config/tekops/config.toml` and load whatever happened to sit in the
+/// directory they ran from - and on a malformed one, exit 1 before dispatch.
 pub fn path(xdg_config: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     xdg_config
+        .filter(|p| p.is_absolute())
         .map(Path::to_path_buf)
         .or_else(|| home.map(|h| h.join(".config")))
         .map(|base| base.join(CONFIG_DIR).join(CONFIG_FILE))
@@ -208,6 +217,36 @@ data_dir = "/var/lib/teku"
             got,
             Some(PathBuf::from("/home/op/.config/tekops/config.toml"))
         );
+    }
+
+    /// An empty `$XDG_CONFIG_HOME` is how scripts and systemd units commonly
+    /// "unset" it, and the XDG spec says to treat it as unset. Honouring it
+    /// would resolve to a cwd-relative `tekops/config.toml` and silently skip
+    /// the operator's real one.
+    #[test]
+    fn an_empty_xdg_config_home_falls_back_to_home() {
+        let got = path(Some(Path::new("")), Some(Path::new("/home/op")));
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/home/op/.config/tekops/config.toml"))
+        );
+    }
+
+    #[test]
+    fn a_relative_xdg_config_home_falls_back_to_home() {
+        let got = path(Some(Path::new("relative/dir")), Some(Path::new("/home/op")));
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/home/op/.config/tekops/config.toml"))
+        );
+    }
+
+    /// A non-absolute XDG value with no HOME to fall back to is no path at all,
+    /// never a cwd-relative one.
+    #[test]
+    fn a_relative_xdg_config_home_with_no_home_is_no_path() {
+        assert_eq!(path(Some(Path::new("")), None), None);
+        assert_eq!(path(Some(Path::new("relative/dir")), None), None);
     }
 
     /// No HOME and no XDG is "no config file", never an error. This is why

@@ -860,10 +860,11 @@ fn should_hint(stack: Option<Stack>, e: &ApiError) -> bool {
 /// Identical to `exit_for` except that an unreachable endpoint gets a stack
 /// hint appended, since "could not reach endpoint" on a Docker host almost
 /// always means the ports are the default bare-metal ones. `stack` is the
-/// profile already resolved for this invocation (flag, then $TEKOPS_STACK) -
-/// when the operator has named one, the hint would just be telling them to do
-/// what they already did, so it is skipped: if their explicitly chosen
-/// profile still cannot connect, the stack name was never the problem.
+/// profile already resolved for this invocation (flag, then $TEKOPS_STACK, then
+/// the config file's `stack`) - when the operator has named one, by any of those
+/// three, the hint would just be telling them to do what they already did, so it
+/// is skipped: if their explicitly chosen profile still cannot connect, the
+/// stack name was never the problem.
 fn exit_for_api(result: Result<(), ApiError>, stack: Option<Stack>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
