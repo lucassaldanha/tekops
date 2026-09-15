@@ -9,6 +9,22 @@ Helper CLI for operating a Teku node, run directly on the node over SSH.
 **[USAGE.md](USAGE.md) documents every command**, including running against
 Eth Docker and Rocket Pool deployments.
 
+## About this project
+
+tekops is a personal project I build in my spare time to operate my own node. It
+is not a Consensys project: not affiliated with, endorsed by, or supported by
+Consensys or the Teku team. Teku is their software, this is just a CLI I wrote
+for running it.
+
+It comes with no guarantees and no support. I add what I need and fix what I hit
+on my own node, on no particular schedule. Issues and pull requests are welcome,
+but I may not get to them.
+
+It is released under the [Apache License 2.0](LICENSE), which disclaims all
+warranty and liability. tekops runs on a machine that runs a validator, so give
+it the same scrutiny you would give any other third-party tool with access to
+that host.
+
 ## Install
 
 Download the binary for your platform from the [latest release](https://github.com/lucassaldanha/tekops/releases/latest):
