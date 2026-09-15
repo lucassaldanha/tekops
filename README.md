@@ -35,39 +35,17 @@ Download the binary for your platform from the [latest release](https://github.c
 | Linux arm64 | `tekops-v<version>-aarch64-linux.tar.gz` |
 | macOS Apple silicon | `tekops-v<version>-aarch64-macos.tar.gz` |
 
-Releases up to v0.3.1 used the cargo target triple instead
-(`x86_64-unknown-linux-musl` and friends); the names above start at v0.4.0.
+## Update
 
-    VERSION=0.4.0
-    TARGET=x86_64-linux
-    curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/tekops-v$VERSION-$TARGET.tar.gz"
-    tar xzf "tekops-v$VERSION-$TARGET.tar.gz"
-    sudo install -m755 tekops /usr/local/bin/tekops
+    tekops update
 
-The Linux binaries are statically linked, so there is nothing else to install
-on the node.
+Checks GitHub Releases, shows `current -> latest`, and asks before replacing the
+running binary. The download is verified against the release's `SHA256SUMS` and
+smoke-tested first, so a failed update leaves the working binary in place. Use
+`sudo` if tekops lives in a root-owned directory such as `/usr/local/bin`.
 
-Verify what you downloaded against `SHA256SUMS` from the same release:
-
-    curl -LO "https://github.com/lucassaldanha/tekops/releases/download/v$VERSION/SHA256SUMS"
-    sha256sum -c SHA256SUMS --ignore-missing
-
-**macOS:** the binary is signed with a Developer ID certificate and notarized by
-Apple, so it runs without the "developer cannot be verified" prompt. It is not
-stapled, because a bare executable cannot carry a stapled notarization ticket,
-so a browser-downloaded copy needs the machine to be online the first time it
-runs while macOS checks the ticket with Apple. Downloaded with `curl` or `gh` as
-above it is never quarantined and that check never happens.
-
-Releases up to v0.7.0 are unsigned. If macOS refuses to open one of those, clear
-the quarantine flag:
-
-    xattr -d com.apple.quarantine tekops
-
-While this repository is private, the release assets need an authenticated
-download instead of `curl`:
-
-    gh release download "v$VERSION" -p "tekops-v$VERSION-$TARGET.tar.gz"
+tekops never checks for updates on its own. Nothing touches the network unless
+you run this.
 
 ## Requirements
 
@@ -88,24 +66,4 @@ file needs to reach the node.
 
     cargo build --release
 
-## Building a release binary
-
-    scripts/build-release.sh x86_64-unknown-linux-musl
-
-The argument is a cargo target triple. Supported targets are
-`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
-`aarch64-apple-darwin`.
-
-The tarball it writes is named for the platform rather than the triple, so
-the command above produces `dist/tekops-v<version>-x86_64-linux.tar.gz`. It
-also prints the binary's SHA256.
-
-Linux targets build inside a digest-pinned musl container and cross-compile
-from x86_64, so no `rustup target add` is needed on the host (a Homebrew
-Rust has no cross-compile targets available, and `cross` requires `rustup`
-on the host even though its build runs in a container) and the aarch64 build
-does not emulate. The resulting binaries are statically linked with no
-runtime dependencies - nothing but that one file needs to reach the node.
-
-This is the same script CI runs, so a locally built Linux binary hashes
-identically to the published one.
+If you prefere to build it yourself.
