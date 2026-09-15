@@ -1,6 +1,17 @@
 name: Release
 
 on:
+  # The normal path: run this from the Actions tab or with
+  # `gh workflow run release.yml -f version=X.Y.Z`. The bump, the tag and
+  # the release all happen here.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, as X.Y.Z (a leading v is accepted)'
+        required: true
+        type: string
+  # The fallback: a hand-pushed tag on an already-bumped commit. Skips the
+  # prepare step and behaves exactly as this workflow always has.
   push:
     tags:
       - 'v*'
@@ -12,15 +23,57 @@ permissions:
   contents: write
 
 jobs:
+  # Resolves the one pair of values every later job needs - which tag is being
+  # published, and which commit it names - so that neither path has to be
+  # special-cased again downstream. On the dispatch path it also writes the
+  # bump commit that `sha` then points at.
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Bump, commit and push
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ github.ref_name }}
+        run: scripts/prepare-release.sh "$VERSION" "$BRANCH"
+
+      - name: Resolve tag and commit
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag="v${VERSION#v}"
+            sha="$(git rev-parse HEAD)"
+          else
+            tag="${GITHUB_REF_NAME}"
+            sha="${GITHUB_SHA}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "publishing $tag from $sha"
+
   verify:
     name: verify tag and test
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Tag matches Cargo.toml
-        run: scripts/check-version.sh "${GITHUB_REF_NAME}"
+        run: scripts/check-version.sh "${{ needs.prepare.outputs.tag }}"
 
       - name: Test
         run: cargo test --locked
@@ -30,7 +83,7 @@ jobs:
 
   build:
     name: build ${{ matrix.target }}
-    needs: verify
+    needs: [prepare, verify]
     runs-on: ${{ matrix.runner }}
     strategy:
       # Build every target even if one fails, so a single broken target
@@ -46,9 +99,12 @@ jobs:
             runner: macos-14
     steps:
       # Full history: build-release.sh reads the commit timestamp for
-      # SOURCE_DATE_EPOCH.
+      # SOURCE_DATE_EPOCH. The explicit ref is what makes the dispatch path
+      # build the bump commit rather than the branch as it stood when the
+      # workflow was started.
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
       # Two steps for one command, so the signing secrets are only ever put in
@@ -79,10 +135,12 @@ jobs:
     name: publish release
     # Depends on every build job: a release whose assets disagree about
     # which platforms a version supports is worse than no release.
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -95,12 +153,19 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # --target creates the tag as part of publishing, which is why nothing
+      # earlier does. On the tag-push path the tag already exists and --target
+      # is ignored; on the dispatch path this is the moment the version
+      # becomes real, after every build has already succeeded.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --target "$SHA" \
             --generate-notes \
             artifacts/*.tar.gz \
             artifacts/SHA256SUMS

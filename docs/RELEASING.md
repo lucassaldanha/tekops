@@ -1,8 +1,9 @@
 # Releasing
 
-A `v*` tag triggers `.github/workflows/release.yml`, which verifies the tag
-against `Cargo.toml`, runs the suite, builds three targets and publishes
-tarballs plus `SHA256SUMS`. That part needs nothing from you beyond the tag.
+`.github/workflows/release.yml` takes a version, bumps `Cargo.toml`, runs the
+suite, builds three targets, tags, and publishes tarballs plus `SHA256SUMS`.
+That part needs nothing from you beyond the version number - see
+[Cutting a release](#cutting-a-release).
 
 The macOS binary is additionally signed with a Developer ID certificate and
 notarized by Apple, so it runs without the "developer cannot be verified"
@@ -117,13 +118,44 @@ you. The `gh secret list` check is what closes that gap.
 
 ## Cutting a release
 
-1. Bump `version` in `Cargo.toml`. `scripts/check-version.sh` makes the tag and
-   the manifest agree, so a mismatch fails the release at its first step.
-2. Commit, push.
-3. `git tag vX.Y.Z && git push origin vX.Y.Z`
-4. Watch the `aarch64-apple-darwin` leg of the `build` job. It is the only one
+Run the workflow and give it the version. Nothing is edited, committed or
+tagged by hand.
+
+    gh workflow run release.yml -f version=X.Y.Z
+
+Or from the **Actions** tab: **Release**, **Run workflow**, type the version.
+Either way the run:
+
+1. Rejects the version if it is not `X.Y.Z`, if that tag already exists, or if
+   it does not sort above the version `Cargo.toml` currently declares.
+2. Bumps `Cargo.toml` and `Cargo.lock` and pushes `chore(release): vX.Y.Z` to
+   the branch the workflow was dispatched from.
+3. Runs the suite and clippy against that commit.
+4. Builds, signs and notarizes the three targets.
+5. Creates the tag and publishes the release with generated notes, the three
+   tarballs and `SHA256SUMS`.
+
+**The tag is created last, by `gh release create --target`.** So a failing
+test or a broken macOS signing leg leaves a bump commit on the branch and no
+tag - revert the commit, or fix forward and dispatch the same version again.
+A tag that had already been pushed would have to be deleted first, and a
+deleted tag that someone has already fetched is worse than a revert.
+
+A hand-pushed `vX.Y.Z` tag still triggers the same workflow and skips the
+prepare step, for re-running a release or cutting one from a commit that is
+not the branch head. On that path `Cargo.toml` has to already declare the
+matching version, exactly as before - `scripts/check-version.sh` fails the run
+at its first step otherwise.
+
+`scripts/test-prepare-release.sh` exercises the bump script against a
+throwaway clone with a bare repository standing in for origin, so the
+validation rules can be changed without a real release as the test.
+
+Then:
+
+1. Watch the `aarch64-apple-darwin` leg of the `build` job. It is the only one
    that signs, and it is where a lapsed certificate or a revoked key surfaces.
-5. Confirm the published asset independently:
+2. Confirm the published asset independently:
 
        spctl --assess -vv -t open --context context:primary-signature tekops
 
@@ -169,8 +201,9 @@ shape that `src/update.rs`'s `TARGET` constants and `download_url` both encode.
 
 ## Notes on secrets in a public repository
 
-- `release.yml` runs on `push` of a `v*` tag only. Pushing a tag requires write
-  access, so a pull request cannot reach the signing secrets.
+- `release.yml` runs on `workflow_dispatch` and on `push` of a `v*` tag. Both
+  require write access to the repository, so a pull request cannot reach the
+  signing secrets. Do not add a `pull_request` trigger to this workflow.
 - `ci.yml` uses `pull_request`, not `pull_request_target`, so a fork's pull
   request runs without repository secrets. Do not change that trigger.
 - The **Team ID is not a secret.** It is embedded in every signed binary and
