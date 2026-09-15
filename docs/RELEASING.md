@@ -116,6 +116,50 @@ asymmetry is deliberate, because the same script runs on a dev machine that has
 none of this material, and a misspelled secret name is the one way it can bite
 you. The `gh secret list` check is what closes that gap.
 
+## The self-hosted builder
+
+The `aarch64-apple-darwin` leg of the `build` job runs on the self-hosted
+runner labelled `self-hosted, macOS`, not on a GitHub-hosted macOS runner.
+GitHub bills macOS minutes at a 10x multiplier and that job is the only one
+that needs a Mac, so it is most of what a release costs. Everything else -
+`verify`, both Linux legs, the `release` job and all of `ci.yml` - stays on
+GitHub-hosted runners, which are always available and cheap.
+
+**If the builder is offline the job queues** until the machine comes back.
+GitHub cancels a job that has waited 24 hours. Nothing else in the run is
+blocked until `release`, which needs every build to have finished.
+
+The builder needs three things:
+
+1. **`rustup`, not a Homebrew or package-manager Rust.** `rust-toolchain.toml`
+   is a rustup feature; without rustup it is ignored in silence and the
+   release binary is built by whatever compiler is installed. The `build` job
+   runs `scripts/check-toolchain.sh` before compiling, which fails the release
+   rather than shipping that. Run it by hand on the builder to check the setup
+   before a release depends on it:
+
+       scripts/check-toolchain.sh
+
+   Expect `toolchain '<version>' is active`. Both failure messages name what
+   they found, so neither needs interpreting.
+
+2. **The Xcode command line tools**, for `codesign`, `spctl` and
+   `xcrun notarytool`.
+
+3. **A logged-in user session.** `sign-macos.sh` creates a throwaway keychain
+   and imports the certificate into it. Keychain operations need a user
+   session, so run the runner as a LaunchAgent (`./svc.sh install`) or from a
+   terminal - a LaunchDaemon with no session fails at the import.
+
+The builder does **not** need Docker unless the Linux legs are moved onto it
+too; those run on GitHub's Linux runners, which is where their pinned
+container is pulled.
+
+The five signing secrets are handed to the builder the same way they are to a
+GitHub-hosted runner. `sign-macos.sh` was already written for a real machine -
+it saves and restores the keychain search list in an `EXIT` trap, rather than
+assuming a throwaway filesystem - so nothing about it changes here.
+
 ## Cutting a release
 
 Run the workflow and give it the version. Nothing is edited, committed or

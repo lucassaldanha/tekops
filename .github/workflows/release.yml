@@ -95,8 +95,15 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
+          # The self-hosted builder, because GitHub bills macOS runners at a
+          # 10x minute multiplier and this is the only job that needs one -
+          # it is most of what a release costs. Matched on [self-hosted,
+          # macOS] rather than the builder's name or its X64 label, so
+          # replacing that machine with an Apple Silicon one needs no change
+          # here. If the builder is offline the job queues until it is back;
+          # GitHub cancels it after 24 hours.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: [self-hosted, macOS]
     steps:
       # Full history: build-release.sh reads the commit timestamp for
       # SOURCE_DATE_EPOCH. The explicit ref is what makes the dispatch path
@@ -106,6 +113,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
+
+      # Only the macOS leg compiles on the host; the Linux legs compile inside
+      # a digest-pinned container that carries its own toolchain. This is the
+      # one place rust-toolchain.toml can be silently ignored, because the
+      # self-hosted builder's Rust is whatever was installed on it rather than
+      # whatever the runner image ships. Failing here is the whole point: an
+      # unpinned compiler produces a perfectly good binary and says nothing.
+      - name: Toolchain is the pinned one
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: scripts/check-toolchain.sh
 
       # Two steps for one command, so the signing secrets are only ever put in
       # the environment of the one runner that needs them. Naming them
