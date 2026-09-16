@@ -244,20 +244,21 @@ self-assessing a node, and an operator pasting the output into a chat when
 asking for help - which is why the report is plain aligned text rather than a
 boxed table.
 
-It accepts `--api-url` and `--metric-url` (or `$TEKOPS_API_URL` /
-`$TEKOPS_METRIC_URL`), `--stack` (or `$TEKOPS_STACK`), `--data-dir` (or
-`$TEKOPS_DATA_DIR`), and `--json`, the same as the commands above and below
-it.
+It accepts `--api-url` (or `$TEKOPS_API_URL`), `--bn-metric-url` (or
+`$TEKOPS_BN_METRIC_URL`), `--vc-metric-url` (or `$TEKOPS_VC_METRIC_URL`),
+`--stack` (or `$TEKOPS_STACK`), `--data-dir` (or `$TEKOPS_DATA_DIR`), and
+`--json`, the same as the commands above and below it.
 
 **`doctor` applies `docker ps` detection to the port defaults; the other API
 commands don't.** Every other command here reads only `--stack`/`$TEKOPS_STACK`
 and, if the endpoint turns out to be unreachable, suggests `--stack` in a hint
 afterward. `doctor` is already running `docker ps` for the container checks, so
-it applies that detection up front to `--api-url` and `--metric-url` as well -
-on an Eth Docker host with no flags given, it probes `:5052` and `:8009`
-straight away rather than failing against the bare-metal defaults first. One
-consequence: `doctor` never prints the `--stack` hint, because detection has
-already had its say by the time an endpoint would be judged unreachable.
+it applies that detection up front to `--api-url`, `--bn-metric-url` and
+`--vc-metric-url` as well - on an Eth Docker host with no flags given, it
+probes `:5052`, `:8008` and `:8009` straight away rather than failing against
+the bare-metal defaults first. One consequence: `doctor` never prints the
+`--stack` hint, because detection has already had its say by the time an
+endpoint would be judged unreachable.
 
 `--data-dir` only matters on bare-metal. The disk-free check resolves its
 target as `--data-dir` > `$TEKOPS_DATA_DIR` > `/var/lib/teku`. On the two
@@ -274,7 +275,7 @@ client's own container** - `eth-docker-consensus-1`, `rocketpool_eth2` - the
 same one `tekops logs` detects. A dead execution or validator-client
 container is not checked directly; it is usually caught indirectly instead
 (`execution layer` if Teku notices the execution client is offline,
-`metrics endpoint` if the validator client stops answering its scrape).
+`validator metrics` if the validator client stops answering its scrape).
 
 #### Exit code
 
@@ -293,7 +294,8 @@ starting point.
 | Check | Pass | Warn | Fail |
 | --- | --- | --- | --- |
 | beacon api | ready | syncing | not ready, unreachable |
-| metrics endpoint | reachable, versions found | reachable but the metric family is absent (wrong port) | unreachable |
+| beacon node metrics | reachable, version found | reachable but the metric family is absent (wrong port) | unreachable |
+| validator metrics | reachable, version found | reachable but the metric family is absent (wrong port) | unreachable |
 | sync status | synced | syncing | - |
 | execution layer | online | - | offline (`el_offline`) |
 | optimistic head | verified | - | unverified |
@@ -312,6 +314,15 @@ client that restarted moments ago legitimately reports zero duties, and
 Teku's heap is preallocated, so low available memory (as distinct from low
 *total* memory) is a healthy node's normal steady state, not a leak.
 
+`metrics layout` isn't in the table above because it isn't a fixed-threshold
+check - it's a diagnostic that only appears when the two metrics endpoints
+disagree with each other, and it only ever warns. It fires on exactly two
+shapes: `--bn-metric-url` turning out to be a validator client's endpoint
+(most often because `metric_url` is still set under its old meaning - see
+"The metrics endpoints" below), or `--bn-metric-url` exporting both
+processes' metrics while `--vc-metric-url` is unreachable, which reads as an
+all-in-one deployment.
+
 #### Sample output
 
     tekops doctor
@@ -319,7 +330,8 @@ Teku's heap is preallocated, so low available memory (as distinct from low
       eth-docker · teku/v25.1.0 · linux x86_64
 
       ✔  beacon api           ready at http://localhost:5052
-      ✔  metrics endpoint     teku/v25.1.0 at http://localhost:8009/metrics
+      ✔  beacon node metrics  teku/v25.1.0 at http://localhost:8008/metrics
+      ✔  validator metrics    teku/v25.1.0 at http://localhost:8009/metrics
       ✔  sync status          synced, head 8891234
       ✔  execution layer      online
       ✘  optimistic head      head unverified by the execution client; duties will not be performed
@@ -409,15 +421,23 @@ Notes on the URL:
 
 ## Metrics commands
 
-`duties`, `validators`, and `version` read the validator client's own
-Prometheus `/metrics` page instead of the Beacon API. They accept
-`--metric-url` (or `$TEKOPS_METRIC_URL`) to point at a non-default metrics
-endpoint (default: `http://localhost:8010/metrics`).
+`duties`, `validators`, and `version` read a Prometheus `/metrics` page
+instead of the Beacon API. `duties` and `validators` read the validator
+client's own page, and accept `--vc-metric-url` (or `$TEKOPS_VC_METRIC_URL`)
+to point at a non-default endpoint (default: `http://localhost:8010/metrics`).
 
-If the endpoint responds but doesn't export the metric being asked for, these
-fail with an error rather than reporting a confident zero - pointing at the
-beacon node's metrics port instead of the validator client's would otherwise
-render as "this validator published nothing".
+`version` reads both processes' pages, since only one of them exports the
+version metric it's after at a time. It accepts `--bn-metric-url` (or
+`$TEKOPS_BN_METRIC_URL`, default `http://localhost:8008/metrics`) for the
+beacon node alongside `--vc-metric-url` for the validator client. If the two
+resolve to the same URL, tekops scrapes it once rather than twice - that's
+one process exporting both families, the shape an all-in-one deployment
+takes.
+
+If `duties` or `validators`' endpoint responds but doesn't export the metric
+being asked for, they fail with an error rather than reporting a confident
+zero - pointing at the beacon node's metrics port instead of the validator
+client's would otherwise render as "this validator published nothing".
 
 `duties` and `validators` are a local equivalent of Grafana panel queries like
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})`.
@@ -432,11 +452,14 @@ label to filter on - that's added by Prometheus at scrape time).
   (validator_local_validator_counts{instance=~"$system"}))`), and total
   locally-stated ETH balance (summed from `validator_local_validator_balances`,
   reported in Gwei and converted to ETH).
-- **`version`** prints the running Teku version, read from the `version` label
-  on whichever of `beacon_teku_version_total` or `validator_teku_version_total`
-  is present on the scrape (only one exists at a time, depending on whether
-  `--metric-url` points at a beacon node's or a validator client's `/metrics`
-  endpoint).
+- **`version`** prints a three-column table (Process, Version, Endpoint), one
+  row for the beacon node and one for the validator client, each version read
+  from the `version` label on that process's own `beacon_teku_version_total`
+  or `validator_teku_version_total`. A process that didn't answer gets the
+  failure reason in place of a version, and the command still exits `0` as
+  long as one of the two answered - both have to be unreachable for `version`
+  to fail. `--json` prints `{"beacon_node": {...}, "validator_client":
+  {...}}`, one object per process rather than a single list.
 
 ## Docker deployments
 
@@ -463,11 +486,11 @@ container suffix can never match anything `docker ps` returns.
 `--stack` sets the port defaults for a known deployment, since both Docker
 stacks differ from a bare-metal node and from each other:
 
-| | Beacon API | Metrics (validator client) |
-| --- | --- | --- |
-| bare-metal | 5051 | 8010 |
-| eth-docker | 5052 | 8009 |
-| rocketpool | 5052 | 9101 |
+| | Beacon API | Metrics (beacon node) | Metrics (validator client) |
+| --- | --- | --- | --- |
+| bare-metal | 5051 | 8008 | 8010 |
+| eth-docker | 5052 | 8008 | 8009 |
+| rocketpool | 5052 | 9100 | 9101 |
 
     tekops logs --stack rocketpool     # narrow autodetection
     tekops health --stack eth-docker   # take that stack's port defaults
@@ -487,7 +510,7 @@ Name the pieces directly and skip `--stack` entirely:
 
     export TEKOPS_CONTAINER=mynode-teku
     export TEKOPS_API_URL=http://localhost:5099
-    export TEKOPS_METRIC_URL=http://localhost:9109/metrics
+    export TEKOPS_VC_METRIC_URL=http://localhost:9109/metrics
 
 Every value a stack profile would supply is independently overridable, and a
 profile is a layer in the precedence chain rather than a mode that locks the
@@ -511,19 +534,51 @@ config file, so it survives a new shell and can be copied to a second node.
 or `$XDG_CONFIG_HOME/tekops/config.toml` when that variable is set. An absent
 file is not an error, and neither is an absent `$HOME`.
 
-`config.example.toml` ships in the release tarball and documents all six keys.
-Its keys are commented out, so copying it verbatim changes nothing - uncomment
-only the lines you want. Be deliberate about `stack` in particular: uncommenting
-it changes every default port at once.
+`config.example.toml` ships in the release tarball and documents all eight
+keys. Its keys are commented out, so copying it verbatim changes nothing -
+uncomment only the lines you want. Be deliberate about `stack` in particular:
+uncommenting it changes every default port at once.
 
-| Key          | Variable             | What it sets                         |
-|--------------|----------------------|--------------------------------------|
-| `stack`      | `$TEKOPS_STACK`      | Deployment profile and its ports     |
-| `api_url`    | `$TEKOPS_API_URL`    | Beacon API base URL                  |
-| `metric_url` | `$TEKOPS_METRIC_URL` | Prometheus scrape URL                |
-| `container`  | `$TEKOPS_CONTAINER`  | Container to read logs from          |
-| `logs_file`  | `$TEKOPS_LOGS_FILE`  | Log file to tail                     |
-| `data_dir`   | `$TEKOPS_DATA_DIR`   | Filesystem `doctor` checks for space |
+| Key             | Variable                | What it sets                            |
+|-----------------|--------------------------|------------------------------------------|
+| `stack`         | `$TEKOPS_STACK`         | Deployment profile and its ports        |
+| `api_url`       | `$TEKOPS_API_URL`       | Beacon API base URL                     |
+| `bn_metric_url` | `$TEKOPS_BN_METRIC_URL` | Beacon node Prometheus scrape URL       |
+| `vc_metric_url` | `$TEKOPS_VC_METRIC_URL` | Validator client Prometheus scrape URL  |
+| `metric_url`    | `$TEKOPS_METRIC_URL`    | Deprecated alias for `bn_metric_url`    |
+| `container`     | `$TEKOPS_CONTAINER`     | Container to read logs from             |
+| `logs_file`     | `$TEKOPS_LOGS_FILE`     | Log file to tail                        |
+| `data_dir`      | `$TEKOPS_DATA_DIR`      | Filesystem `doctor` checks for space    |
+
+### The metrics endpoints
+
+Two of the eight keys above point at two different processes, and getting
+that pairing wrong is easy enough that it's worth its own section.
+
+`duties` and `validators` read the validator client's own scrape
+(`vc_metric_url`); `version` and `doctor` read both processes and report
+them separately.
+
+**`metric_url` changed meaning.** It used to resolve to the validator
+client's endpoint. It now resolves to the beacon node's, matching `api_url`,
+which is likewise unprefixed and likewise the beacon node's. If you set
+`metric_url` for your validator client under the old meaning, move that
+value to `vc_metric_url` - leaving it in `metric_url` doesn't fail, it just
+quietly points `version` and `doctor` at the wrong process from now on.
+`tekops doctor` detects this exact situation: its "metrics layout" check
+warns when the beacon node URL turns out to export only validator metrics.
+
+On an all-in-one deployment, where one process exports both families, set
+`bn_metric_url` and `vc_metric_url` to the same URL; tekops scrapes it once
+rather than twice.
+
+The default ports per stack:
+
+| Stack | BN metrics | VC metrics |
+| --- | --- | --- |
+| bare-metal | `http://localhost:8008/metrics` | `http://localhost:8010/metrics` |
+| eth-docker | `http://localhost:8008/metrics` | `http://localhost:8009/metrics` |
+| rocketpool | `http://localhost:9100/metrics` | `http://localhost:9101/metrics` |
 
 ### Precedence
 
@@ -581,12 +636,12 @@ prints the same build version alongside the project link, and takes no flags.
 Every network command gives up after 10 seconds rather than waiting forever
 on a node that accepts the connection but never answers.
 
-`tekops` is built without a TLS backend, so `--api-url` and `--metric-url`
-must be `http://` URLs. It is meant to run on the node against its own local
-endpoints, and dropping TLS removes `rustls` and `ring` (and all C
-compilation) from the build, cutting the binary roughly in half. An `https://`
-URL fails immediately with `cannot make HTTPS request because no TLS backend
-is configured` rather than doing anything surprising.
+`tekops` is built without a TLS backend, so `--api-url`, `--bn-metric-url`
+and `--vc-metric-url` must be `http://` URLs. It is meant to run on the node
+against its own local endpoints, and dropping TLS removes `rustls` and `ring`
+(and all C compilation) from the build, cutting the binary roughly in half.
+An `https://` URL fails immediately with `cannot make HTTPS request because
+no TLS backend is configured` rather than doing anything surprising.
 
 ## Shell completion
 

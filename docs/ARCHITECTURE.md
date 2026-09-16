@@ -122,19 +122,27 @@ never be the right addition to their error path.
 
 ### Flags and configuration
 
-The repeated `--api-url`/`--metric-url`/`--json` flags live in two
-flattened arg structs, `ApiArgs` and `MetricArgs`, rather than being
-restated per command. Both also carry `--stack`, which `resolve_stack`,
-`resolve_base_url` and `resolve_metric_url` fold into the URL a flag,
-`$TEKOPS_API_URL`/`$TEKOPS_METRIC_URL`, or the config file's
-`api_url`/`metric_url` didn't already supply. The config sits below the
-environment in all three, and `resolve_base_url`/`resolve_metric_url` take
-the environment as a parameter rather than reading it themselves precisely
-so that ordering is testable.
+The repeated `--api-url`/`--bn-metric-url`/`--vc-metric-url`/`--json` flags
+live in two flattened arg structs, `ApiArgs` and `MetricArgs`, rather than
+being restated per command (`doctor` declares its three metric flags
+directly instead of flattening `MetricArgs`, since that struct also
+declares `stack` and `json` and flattening both would be a duplicate arg
+id). All three carry `--stack`, which `resolve_stack`, `resolve_base_url`,
+`resolve_bn_metric_url` and `resolve_vc_metric_url` fold into the URL a
+flag, an environment variable, or the config file didn't already supply.
+`resolve_bn_metric_url` has an extra rung the other three don't: the
+deprecated `--metric-url`/`$TEKOPS_METRIC_URL`/`metric_url` trio, tried
+after their `bn_`-prefixed replacements and before the config file's
+`bn_metric_url` (see the `config.rs` entry for why that key still exists
+and what it now means). `resolve_vc_metric_url` has no such rung - an
+operator migrating off `metric_url` has to say `vc_metric_url` explicitly,
+which is the point. The config sits below the environment in all four, and
+each resolver takes the environment as a parameter rather than reading it
+itself precisely so that ordering is testable.
 
 The config is loaded once by `run()` **before dispatch**, so a malformed
 file fails every command including `about` and `update`, which read none of
-the six keys: the file being broken is a fact about the installation rather
+the eight keys: the file being broken is a fact about the installation rather
 than about one command, and reporting it from whichever command the operator
 runs first is the shortest path to fixing it. That failure prints directly
 and does **not** go through `exit_for_api`, whose `--stack` hint would point
@@ -287,12 +295,23 @@ by `duties()`, one call per method); `sum_by_label` groups-and-sums by a
 label's value (used by `validators()` for the per-status counts) alongside
 a plain `sum_all` for the total balance; and `distinct_label_values`
 collects every distinct value of a label across matching samples (used by
-`version()`, for "info"-style metrics whose value is always 1 and whose
+`families()`, for "info"-style metrics whose value is always 1 and whose
 label carries the real data). `validators()` converts the summed balance
-from Gwei to ETH (`/ 1e9`); `version()` tries `beacon_teku_version_total`
-first and
-falls back to `validator_teku_version_total`, since only one is ever
-present depending on which process is being scraped.
+from Gwei to ETH (`/ 1e9`).
+
+`families()` reads both `beacon_teku_version_total` and
+`validator_teku_version_total` off one scrape and returns whatever it found
+of each, plus `has_validator_families` (whether the validator counts family
+is present). It exists because `version` and `doctor` both need several
+facts about one endpoint - which version(s) it exports, and whether it's a
+validator client - and the per-question methods above (`duties()`,
+`validators()`) each do their own `fetch()`, so getting the same answers out
+of them would mean scraping the same URL more than once for one report.
+`has_validator_families` rides along rather than living on its own because
+it's what tells apart a dual-role process (exports both beacon and validator
+families) from a validator client sitting where a beacon node was expected
+(exports only the validator ones) - `doctor`'s "metrics layout" check reads
+exactly that distinction.
 
 Three parser details are load-bearing and were each a real bug:
 
@@ -310,11 +329,14 @@ Three parser details are load-bearing and were each a real bug:
 
 Separately, `require_metric` makes `duties` and `validators` **fail when
 the metric family is absent from the scrape entirely**, rather than summing
-to a confident zero, and `version` errors likewise when neither version
-metric is present. Absent and present-but-zero are different answers, and
+to a confident zero. Absent and present-but-zero are different answers, and
 conflating them meant pointing at the beacon node's metrics port instead of
 the validator client's rendered as "this validator published nothing" - the
-alarm reading, from a healthy node.
+alarm reading, from a healthy node. `families()` doesn't route through
+`require_metric`: an absent version or validator family is exactly the fact
+`version` and `doctor` are asking about, so `families()` reports emptiness
+rather than erroring, and it's `cli.rs`/`doctor.rs` that decide what an
+absence means for their own report.
 
 ## `curl.rs`
 
@@ -797,28 +819,67 @@ rather than judgement calls, and are not gated by a constant.
 
 ### `Probe::Skipped` exists to bound a timeout budget
 
-`http::REQUEST_TIMEOUT` is 10 seconds per call, and `probe` makes seven
-calls against the node: four Beacon API (`health`, `syncing`,
-`finality_checkpoints`, `peers`) and three metrics scrapes (`version`,
-`duties`, `validators`). Run naively and sequentially against a dead node,
-that is 70 seconds of silence on the exact command an operator reaches for
-*because* the node looks sick.
+`http::REQUEST_TIMEOUT` is 10 seconds per call, and `probe` makes up to
+eight calls against the node: four Beacon API (`health`, `syncing`,
+`finality_checkpoints`, `peers`) and four metrics scrapes (`bn_families`,
+`vc_families`, `duties`, `validators`) - three when `bn_metric_url` and
+`vc_metric_url` are equal, since the all-in-one case below reuses
+`bn_families`'s result instead of scraping the same endpoint twice. Run
+naively and sequentially against a dead node, that's up to 80 seconds of
+silence on the exact command an operator reaches for *because* the node
+looks sick.
 
 So `health()` runs first and gates the other three Beacon API calls, and
-`version()` (the first metrics call) gates `duties`/`validators` the same
-way: if the gating call comes back `ApiError::Unreachable`, the rest are
-recorded as `Probe::Skipped("...unreachable")` and never attempted, dropping
-the worst case to roughly 20 seconds - one timeout per endpoint rather than
-one per call.
+`vc_families()` gates `duties`/`validators` the same way: if the gating call
+comes back unreachable, the rest are recorded as `Probe::Skipped("...
+unreachable")` and never attempted. `bn_families()` is not gated by
+anything and is always fetched, because `version` and `doctor` both need
+the beacon node's own answer regardless of what the validator client's
+looks like. That leaves three independent endpoints - beacon API, BN
+metrics, VC metrics - each contributing at most one timeout, dropping the
+worst case to roughly 30 seconds, or 20 when the two metric URLs are equal
+and there are only two endpoints to time out against.
 
 `Skipped` is a distinct variant from `Failed`, not a reuse of it, because
 they mean different things and render differently.
-`check_beacon_api`/`check_metrics_endpoint` treat a `Skipped` gating probe
-as `Fail` (the endpoint really is down), while every check downstream of it
-(`check_syncing`, `check_finality`, `check_peers`, `check_validators`,
-`check_duties`) treats both `Skipped` and `Failed` as `Warn`, since the
-outage is already reported once as a `Fail` by the gating check and
-repeating it per downstream row would be noise, not information.
+`check_beacon_api`/`check_bn_metrics`/`check_vc_metrics` treat a `Skipped`
+gating probe as `Fail` (the endpoint really is down), while every check
+downstream of it (`check_syncing`, `check_finality`, `check_peers`,
+`check_validators`, `check_duties`) treats both `Skipped` and `Failed` as
+`Warn`, since the outage is already reported once as a `Fail` by the gating
+check and repeating it per downstream row would be noise, not information.
+
+### Two metrics endpoints, one scrape when they agree
+
+`check_bn_metrics` and `check_vc_metrics` are both thin calls into
+`check_one_metrics_endpoint`, passing a different name, `Probe`, URL and
+version-family picker; the two render identically and differ only in which
+endpoint and which family they're reading.
+
+`probe` fetches `vc_metric_url` only when it differs from `bn_metric_url`;
+when they're equal it clones `bn_families`'s outcome (`Ok`, `Failed` or
+`Skipped`) into `vc_families` rather than scraping again, because an
+all-in-one deployment is one process answering for both roles, and asking
+it twice would double the timeout budget for no new information.
+
+`check_metrics_layout` reads `bn_families` alone and tells apart the two
+shapes a wrong metrics layout can take, using exactly the fact
+`has_validator_families` exists to carry (see the `metrics.rs` entry): a
+validator client sitting where the beacon node was expected
+(`has_validator_families` true, `beacon_versions` empty), or an all-in-one
+deployment (`has_validator_families` true, `beacon_versions` non-empty, and
+`vc_families` separately unreachable). The two conditions are mutually
+exclusive by construction, and `the_two_layout_diagnostics_are_mutually_exclusive`
+pins that.
+
+**Neither diagnostic repoints anything - both only ever warn and name what
+to change by hand.** A heuristic that silently redirected `vc_metric_url` to
+what looks like the validator client's real endpoint would be the same
+class of mistake `metrics::require_metric` exists to prevent (see the
+`metrics.rs` entry): a confident, silently-adjusted answer is worse than one
+that names the problem and stops, and an operator who moves `metric_url`'s
+value to `vc_metric_url` by hand knows what changed, while one whose config
+was silently reinterpreted for them does not.
 
 ### Container checks are omitted on bare-metal, never rendered as "n/a"
 
@@ -838,13 +899,17 @@ return - and both have to agree, which is why both are tested per stack.
 
 `metrics::require_metric` already refuses to report present-but-absent as a
 confident zero - it errors instead, naming the URL and the missing family.
-`check_metrics_endpoint`, `check_validators` and `check_duties` all render
-that error as `Warn`, not `Fail`, and pass its text straight through rather
+`check_validators` and `check_duties` render that error as `Warn`, not
+`Fail`, and pass its text straight through rather
 than re-deriving a message, since conflating "absent" with "zero" is a
 documented past bug in this repo and `doctor` is the command most likely to
 reintroduce it - it reports on both the beacon-node and validator-client
 metric families side by side, in one report, which is exactly the situation
-that bug needs to hide in.
+that bug needs to hide in. `check_one_metrics_endpoint` draws the same
+absent-versus-zero line for `check_bn_metrics`/`check_vc_metrics`, but
+doesn't go through `require_metric` to do it: `families()` already reports
+an empty version list rather than erroring (see the `metrics.rs` entry), so
+the check renders that emptiness as its own `Warn` message directly.
 
 ### No ANSI, by construction
 
@@ -919,14 +984,22 @@ Owns the per-stack port defaults and container-naming knowledge, and nothing
 else - no I/O of its own. The actual `docker inspect` work lives in
 `docker.rs`.
 
-Two things are load-bearing. **`metric_url` points at the validator client,
-not the beacon node** (8009 and 9101, not 8008 and 9100): `duties` and
-`validators` read VC metric families and `version` falls back across both,
-so the VC endpoint answers all three commands while the BN endpoint answers
-one. And **`container_suffix` is a suffix, not a name**, because neither
-prefix is knowable from the stack alone - Eth Docker's is the Compose
-project (the directory it was cloned into) and Rocket Pool's is its
-configurable `ProjectName`.
+Two things are load-bearing. **`bn_metric_url()` and `vc_metric_url()` are
+separate accessors, not one that `duties`/`validators` override**, because
+the two processes' ports genuinely differ per stack and `version`/`doctor`
+need both at once - collapsing them back into one method would just move the
+resolution problem into the caller. Teku's own `--metrics-port` default is
+8008 for both processes; both Docker stacks keep that for the beacon node
+(Rocket Pool moves it to 9100, `defaultBnMetricsPort`), so `bn_metric_url()`
+tracks Teku's own default. `vc_metric_url()` doesn't: Eth Docker moves the
+validator client to 8009 and Rocket Pool to 9101, and bare-metal's 8010 is a
+**tekops convention, not a Teku default** - a separated bare-metal node has
+necessarily repointed one of the two processes by hand already, so tekops
+picking 8010 costs it nothing and gives every stack a distinct VC port. And
+**`container_suffix` is a suffix, not a name**, because neither prefix is
+knowable from the stack alone - Eth Docker's is the Compose project (the
+directory it was cloned into) and Rocket Pool's is its configurable
+`ProjectName`.
 
 `detect_stack` takes `docker ps` output as a parameter rather than running
 `docker` itself, so the matching rule is testable with no Docker installed -
@@ -959,7 +1032,7 @@ are pure and take every input as a parameter, so the whole surface is
 testable with no environment races and no files on disk; `load` is the only
 function here that touches a filesystem.
 
-The file carries exactly the six settings that already have `$TEKOPS_*`
+The file carries exactly the eight settings that already have `$TEKOPS_*`
 variables, and nothing else. Every key is a variable is a flag, which is
 the one sentence that makes the feature explainable. Per-command defaults
 (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -969,6 +1042,21 @@ typed the default" from "the operator typed nothing", which clap's
 too - `GITHUB_TOKEN`/`GH_TOKEN` are shared conventions with the `gh` CLI
 rather than tekops settings, and `gist.rs` already works to keep that
 credential out of `/proc/<pid>/cmdline` on a machine running a validator.
+
+The count moved from six to eight when the metrics endpoint split in two:
+`bn_metric_url` and `vc_metric_url` joined the struct, and the field they
+replaced, `metric_url`, **stayed rather than being removed**. `Config`
+derives `deny_unknown_fields`, so dropping a key outright would reject every
+config file that still carries it - the same reasoning that keeps
+`--metric-url` a hidden `clap` flag rather than a removed one (see the
+`cli.rs` entry). `metric_url` also **changed what it means** in the
+process: it used to resolve to the validator client, and now resolves to
+the beacon node, matching `api_url`. `the_deprecated_metric_url_key_still_parses`
+pins that the key keeps parsing; `cli.rs`'s
+`the_deprecated_spelling_feeds_the_beacon_node_not_the_validator` pins the
+meaning it resolves to now. `doctor`'s "metrics layout" check (see the
+`doctor.rs` entry) is what catches an operator who set this key under its
+old meaning and never moved it.
 
 `path` returns `Option`, and a missing `$HOME` *and* `$XDG_CONFIG_HOME`
 yields `None` rather than an error. That is why this module has its own path
