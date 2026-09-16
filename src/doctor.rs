@@ -279,7 +279,13 @@ fn check_metrics_layout(f: &Facts, out: &mut Vec<Finding>) {
     let Probe::Ok(bn) = &f.bn_families else {
         return;
     };
-    if !bn.has_validator_families {
+    // `has_validator_families` alone is too narrow a gate: a validator client
+    // with no keys loaded exports no children of `validator_local_validator_counts`
+    // at all - this repo's own absent-is-not-zero premise, already applied to
+    // the sibling balances family in `metrics.rs`. `validator_versions` is a
+    // second, independent signal of the same family that survives that case,
+    // so either one is enough to proceed.
+    if !bn.has_validator_families && bn.validator_versions.is_empty() {
         return;
     }
 
@@ -1521,6 +1527,27 @@ mod tests {
         );
     }
 
+    /// A validator client with no keys loaded exports none of
+    /// `validator_local_validator_counts`'s children, so `has_validator_families`
+    /// is false even though the process is unmistakably a validator client:
+    /// `beacon_versions` is empty and `validator_versions` is populated. The
+    /// old `!bn.has_validator_families` gate returned before looking at
+    /// either, which is exactly the absent-is-not-zero bug this repo already
+    /// avoids for the sibling balances family.
+    #[test]
+    fn a_keyless_validator_endpoint_in_the_beacon_slot_is_still_recognised() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], false));
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+    }
+
     /// The property that makes two diagnostics worth having rather than one:
     /// an all-in-one process exports the beacon families too, and a validator
     /// client does not.
@@ -1533,11 +1560,32 @@ mod tests {
         let mut misdirected = healthy();
         misdirected.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], true));
 
-        let a = finding(&evaluate(&all_in_one), "metrics layout")
+        let all_in_one_findings = evaluate(&all_in_one);
+        let misdirected_findings = evaluate(&misdirected);
+
+        // `finding()` returns the first match by name, so on its own it can't
+        // tell "exactly one fired" from "both fired and this is the first" -
+        // asserting the count closes that gap.
+        assert_eq!(
+            all_in_one_findings
+                .iter()
+                .filter(|f| f.name == "metrics layout")
+                .count(),
+            1
+        );
+        assert_eq!(
+            misdirected_findings
+                .iter()
+                .filter(|f| f.name == "metrics layout")
+                .count(),
+            1
+        );
+
+        let a = finding(&all_in_one_findings, "metrics layout")
             .unwrap()
             .detail
             .clone();
-        let b = finding(&evaluate(&misdirected), "metrics layout")
+        let b = finding(&misdirected_findings, "metrics layout")
             .unwrap()
             .detail
             .clone();
