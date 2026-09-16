@@ -67,8 +67,18 @@ struct ApiArgs {
 /// The Prometheus scrape flags, shared by every command that reads metrics.
 #[derive(clap::Args)]
 struct MetricArgs {
-    /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
+    /// Beacon node Prometheus metrics URL (or $TEKOPS_BN_METRIC_URL)
     #[arg(long)]
+    bn_metric_url: Option<String>,
+    /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+    #[arg(long)]
+    vc_metric_url: Option<String>,
+    /// Deprecated alias for --bn-metric-url (or $TEKOPS_METRIC_URL)
+    //
+    // Hidden rather than removed: existing scripts and rc files still say it.
+    // `conflicts_with` because the two name one endpoint, so accepting both
+    // would mean silently honouring one and dropping the other.
+    #[arg(long, hide = true, conflicts_with = "bn_metric_url")]
     metric_url: Option<String>,
     /// Deployment to take port defaults from (or $TEKOPS_STACK)
     #[arg(long)]
@@ -203,12 +213,18 @@ enum Commands {
     Doctor {
         #[command(flatten)]
         api: ApiArgs,
-        /// Prometheus metrics URL (or $TEKOPS_METRIC_URL)
+        /// Beacon node Prometheus metrics URL (or $TEKOPS_BN_METRIC_URL)
         //
         // Declared here rather than by flattening `MetricArgs`: that struct
         // also declares `stack` and `json`, and flattening both is a duplicate
         // arg id, which clap turns into a panic at startup.
         #[arg(long)]
+        bn_metric_url: Option<String>,
+        /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+        #[arg(long)]
+        vc_metric_url: Option<String>,
+        /// Deprecated alias for --bn-metric-url (or $TEKOPS_METRIC_URL)
+        #[arg(long, hide = true, conflicts_with = "bn_metric_url")]
         metric_url: Option<String>,
         /// Filesystem to check for free space (or $TEKOPS_DATA_DIR)
         //
@@ -325,7 +341,8 @@ pub fn run() -> ExitCode {
             // needs the container name and the two URLs, and duplicating that
             // here would be a second approximation of the config `doctor`
             // itself builds. The extra spawn is paid only with `--doctor`.
-            let probe = doctor.then(|| doctor_probe_config(stack, None, None, None, &cfg));
+            let probe = doctor
+                .then(|| doctor_probe_config(stack, None, MetricUrlFlags::default(), None, &cfg));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -374,30 +391,30 @@ pub fn run() -> ExitCode {
         }
         Commands::Duties { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
-                metrics.metric_url,
-                env::var("TEKOPS_METRIC_URL").ok(),
-                cfg.metric_url.clone(),
+            let client = MetricsClient::new(resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
                 stack,
             ));
             exit_for_api(metrics_duties(&client, metrics.json), stack)
         }
         Commands::Validators { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
-                metrics.metric_url,
-                env::var("TEKOPS_METRIC_URL").ok(),
-                cfg.metric_url.clone(),
+            let client = MetricsClient::new(resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
                 stack,
             ));
             exit_for_api(metrics_validators(&client, metrics.json), stack)
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
-                metrics.metric_url,
-                env::var("TEKOPS_METRIC_URL").ok(),
-                cfg.metric_url.clone(),
+            let client = MetricsClient::new(resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
                 stack,
             ));
             exit_for_api(metrics_version(&client, metrics.json), stack)
@@ -420,9 +437,20 @@ pub fn run() -> ExitCode {
         }
         Commands::Doctor {
             api,
+            bn_metric_url,
+            vc_metric_url,
             metric_url,
             data_dir,
-        } => run_doctor(api, metric_url, data_dir, &cfg),
+        } => run_doctor(
+            api,
+            MetricUrlFlags {
+                bn: bn_metric_url,
+                vc: vc_metric_url,
+                legacy: metric_url,
+            },
+            data_dir,
+            &cfg,
+        ),
     }
 }
 
@@ -437,7 +465,7 @@ pub fn run() -> ExitCode {
 /// hint; there would be nothing left for it to suggest.
 ///
 /// The ladder terminates in `Stack::BareMetal` rather than `None`:
-/// `resolve_base_url`/`resolve_metric_url` already default to bare-metal
+/// `resolve_base_url`/`resolve_vc_metric_url` already default to bare-metal
 /// independently when handed `None`, so leaving this rung off let the report
 /// header say "unknown stack" directly above two confidently bare-metal URLs -
 /// two different facts that must not disagree.
@@ -505,6 +533,17 @@ fn doctor_needs_stack_detection(
     resolve_stack(flag, env, cfg).is_none()
 }
 
+/// The three spellings of the metrics endpoints, as given on the command line.
+///
+/// A struct rather than three more positional parameters: `doctor_probe_config`
+/// already takes five, and `dump-logs --doctor` passes nothing for any of them.
+#[derive(Default)]
+struct MetricUrlFlags {
+    bn: Option<String>,
+    vc: Option<String>,
+    legacy: Option<String>,
+}
+
 /// Doctor's full probe configuration, `docker ps` detection included.
 ///
 /// Lifted out of `run_doctor` so `dump-logs --doctor` builds the identical
@@ -516,10 +555,13 @@ fn doctor_needs_stack_detection(
 fn doctor_probe_config(
     stack_flag: Option<Stack>,
     api_url: Option<String>,
-    metric_url: Option<String>,
+    metrics: MetricUrlFlags,
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
+    // Both are consumed in the doctor split; see Task 6.
+    let _ = (&metrics.bn, &metrics.legacy);
+
     // Read once, used for both `doctor_needs_stack_detection` (below) and
     // `resolve_doctor_stack`.
     let stack_env = env::var("TEKOPS_STACK").ok();
@@ -569,10 +611,10 @@ fn doctor_probe_config(
             cfg.api_url.clone(),
             stack,
         ),
-        metric_url: resolve_metric_url(
-            metric_url,
-            env::var("TEKOPS_METRIC_URL").ok(),
-            cfg.metric_url.clone(),
+        metric_url: resolve_vc_metric_url(
+            metrics.vc,
+            env::var("TEKOPS_VC_METRIC_URL").ok(),
+            cfg.vc_metric_url.clone(),
             stack,
         ),
         container,
@@ -587,11 +629,11 @@ fn doctor_probe_config(
 
 fn run_doctor(
     api: ApiArgs,
-    metric_url: Option<String>,
+    metrics: MetricUrlFlags,
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> ExitCode {
-    let probe_cfg = doctor_probe_config(api.stack, api.api_url, metric_url, data_dir, cfg);
+    let probe_cfg = doctor_probe_config(api.stack, api.api_url, metrics, data_dir, cfg);
 
     let facts = crate::doctor::probe(&probe_cfg);
     let findings = crate::doctor::evaluate(&facts);
@@ -648,16 +690,64 @@ fn resolve_base_url(
         .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).api_url().to_string())
 }
 
-/// The Prometheus scrape URL, on the same ladder as `resolve_base_url`.
-fn resolve_metric_url(
+/// The beacon node's Prometheus scrape URL.
+///
+/// The deprecated `--metric-url` / `$TEKOPS_METRIC_URL` / `metric_url` trio
+/// feeds this ladder rather than the validator client's. The unprefixed
+/// spelling means the beacon node because `--api-url` is likewise unprefixed
+/// and likewise the beacon node's: the tool's primary subject gets the plain
+/// name, and the validator client is the one that has to say so.
+///
+/// New spellings beat legacy ones *within* a tier and never across one, which
+/// keeps the repo's flag > environment > config > default discipline intact.
+///
+/// This is a change of meaning for the deprecated trio, which used to resolve
+/// to the validator client. `doctor`'s "metrics layout" check recognises a
+/// config written under the old meaning and names the fix.
+//
+// Nothing outside tests calls this yet - `version` gains its bn endpoint in
+// Task 5. Without this, both this function and `Stack::bn_metric_url` (which
+// only this calls) would be dead code between the two tasks.
+#[allow(dead_code)]
+fn resolve_bn_metric_url(
+    flag: Option<String>,
+    legacy_flag: Option<String>,
+    env: Option<String>,
+    legacy_env: Option<String>,
+    cfg: Option<String>,
+    legacy_cfg: Option<String>,
+    stack: Option<Stack>,
+) -> String {
+    flag.or(legacy_flag)
+        .or(env)
+        .or(legacy_env)
+        .or(cfg)
+        .or(legacy_cfg)
+        .unwrap_or_else(|| {
+            stack
+                .unwrap_or(Stack::BareMetal)
+                .bn_metric_url()
+                .to_string()
+        })
+}
+
+/// The validator client's Prometheus scrape URL.
+///
+/// No legacy rung: nothing reaches this but its own spellings and the stack
+/// default. An operator migrating from the old `metric_url` has to say
+/// `vc_metric_url` explicitly, which is the point.
+fn resolve_vc_metric_url(
     flag: Option<String>,
     env: Option<String>,
     cfg: Option<String>,
     stack: Option<Stack>,
 ) -> String {
-    flag.or(env)
-        .or(cfg)
-        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).vc_metric_url().to_string())
+    flag.or(env).or(cfg).unwrap_or_else(|| {
+        stack
+            .unwrap_or(Stack::BareMetal)
+            .vc_metric_url()
+            .to_string()
+    })
 }
 
 /// The names of running containers, or `None` if Docker cannot be asked.
@@ -1318,7 +1408,7 @@ mod tests {
         let cfg = doctor_probe_config(
             Some(Stack::BareMetal),
             None,
-            None,
+            MetricUrlFlags::default(),
             None,
             &crate::config::Config::default(),
         );
@@ -1329,7 +1419,7 @@ mod tests {
         );
         assert_eq!(
             cfg.metric_url,
-            resolve_metric_url(None, None, None, Some(Stack::BareMetal))
+            resolve_vc_metric_url(None, None, None, Some(Stack::BareMetal))
         );
     }
 
@@ -1338,7 +1428,7 @@ mod tests {
         let cfg = doctor_probe_config(
             Some(Stack::BareMetal),
             Some("http://example.invalid:1234".to_string()),
-            None,
+            MetricUrlFlags::default(),
             None,
             &crate::config::Config::default(),
         );
@@ -1440,6 +1530,8 @@ mod tests {
             cli.command,
             Commands::Duties {
                 metrics: MetricArgs {
+                    bn_metric_url: None,
+                    vc_metric_url: None,
                     metric_url: None,
                     stack: None,
                     json: false
@@ -1455,6 +1547,8 @@ mod tests {
             cli.command,
             Commands::Validators {
                 metrics: MetricArgs {
+                    bn_metric_url: None,
+                    vc_metric_url: None,
                     metric_url: None,
                     stack: None,
                     json: false
@@ -1470,6 +1564,8 @@ mod tests {
             cli.command,
             Commands::Version {
                 metrics: MetricArgs {
+                    bn_metric_url: None,
+                    vc_metric_url: None,
                     metric_url: None,
                     stack: None,
                     json: false
@@ -1862,7 +1958,7 @@ mod tests {
     #[test]
     fn metric_url_precedence_matches_the_api_url_ladder() {
         assert_eq!(
-            resolve_metric_url(
+            resolve_vc_metric_url(
                 Some("http://x:2/m".into()),
                 None,
                 None,
@@ -1871,11 +1967,11 @@ mod tests {
             "http://x:2/m"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::EthDocker)),
+            resolve_vc_metric_url(None, None, None, Some(Stack::EthDocker)),
             "http://localhost:8009/metrics"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, None),
+            resolve_vc_metric_url(None, None, None, None),
             "http://localhost:8010/metrics"
         );
     }
@@ -1894,7 +1990,7 @@ mod tests {
             "http://custom:5099"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
+            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
             "http://localhost:9101/metrics"
         );
     }
@@ -1941,7 +2037,7 @@ mod tests {
     #[test]
     fn the_metric_url_follows_the_same_ladder() {
         assert_eq!(
-            resolve_metric_url(
+            resolve_vc_metric_url(
                 Some("http://flag:1".into()),
                 Some("http://env:2".into()),
                 Some("http://cfg:3".into()),
@@ -1950,7 +2046,7 @@ mod tests {
             "http://flag:1"
         );
         assert_eq!(
-            resolve_metric_url(
+            resolve_vc_metric_url(
                 None,
                 Some("http://env:2".into()),
                 Some("http://cfg:3".into()),
@@ -1959,13 +2055,196 @@ mod tests {
             "http://env:2"
         );
         assert_eq!(
-            resolve_metric_url(None, None, Some("http://cfg:3".into()), None),
+            resolve_vc_metric_url(None, None, Some("http://cfg:3".into()), None),
             "http://cfg:3"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
+            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
             Stack::RocketPool.vc_metric_url()
         );
+    }
+
+    /// The beacon node's ladder, one tier at a time. New spellings beat legacy
+    /// ones *within* a tier and never across one, so a legacy flag still beats
+    /// a new environment variable.
+    #[test]
+    fn bn_metric_url_ladder_prefers_each_tier_in_order() {
+        let all = || {
+            (
+                Some("http://flag".to_string()),
+                Some("http://legacy-flag".to_string()),
+                Some("http://env".to_string()),
+                Some("http://legacy-env".to_string()),
+                Some("http://cfg".to_string()),
+                Some("http://legacy-cfg".to_string()),
+            )
+        };
+
+        let (f, lf, e, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(f, lf, e, le, c, lc, None),
+            "http://flag"
+        );
+
+        let (_, lf, e, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, lf, e, le, c, lc, None),
+            "http://legacy-flag"
+        );
+
+        let (_, _, e, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, e, le, c, lc, None),
+            "http://env"
+        );
+
+        let (_, _, _, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, le, c, lc, None),
+            "http://legacy-env"
+        );
+
+        let (_, _, _, _, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, c, lc, None),
+            "http://cfg"
+        );
+
+        let (_, _, _, _, _, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, None, lc, None),
+            "http://legacy-cfg"
+        );
+    }
+
+    #[test]
+    fn bn_metric_url_falls_back_to_the_stacks_beacon_port() {
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, None, None, Some(Stack::RocketPool)),
+            "http://localhost:9100/metrics"
+        );
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, None, None, None),
+            "http://localhost:8008/metrics"
+        );
+    }
+
+    /// The meaning change, pinned. The deprecated spelling used to resolve to
+    /// the validator client; it now resolves to the beacon node, agreeing with
+    /// the unprefixed `--api-url`. If someone later "fixes" the alias back,
+    /// this test is the thing that objects.
+    #[test]
+    fn the_deprecated_spelling_feeds_the_beacon_node_not_the_validator() {
+        let legacy = "http://legacy".to_string();
+
+        assert_eq!(
+            resolve_bn_metric_url(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(legacy.clone()),
+                Some(Stack::EthDocker)
+            ),
+            "http://legacy"
+        );
+
+        // The same value must not reach the validator client's ladder at all.
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, Some(Stack::EthDocker)),
+            "http://localhost:8009/metrics"
+        );
+    }
+
+    #[test]
+    fn vc_metric_url_ladder_prefers_each_tier_in_order() {
+        assert_eq!(
+            resolve_vc_metric_url(
+                Some("http://flag".into()),
+                Some("http://env".into()),
+                Some("http://cfg".into()),
+                None
+            ),
+            "http://flag"
+        );
+        assert_eq!(
+            resolve_vc_metric_url(
+                None,
+                Some("http://env".into()),
+                Some("http://cfg".into()),
+                None
+            ),
+            "http://env"
+        );
+        assert_eq!(
+            resolve_vc_metric_url(None, None, Some("http://cfg".into()), None),
+            "http://cfg"
+        );
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
+            "http://localhost:9101/metrics"
+        );
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, None),
+            "http://localhost:8010/metrics"
+        );
+    }
+
+    /// The deprecated flag and its replacement name the same endpoint, so
+    /// allowing both would mean silently honouring one and dropping the other.
+    #[test]
+    fn metric_url_and_bn_metric_url_cannot_both_be_given() {
+        let err = command().try_get_matches_from([
+            "tekops",
+            "version",
+            "--metric-url",
+            "http://a",
+            "--bn-metric-url",
+            "http://b",
+        ]);
+        assert!(err.is_err(), "clap must reject both spellings at once");
+    }
+
+    /// The deprecated flag is accepted but not advertised.
+    #[test]
+    fn the_deprecated_metric_url_flag_is_hidden_but_still_parses() {
+        assert!(command()
+            .try_get_matches_from(["tekops", "version", "--metric-url", "http://a"])
+            .is_ok());
+
+        // A separate binding: `find_subcommand_mut` borrows mutably, so it
+        // cannot be called on the temporary `command()` returns.
+        let mut cmd = command();
+        let help = cmd
+            .find_subcommand_mut("version")
+            .expect("version subcommand")
+            .render_help()
+            .to_string();
+        assert!(
+            !help.contains("--metric-url"),
+            "the deprecated flag must not appear in help: {help}"
+        );
+        assert!(help.contains("--bn-metric-url"), "{help}");
+        assert!(help.contains("--vc-metric-url"), "{help}");
+    }
+
+    /// Completions are generated from `command()`, so the new flags arrive
+    /// automatically. Nothing proved that, though, and `hide = true` sitting
+    /// on a neighbouring flag is exactly the kind of thing that could quietly
+    /// take the others with it.
+    #[test]
+    fn generated_completions_offer_both_metric_flags() {
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::shells::Bash,
+            &mut command(),
+            "tekops",
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("clap_complete emits UTF-8");
+        assert!(script.contains("bn-metric-url"), "{script}");
+        assert!(script.contains("vc-metric-url"), "{script}");
     }
 
     #[test]
@@ -2210,7 +2489,9 @@ mod tests {
             "doctor",
             "--api-url",
             "http://a:5052",
-            "--metric-url",
+            "--bn-metric-url",
+            "http://a:8008/metrics",
+            "--vc-metric-url",
             "http://a:8009/metrics",
             "--stack",
             "rocketpool",
@@ -2222,11 +2503,15 @@ mod tests {
         match cli.command {
             Commands::Doctor {
                 api,
+                bn_metric_url,
+                vc_metric_url,
                 metric_url,
                 data_dir,
             } => {
                 assert_eq!(api.api_url.as_deref(), Some("http://a:5052"));
-                assert_eq!(metric_url.as_deref(), Some("http://a:8009/metrics"));
+                assert_eq!(bn_metric_url.as_deref(), Some("http://a:8008/metrics"));
+                assert_eq!(vc_metric_url.as_deref(), Some("http://a:8009/metrics"));
+                assert_eq!(metric_url, None);
                 assert_eq!(data_dir.as_deref(), Some(Path::new("/data")));
                 assert_eq!(api.stack, Some(Stack::RocketPool));
                 assert!(api.json);
