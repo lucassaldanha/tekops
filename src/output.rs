@@ -244,8 +244,16 @@ pub fn format_doctor_report(f: &Facts, findings: &[Finding]) -> String {
         .stack
         .map(|st| st.to_string())
         .unwrap_or_else(|| "unknown stack".to_string());
-    let version = match &f.version {
-        crate::doctor::Probe::Ok(v) if !v.versions.is_empty() => v.versions.join(", "),
+    // Prefer the beacon node's version, falling back to the validator
+    // client's - an all-in-one deployment reports both, and a separated one
+    // still has a version to show even when only one process answered.
+    let version = match (&f.bn_families, &f.vc_families) {
+        (crate::doctor::Probe::Ok(bn), _) if !bn.beacon_versions.is_empty() => {
+            bn.beacon_versions.join(", ")
+        }
+        (_, crate::doctor::Probe::Ok(vc)) if !vc.validator_versions.is_empty() => {
+            vc.validator_versions.join(", ")
+        }
         _ => "version unknown".to_string(),
     };
     s.push_str(&format!(
@@ -485,14 +493,15 @@ mod tests {
     fn facts_for_output() -> crate::doctor::Facts {
         use crate::doctor::Probe;
         use crate::host::{Disk, Load, Memory};
-        use crate::metrics::VersionInfo;
+        use crate::metrics::EndpointFamilies;
         use crate::stack::Stack;
         use std::collections::BTreeMap;
 
         crate::doctor::Facts {
             stack: Some(Stack::EthDocker),
             api_url: "http://localhost:5052".to_string(),
-            metric_url: "http://localhost:8009/metrics".to_string(),
+            bn_metric_url: "http://localhost:8008/metrics".to_string(),
+            vc_metric_url: "http://localhost:8009/metrics".to_string(),
             os: "linux",
             arch: "x86_64",
             health: Probe::Ok(HealthState::Ready),
@@ -509,8 +518,15 @@ mod tests {
                 finalized_epoch: "98".to_string(),
             }),
             peers: Probe::Ok(vec![]),
-            version: Probe::Ok(VersionInfo {
-                versions: vec!["teku/v25.1.0".to_string()],
+            bn_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec!["teku/v25.1.0".to_string()],
+                validator_versions: vec![],
+                has_validator_families: false,
+            }),
+            vc_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec![],
+                validator_versions: vec!["teku/v25.1.0".to_string()],
+                has_validator_families: true,
             }),
             duties: Probe::Ok(DutiesMetrics {
                 published_blocks: 1,

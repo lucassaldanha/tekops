@@ -232,11 +232,6 @@ pub struct ValidatorMetrics {
     pub total_eth: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct VersionInfo {
-    pub versions: Vec<String>,
-}
-
 /// Everything `version` and `doctor` need to know about one scrape endpoint,
 /// from a single fetch.
 ///
@@ -341,26 +336,6 @@ impl MetricsClient {
             ),
             has_validator_families: has_metric(&samples, VALIDATOR_COUNTS_METRIC),
         })
-    }
-
-    /// Reads the running Teku version from whichever of the beacon-node or
-    /// validator-client version metric is present on this scrape - only one
-    /// exists at a time, depending on which process's `/metrics` endpoint
-    /// this client points at.
-    pub fn version(&self) -> Result<VersionInfo, ApiError> {
-        let samples = self.fetch()?;
-        let mut versions = distinct_label_values(&samples, BEACON_VERSION_METRIC, "version");
-        if versions.is_empty() {
-            versions = distinct_label_values(&samples, VALIDATOR_VERSION_METRIC, "version");
-        }
-        if versions.is_empty() {
-            return Err(ApiError::Malformed(format!(
-                "no version metric found at {} (looked for {BEACON_VERSION_METRIC} and \
-                 {VALIDATOR_VERSION_METRIC}); is this a Teku metrics endpoint?",
-                self.url
-            )));
-        }
-        Ok(VersionInfo { versions })
     }
 
     /// Fails when `name` is absent from the scrape entirely. Without this the
@@ -601,47 +576,6 @@ beacon_teku_version_total{version="teku/v24.10.0"} 1
     }
 
     #[test]
-    fn version_reads_beacon_metric_when_present() {
-        let mut server = mockito::Server::new();
-        let body = r#"beacon_teku_version_total{version="teku/v24.9.0"} 1"#;
-        let _m = server
-            .mock("GET", "/metrics")
-            .with_status(200)
-            .with_body(body)
-            .create();
-        let client = MetricsClient::new(format!("{}/metrics", server.url()));
-        let info = client.version().unwrap();
-        assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
-    }
-
-    #[test]
-    fn version_falls_back_to_validator_metric_when_beacon_metric_absent() {
-        let mut server = mockito::Server::new();
-        let body = r#"validator_teku_version_total{version="teku/v24.9.0"} 1"#;
-        let _m = server
-            .mock("GET", "/metrics")
-            .with_status(200)
-            .with_body(body)
-            .create();
-        let client = MetricsClient::new(format!("{}/metrics", server.url()));
-        let info = client.version().unwrap();
-        assert_eq!(info.versions, vec!["teku/v24.9.0".to_string()]);
-    }
-
-    #[test]
-    fn version_errors_when_neither_metric_present() {
-        let mut server = mockito::Server::new();
-        let _m = server
-            .mock("GET", "/metrics")
-            .with_status(200)
-            .with_body("jvm_threads_current 1")
-            .create();
-        let client = MetricsClient::new(format!("{}/metrics", server.url()));
-        let err = client.version().unwrap_err();
-        assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
-    }
-
-    #[test]
     fn find_closing_brace_ignores_braces_inside_quoted_values() {
         let body = r#"beacon_teku_version_total{version="teku/v25.1.0 {dev}"} 1"#;
         let samples = parse_exposition(body);
@@ -743,13 +677,6 @@ validator_local_validator_balances{pubkey="0x2"} 32000000000
         let client = MetricsClient::new(format!("{}/metrics", server.url()));
         let err = client.validators().unwrap_err();
         assert!(matches!(err, ApiError::Malformed(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn version_errors_when_unreachable() {
-        let client = MetricsClient::new("http://127.0.0.1:1/metrics");
-        let err = client.version().unwrap_err();
-        assert!(matches!(err, ApiError::Unreachable(_)));
     }
 
     #[test]

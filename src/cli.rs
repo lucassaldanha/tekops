@@ -568,9 +568,6 @@ fn doctor_probe_config(
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
-    // Both are consumed in the doctor split; see Task 6.
-    let _ = (&metrics.bn, &metrics.legacy);
-
     // Read once, used for both `doctor_needs_stack_detection` (below) and
     // `resolve_doctor_stack`.
     let stack_env = env::var("TEKOPS_STACK").ok();
@@ -620,7 +617,16 @@ fn doctor_probe_config(
             cfg.api_url.clone(),
             stack,
         ),
-        metric_url: resolve_vc_metric_url(
+        bn_metric_url: resolve_bn_metric_url(
+            metrics.bn,
+            metrics.legacy,
+            env::var("TEKOPS_BN_METRIC_URL").ok(),
+            env::var("TEKOPS_METRIC_URL").ok(),
+            cfg.bn_metric_url.clone(),
+            cfg.metric_url.clone(),
+            stack,
+        ),
+        vc_metric_url: resolve_vc_metric_url(
             metrics.vc,
             env::var("TEKOPS_VC_METRIC_URL").ok(),
             cfg.vc_metric_url.clone(),
@@ -1473,9 +1479,34 @@ mod tests {
             resolve_base_url(None, None, None, Some(Stack::BareMetal))
         );
         assert_eq!(
-            cfg.metric_url,
+            cfg.bn_metric_url,
+            resolve_bn_metric_url(None, None, None, None, None, None, Some(Stack::BareMetal))
+        );
+        assert_eq!(
+            cfg.vc_metric_url,
             resolve_vc_metric_url(None, None, None, Some(Stack::BareMetal))
         );
+    }
+
+    /// The legacy trio (`--metric-url` / `$TEKOPS_METRIC_URL` / `metric_url`)
+    /// used to mean the validator client; `doctor` now reads it as the beacon
+    /// node's URL. An operator who set it to steer `doctor` specifically must
+    /// still have it reach *some* field of `ProbeConfig`, not be silently
+    /// dropped - see `resolve_bn_metric_url`'s doc comment.
+    #[test]
+    fn doctor_probe_config_still_honours_the_legacy_metric_url_flag() {
+        let cfg = doctor_probe_config(
+            Some(Stack::BareMetal),
+            None,
+            MetricUrlFlags {
+                bn: None,
+                vc: None,
+                legacy: Some("http://legacy.invalid:9000".to_string()),
+            },
+            None,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(cfg.bn_metric_url, "http://legacy.invalid:9000");
     }
 
     #[test]
@@ -1900,17 +1931,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["counts_by_status"]["active_ongoing"], 100);
         assert_eq!(value["total_eth"], 63.5);
-    }
-
-    #[test]
-    fn version_json_output_is_valid_json() {
-        use crate::metrics::VersionInfo;
-        let info = VersionInfo {
-            versions: vec!["teku/v24.9.0".to_string()],
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["versions"][0], "teku/v24.9.0");
     }
 
     #[test]

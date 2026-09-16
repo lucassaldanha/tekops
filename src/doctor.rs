@@ -13,7 +13,7 @@ use crate::beaconapi::{BeaconClient, FinalityCheckpoints, HealthState, PeerInfo,
 use crate::docker::ContainerState;
 use crate::host::{Disk, Load, Memory};
 use crate::http::ApiError;
-use crate::metrics::{DutiesMetrics, MetricsClient, ValidatorMetrics, VersionInfo};
+use crate::metrics::{DutiesMetrics, EndpointFamilies, MetricsClient, ValidatorMetrics};
 use crate::output::plural;
 use crate::stack::Stack;
 use serde::Serialize;
@@ -138,7 +138,8 @@ impl Finding {
 pub struct Facts {
     pub stack: Option<Stack>,
     pub api_url: String,
-    pub metric_url: String,
+    pub bn_metric_url: String,
+    pub vc_metric_url: String,
     pub os: &'static str,
     pub arch: &'static str,
 
@@ -146,7 +147,8 @@ pub struct Facts {
     pub syncing: Probe<SyncingStatus>,
     pub finality: Probe<FinalityCheckpoints>,
     pub peers: Probe<Vec<PeerInfo>>,
-    pub version: Probe<VersionInfo>,
+    pub bn_families: Probe<EndpointFamilies>,
+    pub vc_families: Probe<EndpointFamilies>,
     pub duties: Probe<DutiesMetrics>,
     pub validators: Probe<ValidatorMetrics>,
 
@@ -172,7 +174,9 @@ pub struct Facts {
 pub fn evaluate(f: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
     check_beacon_api(f, &mut out);
-    check_metrics_endpoint(f, &mut out);
+    check_bn_metrics(f, &mut out);
+    check_vc_metrics(f, &mut out);
+    check_metrics_layout(f, &mut out);
     check_syncing(f, &mut out);
     check_finality(f, &mut out);
     check_peers(f, &mut out);
@@ -212,21 +216,98 @@ fn check_beacon_api(f: &Facts, out: &mut Vec<Finding>) {
     }
 }
 
-fn check_metrics_endpoint(f: &Facts, out: &mut Vec<Finding>) {
-    match &f.version {
-        Probe::Ok(v) => push(
+fn check_bn_metrics(f: &Facts, out: &mut Vec<Finding>) {
+    check_one_metrics_endpoint(
+        "beacon node metrics",
+        &f.bn_families,
+        &f.bn_metric_url,
+        |e| &e.beacon_versions,
+        out,
+    );
+}
+
+fn check_vc_metrics(f: &Facts, out: &mut Vec<Finding>) {
+    check_one_metrics_endpoint(
+        "validator metrics",
+        &f.vc_families,
+        &f.vc_metric_url,
+        |e| &e.validator_versions,
+        out,
+    );
+}
+
+/// One endpoint's check. Reachable-but-wrong is a Warn rather than a Fail: the
+/// node may be perfectly healthy and only tekops pointed somewhere odd, and
+/// `check_metrics_layout` below often has a specific explanation for it.
+fn check_one_metrics_endpoint(
+    name: &'static str,
+    probe: &Probe<EndpointFamilies>,
+    url: &str,
+    pick: fn(&EndpointFamilies) -> &Vec<String>,
+    out: &mut Vec<Finding>,
+) {
+    match probe {
+        Probe::Ok(e) if !pick(e).is_empty() => push(
             out,
-            "metrics endpoint",
+            name,
             Status::Pass,
-            format!("{} at {}", v.versions.join(", "), f.metric_url),
+            format!("{} at {url}", pick(e).join(", ")),
         ),
-        Probe::Failed(e) if f.version.is_unreachable() => {
-            push(out, "metrics endpoint", Status::Fail, e)
-        }
-        // Reachable but exporting nothing we recognize: almost always the
-        // beacon node's port where the validator client's was meant.
-        Probe::Failed(e) => push(out, "metrics endpoint", Status::Warn, e),
-        Probe::Skipped(why) => push(out, "metrics endpoint", Status::Fail, *why),
+        Probe::Ok(_) => push(
+            out,
+            name,
+            Status::Warn,
+            format!("{url} responded but exports no matching Teku version metric"),
+        ),
+        Probe::Failed(e) => push(out, name, Status::Fail, e),
+        Probe::Skipped(why) => push(out, name, Status::Fail, *why),
+    }
+}
+
+/// The two ways a metrics endpoint pair can be wrong that tekops can name.
+///
+/// Both read which families each endpoint actually exports, and that is what
+/// tells them apart: a process serving both roles exports the beacon families
+/// *and* the validator ones, while a validator client exports only the
+/// validator ones. So the pair is mutually exclusive by construction, and
+/// `the_two_layout_diagnostics_are_mutually_exclusive` pins that.
+///
+/// Nothing is repointed automatically. A heuristic that silently moved an
+/// operator's endpoint would be the same class of mistake `require_metric`
+/// exists to prevent, so this only ever advises.
+fn check_metrics_layout(f: &Facts, out: &mut Vec<Finding>) {
+    let Probe::Ok(bn) = &f.bn_families else {
+        return;
+    };
+    if !bn.has_validator_families {
+        return;
+    }
+
+    if bn.beacon_versions.is_empty() {
+        push(
+            out,
+            "metrics layout",
+            Status::Warn,
+            format!(
+                "{} is a validator client endpoint, not a beacon node one. \
+                 The unprefixed `metric_url` now means the beacon node; move \
+                 this value to `vc_metric_url` (or $TEKOPS_VC_METRIC_URL, or \
+                 --vc-metric-url).",
+                f.bn_metric_url
+            ),
+        );
+    } else if f.vc_families.is_unreachable() {
+        push(
+            out,
+            "metrics layout",
+            Status::Warn,
+            format!(
+                "{} exports both beacon and validator metrics and {} is \
+                 unreachable: this looks like an all-in-one deployment. Set \
+                 `vc_metric_url` to {}.",
+                f.bn_metric_url, f.vc_metric_url, f.bn_metric_url
+            ),
+        );
     }
 }
 
@@ -576,7 +657,8 @@ fn gib(bytes: u64) -> String {
 pub struct ProbeConfig {
     pub stack: Option<Stack>,
     pub api_url: String,
-    pub metric_url: String,
+    pub bn_metric_url: String,
+    pub vc_metric_url: String,
     /// The consensus container to inspect, when there is one.
     pub container: Option<String>,
     /// Bare-metal disk target. On a Docker stack the container's own mounts
@@ -610,14 +692,28 @@ pub fn probe(cfg: &ProbeConfig) -> Facts {
         )
     };
 
-    let mc = MetricsClient::new(cfg.metric_url.clone());
-    let version = Probe::from_result(mc.version());
-    let (duties, validators) = if version.is_unreachable() {
+    let bn_families = Probe::from_result(MetricsClient::new(cfg.bn_metric_url.clone()).families());
+
+    // Equal URLs mean one process serving both families. Scrape once and hand
+    // the same answer to both slots rather than asking the same endpoint
+    // twice: `EndpointFamilies` is `Clone` precisely for this.
+    let vc_mc = MetricsClient::new(cfg.vc_metric_url.clone());
+    let vc_families = if cfg.bn_metric_url == cfg.vc_metric_url {
+        match &bn_families {
+            Probe::Ok(f) => Probe::Ok(f.clone()),
+            Probe::Failed(e) => Probe::Failed(e.clone()),
+            Probe::Skipped(s) => Probe::Skipped(s),
+        }
+    } else {
+        Probe::from_result(vc_mc.families())
+    };
+
+    let (duties, validators) = if vc_families.is_unreachable() {
         (Probe::Skipped(METRICS_DOWN), Probe::Skipped(METRICS_DOWN))
     } else {
         (
-            Probe::from_result(mc.duties()),
-            Probe::from_result(mc.validators()),
+            Probe::from_result(vc_mc.duties()),
+            Probe::from_result(vc_mc.validators()),
         )
     };
 
@@ -652,14 +748,16 @@ pub fn probe(cfg: &ProbeConfig) -> Facts {
     Facts {
         stack: cfg.stack,
         api_url: cfg.api_url.clone(),
-        metric_url: cfg.metric_url.clone(),
+        bn_metric_url: cfg.bn_metric_url.clone(),
+        vc_metric_url: cfg.vc_metric_url.clone(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         health,
         syncing,
         finality,
         peers,
-        version,
+        bn_families,
+        vc_families,
         duties,
         validators,
         containers,
@@ -682,7 +780,6 @@ fn inspect_container(name: &str) -> Option<ContainerState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::VersionInfo;
     use std::collections::BTreeMap;
 
     fn syncing(is_syncing: bool, distance: &str) -> SyncingStatus {
@@ -700,7 +797,8 @@ mod tests {
         Facts {
             stack: Some(Stack::BareMetal),
             api_url: "http://localhost:5051".to_string(),
-            metric_url: "http://localhost:8010/metrics".to_string(),
+            bn_metric_url: "http://localhost:8008/metrics".to_string(),
+            vc_metric_url: "http://localhost:8010/metrics".to_string(),
             os: "linux",
             arch: "x86_64",
             health: Probe::Ok(HealthState::Ready),
@@ -711,8 +809,15 @@ mod tests {
                 finalized_epoch: "98".to_string(),
             }),
             peers: Probe::Ok(peers(30)),
-            version: Probe::Ok(VersionInfo {
-                versions: vec!["teku/v25.1.0".to_string()],
+            bn_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec!["teku/v25.1.0".to_string()],
+                validator_versions: vec![],
+                has_validator_families: false,
+            }),
+            vc_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec![],
+                validator_versions: vec!["teku/v25.1.0".to_string()],
+                has_validator_families: true,
             }),
             duties: Probe::Ok(DutiesMetrics {
                 published_blocks: 1,
@@ -1295,54 +1400,154 @@ mod tests {
         assert_eq!(status_of(&evaluate(&f), "peer count"), Some(Status::Warn));
     }
 
-    // --- metrics endpoint ---
+    // --- bn/vc metrics ---
     //
     // The only genuinely non-obvious status logic in the module: unreachable
     // is Fail, but reachable-and-erroring is Warn, since that almost always
-    // means the scrape is pointed at the beacon node's port rather than the
-    // validator client's - a misconfiguration, not an outage.
+    // means the scrape is pointed at the wrong process - a misconfiguration,
+    // not an outage. `check_metrics_layout` below often names the reason.
+
+    fn families(beacon: &[&str], validator: &[&str], has_vc: bool) -> EndpointFamilies {
+        EndpointFamilies {
+            beacon_versions: beacon.iter().map(|s| s.to_string()).collect(),
+            validator_versions: validator.iter().map(|s| s.to_string()).collect(),
+            has_validator_families: has_vc,
+        }
+    }
+
+    fn finding<'a>(findings: &'a [Finding], name: &str) -> Option<&'a Finding> {
+        findings.iter().find(|f| f.name == name)
+    }
 
     #[test]
-    fn metrics_endpoint_passes_when_a_version_is_reported() {
+    fn bn_metrics_passes_when_a_version_is_reported() {
         let f = healthy();
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Pass)
         );
     }
 
     #[test]
-    fn metrics_endpoint_fails_when_unreachable() {
+    fn bn_metrics_fails_when_unreachable() {
         let mut f = healthy();
-        f.version = Probe::Failed("could not reach endpoint: refused".to_string());
+        f.bn_families = Probe::Failed("could not reach endpoint: refused".to_string());
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Fail)
         );
     }
 
     #[test]
-    fn metrics_endpoint_warns_when_reachable_but_missing_the_metric() {
+    fn bn_metrics_warns_when_reachable_but_missing_the_metric() {
         let mut f = healthy();
-        f.version = Probe::Failed(
-            "metric beacon_teku_version_total not found at http://localhost:8010/metrics \
-             - the endpoint responded but exports no such metric"
-                .to_string(),
-        );
+        f.bn_families = Probe::Ok(families(&[], &[], false));
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Warn)
         );
     }
 
     #[test]
-    fn metrics_endpoint_fails_when_skipped() {
+    fn bn_metrics_fails_when_skipped() {
         let mut f = healthy();
-        f.version = Probe::Skipped("beacon api unreachable");
+        f.bn_families = Probe::Skipped("beacon api unreachable");
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Fail)
         );
+    }
+
+    #[test]
+    fn both_metrics_endpoints_are_checked_separately() {
+        let findings = evaluate(&healthy());
+        assert!(finding(&findings, "beacon node metrics").is_some());
+        assert!(finding(&findings, "validator metrics").is_some());
+    }
+
+    #[test]
+    fn a_dead_validator_endpoint_does_not_fail_the_beacon_one() {
+        let mut f = healthy();
+        f.vc_families = Probe::Failed("could not reach endpoint".to_string());
+        let findings = evaluate(&f);
+        assert_eq!(
+            finding(&findings, "beacon node metrics").unwrap().status,
+            Status::Pass
+        );
+        assert_eq!(
+            finding(&findings, "validator metrics").unwrap().status,
+            Status::Fail
+        );
+    }
+
+    /// One process exporting both families, with nothing on the validator
+    /// port. eth-docker's `teku-allin1.yml` produces exactly this, and its
+    /// defaults (8008 and 8009) are not equal, so nothing else catches it.
+    #[test]
+    fn an_all_in_one_deployment_is_recognised_and_named() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&["teku/v25.4.1"], &["teku/v25.4.1"], true));
+        f.vc_families = Probe::Failed("could not reach endpoint".to_string());
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(layout.detail.contains("all-in-one"), "{}", layout.detail);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+    }
+
+    /// A validator endpoint sitting in the beacon node's slot. No correct
+    /// configuration produces this, so it is almost always a config written
+    /// when `metric_url` still meant the validator client.
+    #[test]
+    fn a_validator_endpoint_in_the_beacon_slot_is_recognised_and_named() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], true));
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+        assert!(
+            !layout.detail.contains("all-in-one"),
+            "must not be confused with an all-in-one deployment: {}",
+            layout.detail
+        );
+    }
+
+    /// The property that makes two diagnostics worth having rather than one:
+    /// an all-in-one process exports the beacon families too, and a validator
+    /// client does not.
+    #[test]
+    fn the_two_layout_diagnostics_are_mutually_exclusive() {
+        let mut all_in_one = healthy();
+        all_in_one.bn_families = Probe::Ok(families(&["teku/v25.4.1"], &["teku/v25.4.1"], true));
+        all_in_one.vc_families = Probe::Failed("could not reach endpoint".to_string());
+
+        let mut misdirected = healthy();
+        misdirected.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], true));
+
+        let a = finding(&evaluate(&all_in_one), "metrics layout")
+            .unwrap()
+            .detail
+            .clone();
+        let b = finding(&evaluate(&misdirected), "metrics layout")
+            .unwrap()
+            .detail
+            .clone();
+        assert_ne!(a, b, "the two shapes must produce different advice");
+    }
+
+    /// A correctly configured separated deployment says nothing about layout.
+    #[test]
+    fn a_healthy_separated_deployment_produces_no_layout_finding() {
+        assert!(finding(&evaluate(&healthy()), "metrics layout").is_none());
     }
 
     // --- probe ---
@@ -1363,7 +1568,8 @@ mod tests {
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
             container: None,
             data_dir: None,
         };
@@ -1380,7 +1586,7 @@ mod tests {
         assert!(matches!(f.syncing, Probe::Skipped(_)));
         assert!(matches!(f.finality, Probe::Skipped(_)));
         assert!(matches!(f.peers, Probe::Skipped(_)));
-        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(matches!(f.bn_families, Probe::Failed(_)));
         assert!(matches!(f.duties, Probe::Skipped(_)));
         assert!(matches!(f.validators, Probe::Skipped(_)));
     }
@@ -1390,7 +1596,8 @@ mod tests {
         let cfg = ProbeConfig {
             stack: Some(Stack::EthDocker),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
             container: None,
             data_dir: None,
         };
@@ -1408,7 +1615,8 @@ mod tests {
             let cfg = ProbeConfig {
                 stack: Some(stack),
                 api_url: "http://127.0.0.1:1".to_string(),
-                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
                 container: None,
                 data_dir: None,
             };
@@ -1430,7 +1638,8 @@ mod tests {
             let cfg = ProbeConfig {
                 stack,
                 api_url: "http://127.0.0.1:1".to_string(),
-                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
                 container: None,
                 data_dir: None,
             };
@@ -1483,7 +1692,8 @@ mod tests {
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
             api_url: server.url(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
             container: None,
             data_dir: None,
         };
@@ -1508,14 +1718,17 @@ mod tests {
     }
 
     /// Same reasoning as `a_beacon_api_error_that_is_not_unreachable_does_not_skip_the_rest`,
-    /// for the metrics side. A scrape that responds 200 but exports none of
-    /// the version metric families is `ApiError::Malformed` (via
-    /// `require_metric`/`version`'s own check), not `Unreachable`, and must
-    /// not skip `duties`/`validators` - the body below deliberately includes
-    /// the metrics those two calls need, so a skip would be visible as a
-    /// missing `Probe::Ok`.
+    /// for the metrics side, adapted to `families`: unlike the old `version`,
+    /// a reachable scrape exporting none of the families tekops looks for is
+    /// `Probe::Ok` with empty vecs rather than a failure (that is the point of
+    /// `families` reporting emptiness instead of erroring - see
+    /// `families_reports_emptiness_rather_than_failing_on_a_foreign_endpoint`
+    /// in `metrics.rs`). So the short-circuit here only has real unreachability
+    /// to key off, and the body below deliberately includes the metrics
+    /// `duties`/`validators` need, so a wrongly-skipped call would be visible
+    /// as a missing `Probe::Ok`.
     #[test]
-    fn a_metrics_error_that_is_not_unreachable_does_not_skip_the_rest() {
+    fn a_reachable_but_unrecognised_metrics_endpoint_does_not_skip_the_rest() {
         let mut server = mockito::Server::new();
         let body = r#"
 validator_beacon_node_requests_total{method="publish_block",outcome="success"} 1
@@ -1531,21 +1744,22 @@ validator_local_validator_balances{pubkey="0x1"} 32000000000
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: format!("{}/metrics", server.url()),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: format!("{}/metrics", server.url()),
             container: None,
             data_dir: None,
         };
         let f = probe(&cfg);
 
-        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(matches!(f.vc_families, Probe::Ok(_)));
         assert!(
             !matches!(f.duties, Probe::Skipped(_)),
-            "duties was skipped on a non-unreachable version failure: {:?}",
+            "duties was skipped on a reachable, merely unrecognised, endpoint: {:?}",
             f.duties
         );
         assert!(
             !matches!(f.validators, Probe::Skipped(_)),
-            "validators was skipped on a non-unreachable version failure: {:?}",
+            "validators was skipped on a reachable, merely unrecognised, endpoint: {:?}",
             f.validators
         );
     }
