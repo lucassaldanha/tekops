@@ -26,10 +26,20 @@
 # stacks put the REST API on 5052.  ($TEKOPS_API_URL)
 #api_url = "http://localhost:5052"
 
-# Prometheus scrape URL. Point this at the validator client, not the beacon
-# node: it is the endpoint that answers `duties`, `validators` and `version`,
-# while the beacon node's answers only `version`.  ($TEKOPS_METRIC_URL)
-#metric_url = "http://localhost:8009/metrics"
+# Beacon node Prometheus scrape URL. Answers `version` and the beacon half of
+# `tekops doctor`.  ($TEKOPS_BN_METRIC_URL)
+#bn_metric_url = "http://localhost:8008/metrics"
+
+# Validator client Prometheus scrape URL. Answers `duties`, `validators` and
+# the validator half of `version`. On an all-in-one deployment, where one
+# process serves both, set this to the same value as bn_metric_url above.
+# ($TEKOPS_VC_METRIC_URL)
+#vc_metric_url = "http://localhost:8009/metrics"
+
+# Deprecated alias for bn_metric_url. NOTE: this key used to mean the
+# validator client. If you set it before tekops gained the pair above, move
+# your value to vc_metric_url.  ($TEKOPS_METRIC_URL)
+#metric_url = "http://localhost:8008/metrics"
 
 # Docker container to read logs from. Overrides `docker ps` detection, so set
 # it if detection finds more than one candidate.  ($TEKOPS_CONTAINER)

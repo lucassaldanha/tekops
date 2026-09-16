@@ -5,7 +5,7 @@
 //! testable with no environment races and no files on disk; `load` is the only
 //! function here that touches a filesystem.
 //!
-//! The file carries exactly the six settings that already have `$TEKOPS_*`
+//! The file carries exactly the eight settings that already have `$TEKOPS_*`
 //! variables, and nothing else. Every key is a variable is a flag, which is
 //! the one sentence that makes the feature explainable. Per-command defaults
 //! (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -45,6 +45,18 @@ const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     pub stack: Option<Stack>,
     pub api_url: Option<String>,
+    pub bn_metric_url: Option<String>,
+    pub vc_metric_url: Option<String>,
+    /// Deprecated alias for `bn_metric_url`.
+    ///
+    /// Retained rather than removed because `deny_unknown_fields` would make
+    /// its removal reject every existing config file that still carries it.
+    ///
+    /// Note that this key changed meaning: it used to resolve to the validator
+    /// client. The unprefixed spelling now means the beacon node, agreeing
+    /// with `api_url`, which is likewise unprefixed and likewise the beacon
+    /// node's. `doctor`'s "metrics layout" check exists to catch a file
+    /// written under the old meaning.
     pub metric_url: Option<String>,
     pub container: Option<String>,
     pub logs_file: Option<PathBuf>,
@@ -137,7 +149,9 @@ mod tests {
         let text = r#"
 stack = "eth-docker"
 api_url = "http://localhost:5051"
-metric_url = "http://localhost:8009/metrics"
+bn_metric_url = "http://localhost:8008/metrics"
+vc_metric_url = "http://localhost:8009/metrics"
+metric_url = "http://localhost:8008/metrics"
 container = "eth-docker-consensus-1"
 logs_file = "/var/log/teku/teku.log"
 data_dir = "/var/lib/teku"
@@ -146,12 +160,42 @@ data_dir = "/var/lib/teku"
         assert_eq!(cfg.stack, Some(Stack::EthDocker));
         assert_eq!(cfg.api_url.as_deref(), Some("http://localhost:5051"));
         assert_eq!(
-            cfg.metric_url.as_deref(),
+            cfg.bn_metric_url.as_deref(),
+            Some("http://localhost:8008/metrics")
+        );
+        assert_eq!(
+            cfg.vc_metric_url.as_deref(),
             Some("http://localhost:8009/metrics")
+        );
+        assert_eq!(
+            cfg.metric_url.as_deref(),
+            Some("http://localhost:8008/metrics")
         );
         assert_eq!(cfg.container.as_deref(), Some("eth-docker-consensus-1"));
         assert_eq!(cfg.logs_file, Some(PathBuf::from("/var/log/teku/teku.log")));
         assert_eq!(cfg.data_dir, Some(PathBuf::from("/var/lib/teku")));
+    }
+
+    /// The deprecated key must keep parsing. `deny_unknown_fields` means
+    /// dropping it from the struct would make every existing config file fail
+    /// outright, so it stays a real field for as long as it is documented.
+    ///
+    /// Which endpoint it feeds is decided by the resolution ladder, not here;
+    /// see `resolve_bn_metric_url` in `cli.rs` and the test that pins the
+    /// meaning change.
+    #[test]
+    fn the_deprecated_metric_url_key_still_parses() {
+        let cfg = parse(
+            "metric_url = \"http://localhost:8008/metrics\"\n",
+            Path::new("/x"),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.metric_url.as_deref(),
+            Some("http://localhost:8008/metrics")
+        );
+        assert_eq!(cfg.bn_metric_url, None);
+        assert_eq!(cfg.vc_metric_url, None);
     }
 
     #[test]
@@ -358,7 +402,9 @@ data_dir = "/var/lib/teku"
         let populated = Config {
             stack: Some(Stack::EthDocker),
             api_url: Some("http://x".into()),
-            metric_url: Some("http://y".into()),
+            bn_metric_url: Some("http://y".into()),
+            vc_metric_url: Some("http://z".into()),
+            metric_url: Some("http://w".into()),
             container: Some("c".into()),
             logs_file: Some(PathBuf::from("/a")),
             data_dir: Some(PathBuf::from("/b")),
