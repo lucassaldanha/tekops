@@ -64,7 +64,14 @@ struct ApiArgs {
     json: bool,
 }
 
-/// The Prometheus scrape flags, shared by every command that reads metrics.
+/// The Prometheus scrape flags for `version`, the one command that reads
+/// both processes.
+///
+/// `Duties` and `Validators` flatten `VcMetricArgs` instead: the beacon-node
+/// spellings here (`--bn-metric-url` and the legacy `--metric-url`) name an
+/// endpoint those two commands never read, so accepting them would mean
+/// parsing successfully and doing nothing - clap rejects them there rather
+/// than silently discarding them.
 #[derive(clap::Args)]
 struct MetricArgs {
     /// Beacon node Prometheus metrics URL (or $TEKOPS_BN_METRIC_URL)

@@ -123,13 +123,20 @@ never be the right addition to their error path.
 ### Flags and configuration
 
 The repeated `--api-url`/`--bn-metric-url`/`--vc-metric-url`/`--json` flags
-live in two flattened arg structs, `ApiArgs` and `MetricArgs`, rather than
-being restated per command (`doctor` declares its three metric flags
-directly instead of flattening `MetricArgs`, since that struct also
-declares `stack` and `json` and flattening both would be a duplicate arg
-id). All three carry `--stack`, which `resolve_stack`, `resolve_base_url`,
-`resolve_bn_metric_url` and `resolve_vc_metric_url` fold into the URL a
-flag, an environment variable, or the config file didn't already supply.
+live in three flattened arg structs - `ApiArgs`, `MetricArgs`, and
+`VcMetricArgs` - rather than being restated per command (`doctor` declares
+its three metric flags directly instead of flattening `MetricArgs`, since
+that struct also declares `stack` and `json` and flattening both would be a
+duplicate arg id). `MetricArgs` carries both the beacon-node and
+validator-client spellings and is `version`'s alone, the one command that
+reads both processes. `VcMetricArgs` carries only `--vc-metric-url`, for
+`duties` and `validators`: the beacon-node spellings name an endpoint those
+two never read, so `MetricArgs` there would let them parse and do nothing -
+`VcMetricArgs` makes clap reject them instead. All four - the three structs
+and `doctor`'s direct flags - carry `--stack`, which `resolve_stack`,
+`resolve_base_url`, `resolve_bn_metric_url` and `resolve_vc_metric_url` fold
+into the URL a flag, an environment variable, or the config file didn't
+already supply.
 `resolve_bn_metric_url` has an extra rung the other three don't: the
 deprecated `--metric-url`/`$TEKOPS_METRIC_URL`/`metric_url` trio, tried
 after their `bn_`-prefixed replacements and before the config file's
