@@ -1,7 +1,7 @@
 use crate::beaconapi::{BlockHeader, FinalityCheckpoints, HealthState, SyncingStatus};
 use crate::doctor::{Facts, Finding, Status};
 use crate::loglevel::LogLevelSpec;
-use crate::metrics::{DutiesMetrics, ValidatorMetrics, VersionInfo};
+use crate::metrics::{DutiesMetrics, ValidatorMetrics};
 use crate::protocol::Protocol;
 use crate::term::sanitize;
 use comfy_table::Table;
@@ -102,11 +102,43 @@ pub fn format_validator_metrics_table(metrics: &ValidatorMetrics) -> String {
     format!("{counts_table}\n\n{total_table}")
 }
 
-pub fn format_version_table(info: &VersionInfo) -> String {
+/// One process's line of the version report.
+///
+/// `versions` and `error` are mutually exclusive in practice, but both are
+/// modelled rather than an enum so the JSON stays flat and a consumer can read
+/// `.beacon_node.versions` without matching on a tag first.
+#[derive(Serialize)]
+pub struct ProcessVersion {
+    pub url: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Both processes, always both keys.
+///
+/// A process that did not answer is present with its `error` rather than
+/// absent, so a consumer can tell "not running" from "not asked".
+#[derive(Serialize)]
+pub struct VersionReport {
+    pub beacon_node: ProcessVersion,
+    pub validator_client: ProcessVersion,
+}
+
+pub fn format_version_table(report: &VersionReport) -> String {
     let mut table = Table::new();
-    table.set_header(vec!["Version"]);
-    for version in &info.versions {
-        table.add_row(vec![version.clone()]);
+    table.set_header(vec!["Process", "Version", "Endpoint"]);
+    for (label, p) in [
+        ("beacon node", &report.beacon_node),
+        ("validator client", &report.validator_client),
+    ] {
+        let version = if p.versions.is_empty() {
+            p.error.clone().unwrap_or_else(|| "unknown".to_string())
+        } else {
+            p.versions.join(", ")
+        };
+        table.add_row(vec![label.to_string(), version, p.url.clone()]);
     }
     table.to_string()
 }
@@ -414,23 +446,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn formats_version_table() {
-        let info = VersionInfo {
-            versions: vec!["teku/v24.9.0".to_string()],
-        };
-        let table = format_version_table(&info);
-        assert!(table.contains("teku/v24.9.0"));
+    fn version_report(bn: Option<&str>, vc: Option<&str>) -> VersionReport {
+        VersionReport {
+            beacon_node: ProcessVersion {
+                url: "http://localhost:8008/metrics".to_string(),
+                versions: bn.map(|v| vec![v.to_string()]).unwrap_or_default(),
+                error: bn.is_none().then(|| "connection refused".to_string()),
+            },
+            validator_client: ProcessVersion {
+                url: "http://localhost:8009/metrics".to_string(),
+                versions: vc.map(|v| vec![v.to_string()]).unwrap_or_default(),
+                error: vc.is_none().then(|| "connection refused".to_string()),
+            },
+        }
     }
 
     #[test]
-    fn formats_version_table_with_multiple_versions() {
-        let info = VersionInfo {
-            versions: vec!["teku/v24.10.0".to_string(), "teku/v24.9.0".to_string()],
-        };
-        let table = format_version_table(&info);
-        assert!(table.contains("teku/v24.10.0"));
-        assert!(table.contains("teku/v24.9.0"));
+    fn version_table_names_both_processes_and_their_endpoints() {
+        let out = format_version_table(&version_report(Some("teku/v25.4.1"), Some("teku/v25.4.1")));
+        assert!(out.contains("beacon node"), "{out}");
+        assert!(out.contains("validator client"), "{out}");
+        assert!(out.contains("http://localhost:8008/metrics"), "{out}");
+        assert!(out.contains("http://localhost:8009/metrics"), "{out}");
+    }
+
+    /// A separated node whose validator client is down must still show the
+    /// beacon node's version, with the reason in the row that failed.
+    #[test]
+    fn version_table_shows_the_reason_in_place_of_a_missing_version() {
+        let out = format_version_table(&version_report(Some("teku/v25.4.1"), None));
+        assert!(out.contains("teku/v25.4.1"), "{out}");
+        assert!(out.contains("connection refused"), "{out}");
     }
 
     /// A node built the same way Task 6's `healthy()` builds one, except
@@ -439,6 +485,7 @@ mod tests {
     fn facts_for_output() -> crate::doctor::Facts {
         use crate::doctor::Probe;
         use crate::host::{Disk, Load, Memory};
+        use crate::metrics::VersionInfo;
         use crate::stack::Stack;
         use std::collections::BTreeMap;
 

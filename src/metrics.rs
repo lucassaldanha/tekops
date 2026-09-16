@@ -250,8 +250,6 @@ pub struct VersionInfo {
 /// while `doctor` reads the exact combination to tell an all-in-one deployment
 /// apart from a misconfigured one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-// Wired in by Tasks 5 and 6.
-#[allow(dead_code)]
 pub struct EndpointFamilies {
     /// Versions from `beacon_teku_version_total`, empty on a validator client.
     pub beacon_versions: Vec<String>,
@@ -332,8 +330,6 @@ impl MetricsClient {
     }
 
     /// Scrapes once and reports every family tekops can identify.
-    /// Wired in by Tasks 5 and 6.
-    #[allow(dead_code)]
     pub fn families(&self) -> Result<EndpointFamilies, ApiError> {
         let samples = self.fetch()?;
         Ok(EndpointFamilies {

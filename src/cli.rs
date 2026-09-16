@@ -411,13 +411,22 @@ pub fn run() -> ExitCode {
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_vc_metric_url(
+            let bn_url = resolve_bn_metric_url(
+                metrics.bn_metric_url,
+                metrics.metric_url,
+                env::var("TEKOPS_BN_METRIC_URL").ok(),
+                env::var("TEKOPS_METRIC_URL").ok(),
+                cfg.bn_metric_url.clone(),
+                cfg.metric_url.clone(),
+                stack,
+            );
+            let vc_url = resolve_vc_metric_url(
                 metrics.vc_metric_url,
                 env::var("TEKOPS_VC_METRIC_URL").ok(),
                 cfg.vc_metric_url.clone(),
                 stack,
-            ));
-            exit_for_api(metrics_version(&client, metrics.json), stack)
+            );
+            exit_for_api(metrics_version(&bn_url, &vc_url, metrics.json), stack)
         }
         Commands::LogLevel {
             target,
@@ -704,11 +713,6 @@ fn resolve_base_url(
 /// This is a change of meaning for the deprecated trio, which used to resolve
 /// to the validator client. `doctor`'s "metrics layout" check recognises a
 /// config written under the old meaning and names the fix.
-//
-// Nothing outside tests calls this yet - `version` gains its bn endpoint in
-// Task 5. Without this, both this function and `Stack::bn_metric_url` (which
-// only this calls) would be dead code between the two tasks.
-#[allow(dead_code)]
 fn resolve_bn_metric_url(
     flag: Option<String>,
     legacy_flag: Option<String>,
@@ -1001,15 +1005,66 @@ fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError
     Ok(())
 }
 
-fn metrics_version(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
-    let info = client.version()?;
+/// One row of the version report, from a scrape result and the family to read.
+///
+/// An endpoint that answered but exports no version metric is reported
+/// distinctly from one that could not be reached: the first is "this is not a
+/// Teku process", the second is "this process is not running".
+fn process_version(
+    url: &str,
+    families: &Result<crate::metrics::EndpointFamilies, ApiError>,
+    pick: fn(&crate::metrics::EndpointFamilies) -> &Vec<String>,
+) -> crate::output::ProcessVersion {
+    let (versions, error) = match families {
+        Ok(f) if !pick(f).is_empty() => (pick(f).clone(), None),
+        Ok(_) => (
+            Vec::new(),
+            Some("responded, but exports no Teku version metric".to_string()),
+        ),
+        Err(e) => (Vec::new(), Some(sanitize(&e.to_string()))),
+    };
+    crate::output::ProcessVersion {
+        url: url.to_string(),
+        versions,
+        error,
+    }
+}
+
+/// Scrapes both processes and builds the report.
+///
+/// Equal URLs mean one process serving both families, so the endpoint is
+/// scraped once and both rows are read off that single result rather than
+/// asking the same URL twice.
+fn build_version_report(bn_url: &str, vc_url: &str) -> crate::output::VersionReport {
+    let bn_families = MetricsClient::new(bn_url.to_string()).families();
+    let vc_families = (bn_url != vc_url).then(|| MetricsClient::new(vc_url.to_string()).families());
+    let vc_source = vc_families.as_ref().unwrap_or(&bn_families);
+
+    crate::output::VersionReport {
+        beacon_node: process_version(bn_url, &bn_families, |f| &f.beacon_versions),
+        validator_client: process_version(vc_url, vc_source, |f| &f.validator_versions),
+    }
+}
+
+fn metrics_version(bn_url: &str, vc_url: &str, json: bool) -> Result<(), ApiError> {
+    let report = build_version_report(bn_url, vc_url);
+
+    // Neither process answered, which is a failed command rather than a report
+    // of two absences. One answering is a useful result and exits zero.
+    if report.beacon_node.versions.is_empty() && report.validator_client.versions.is_empty() {
+        return Err(ApiError::Malformed(format!(
+            "no Teku version metric found at {bn_url} or {vc_url}; \
+             are these Teku metrics endpoints?"
+        )));
+    }
+
     if json {
         println!(
             "{}",
-            serde_json::to_string(&info).expect("serialize version json")
+            serde_json::to_string(&report).expect("serialize version json")
         );
     } else {
-        println!("{}", format_version_table(&info));
+        println!("{}", format_version_table(&report));
     }
     Ok(())
 }
@@ -2678,5 +2733,87 @@ mod tests {
             None,
             Some(Stack::RocketPool)
         ));
+    }
+
+    /// Two different endpoints, both answering.
+    #[test]
+    fn version_reports_a_separated_deployment_from_two_endpoints() {
+        let mut bn_server = mockito::Server::new();
+        let _bn = bn_server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#)
+            .create();
+        let mut vc_server = mockito::Server::new();
+        let _vc = vc_server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"validator_teku_version_total{version="teku/v25.3.0"} 1"#)
+            .create();
+
+        let report = build_version_report(
+            &format!("{}/metrics", bn_server.url()),
+            &format!("{}/metrics", vc_server.url()),
+        );
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert_eq!(
+            report.validator_client.versions,
+            vec!["teku/v25.3.0".to_string()]
+        );
+    }
+
+    /// Equal URLs mean one process serving both families. The endpoint is
+    /// scraped once, and mockito's default expectation of exactly one hit per
+    /// mock is what proves it.
+    #[test]
+    fn version_scrapes_once_when_both_urls_are_the_same() {
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(
+                "beacon_teku_version_total{version=\"teku/v25.4.1\"} 1\n\
+                 validator_teku_version_total{version=\"teku/v25.4.1\"} 1",
+            )
+            .expect(1)
+            .create();
+
+        let url = format!("{}/metrics", server.url());
+        let report = build_version_report(&url, &url);
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert_eq!(
+            report.validator_client.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        m.assert();
+    }
+
+    /// One side down is still a useful answer, so the row carries the reason
+    /// and the command succeeds.
+    #[test]
+    fn version_reports_the_reachable_process_when_the_other_is_down() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#)
+            .create();
+
+        let report = build_version_report(
+            &format!("{}/metrics", server.url()),
+            "http://127.0.0.1:1/metrics",
+        );
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert!(report.validator_client.versions.is_empty());
+        assert!(report.validator_client.error.is_some());
     }
 }
