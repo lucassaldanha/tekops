@@ -253,10 +253,13 @@ pub struct EndpointFamilies {
     /// Whether this endpoint exports `validator_local_validator_counts`, the
     /// family `validators` needs.
     ///
-    /// Carried alongside the versions because it is what distinguishes a
-    /// process serving both roles from a validator client sitting where a
-    /// beacon node was expected: the first exports beacon versions too, the
-    /// second does not.
+    /// Not itself what tells an all-in-one process apart from a validator
+    /// client sitting where a beacon node was expected - `beacon_versions`
+    /// being empty or not does that. This field is the *gate* `doctor` uses
+    /// before asking that question: it is true whenever the family has any
+    /// child, but a validator client with no keys loaded exports none, so
+    /// `check_metrics_layout` also falls back to `validator_versions` before
+    /// concluding there is nothing to diagnose.
     pub has_validator_families: bool,
 }
 
