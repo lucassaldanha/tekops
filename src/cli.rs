@@ -1081,9 +1081,16 @@ fn metrics_version(bn_url: &str, vc_url: &str, json: bool) -> Result<(), ApiErro
     // Neither process answered, which is a failed command rather than a report
     // of two absences. One answering is a useful result and exits zero.
     if report.beacon_node.versions.is_empty() && report.validator_client.versions.is_empty() {
+        // Equal URLs mean one scrape covers both rows (see
+        // `build_version_report`), so naming the endpoint twice would read as
+        // two different, both-wrong URLs rather than one.
+        let endpoints = if bn_url == vc_url {
+            format!("at {bn_url}")
+        } else {
+            format!("at {bn_url} or {vc_url}")
+        };
         return Err(ApiError::Malformed(format!(
-            "no Teku version metric found at {bn_url} or {vc_url}; \
-             are these Teku metrics endpoints?"
+            "no Teku version metric found {endpoints}; are these Teku metrics endpoints?"
         )));
     }
 
@@ -2885,5 +2892,42 @@ mod tests {
         );
         assert!(report.validator_client.versions.is_empty());
         assert!(report.validator_client.error.is_some());
+    }
+
+    /// The spec's exit contract for `version`: two absences is a failed
+    /// command, not a report with two empty rows. Both endpoints here are
+    /// unreachable, so this proves the non-zero exit path rather than the
+    /// "reachable but no version metric" one covered elsewhere.
+    #[test]
+    fn version_fails_when_neither_endpoint_answers() {
+        let err = metrics_version(
+            "http://127.0.0.1:1/metrics",
+            "http://127.0.0.1:1/metrics",
+            false,
+        )
+        .expect_err("neither endpoint answered, so this must fail");
+        assert!(
+            err.to_string().contains("no Teku version metric found"),
+            "{err}"
+        );
+    }
+
+    /// Equal URLs collapse to one scrape (see `build_version_report`), so the
+    /// failure message must name the single endpoint once rather than
+    /// printing the same URL twice joined by "or".
+    #[test]
+    fn version_failure_message_names_the_endpoint_once_when_urls_are_equal() {
+        let err = metrics_version(
+            "http://127.0.0.1:1/metrics",
+            "http://127.0.0.1:1/metrics",
+            false,
+        )
+        .expect_err("neither endpoint answered, so this must fail");
+        let message = err.to_string();
+        assert_eq!(
+            message.matches("127.0.0.1:1/metrics").count(),
+            1,
+            "endpoint named more than once: {message}"
+        );
     }
 }
