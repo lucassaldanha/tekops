@@ -88,6 +88,29 @@ struct MetricArgs {
     json: bool,
 }
 
+/// The Prometheus scrape flags for `duties` and `validators`, which read only
+/// the validator client and have no use for a beacon node URL.
+///
+/// This is deliberately not `MetricArgs`: that struct also accepts
+/// `--bn-metric-url` and the legacy `--metric-url`, and before this branch
+/// the legacy spelling was *the* way to steer these two commands. Now that it
+/// means the beacon node (matching `--api-url`), silently reading it here
+/// would scrape the wrong process while exiting zero. Rejecting it is the
+/// better failure: clap's error names `--vc-metric-url`, which is exactly the
+/// migration an old script or rc file needs.
+#[derive(clap::Args)]
+struct VcMetricArgs {
+    /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+    #[arg(long)]
+    vc_metric_url: Option<String>,
+    /// Deployment to take port defaults from (or $TEKOPS_STACK)
+    #[arg(long)]
+    stack: Option<Stack>,
+    /// Print a JSON-serialized summary instead of a formatted table
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Tail and colorize the Teku log, or a container's logs
@@ -156,15 +179,15 @@ enum Commands {
     /// Published blocks, attestations, sync committee messages, and aggregates
     Duties {
         #[command(flatten)]
-        metrics: MetricArgs,
+        metrics: VcMetricArgs,
     },
     /// Validator key counts by status, and total locally-stated ETH balance
     Validators {
         #[command(flatten)]
-        metrics: MetricArgs,
+        metrics: VcMetricArgs,
     },
-    /// Running Teku version, read from the beacon node or validator client
-    /// metrics (whichever is present on the scrape)
+    /// Running Teku version, read from both the beacon node and the
+    /// validator client metrics, reported as two independent rows
     Version {
         #[command(flatten)]
         metrics: MetricArgs,
@@ -1615,10 +1638,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Duties {
-                metrics: MetricArgs {
-                    bn_metric_url: None,
+                metrics: VcMetricArgs {
                     vc_metric_url: None,
-                    metric_url: None,
                     stack: None,
                     json: false
                 }
@@ -1632,10 +1653,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Validators {
-                metrics: MetricArgs {
-                    bn_metric_url: None,
+                metrics: VcMetricArgs {
                     vc_metric_url: None,
-                    metric_url: None,
                     stack: None,
                     json: false
                 }
@@ -1798,15 +1817,46 @@ mod tests {
         }
     }
 
+    /// `duties` and `validators` read only the validator client, and the
+    /// legacy `--metric-url` now names the beacon node - so it must be
+    /// rejected here rather than silently steering nothing, same as
+    /// `--bn-metric-url`. Rejection is the correct outcome: clap's error
+    /// names `--vc-metric-url`, which is the flag an old script needs to
+    /// switch to.
     #[test]
-    fn metric_url_flag_still_reaches_each_metrics_command() {
+    fn duties_and_validators_reject_the_beacon_node_metric_flags() {
+        for cmd in ["duties", "validators"] {
+            // `Cli` derives no `Debug`, so `.err()` rather than `.expect_err()`.
+            let err = Cli::try_parse_from(["tekops", cmd, "--metric-url", "http://x:2/m"])
+                .err()
+                .unwrap_or_else(|| panic!("{cmd} must reject the legacy beacon-node flag"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+            let err = Cli::try_parse_from(["tekops", cmd, "--bn-metric-url", "http://x:2/m"])
+                .err()
+                .unwrap_or_else(|| panic!("{cmd} must reject --bn-metric-url"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn duties_and_validators_still_accept_the_vc_metric_flag() {
         let cli =
-            Cli::try_parse_from(["tekops", "duties", "--metric-url", "http://x:2/m"]).unwrap();
+            Cli::try_parse_from(["tekops", "duties", "--vc-metric-url", "http://x:2/m"]).unwrap();
         match cli.command {
             Commands::Duties { metrics } => {
-                assert_eq!(metrics.metric_url.as_deref(), Some("http://x:2/m"))
+                assert_eq!(metrics.vc_metric_url.as_deref(), Some("http://x:2/m"))
             }
             _ => panic!("expected Duties command"),
+        }
+
+        let cli = Cli::try_parse_from(["tekops", "validators", "--vc-metric-url", "http://x:2/m"])
+            .unwrap();
+        match cli.command {
+            Commands::Validators { metrics } => {
+                assert_eq!(metrics.vc_metric_url.as_deref(), Some("http://x:2/m"))
+            }
+            _ => panic!("expected Validators command"),
         }
     }
 
