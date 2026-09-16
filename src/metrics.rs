@@ -237,6 +237,34 @@ pub struct VersionInfo {
     pub versions: Vec<String>,
 }
 
+/// Everything `version` and `doctor` need to know about one scrape endpoint,
+/// from a single fetch.
+///
+/// Both callers need more than one fact about the same endpoint, and the
+/// per-question methods on this client each re-fetch. Asking once and
+/// returning the answers together keeps `doctor` from scraping the same URL
+/// three times to decide what it is.
+///
+/// Emptiness is reported, never treated as an error. Which absent family
+/// matters is the caller's question: `version` tolerates one missing process,
+/// while `doctor` reads the exact combination to tell an all-in-one deployment
+/// apart from a misconfigured one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EndpointFamilies {
+    /// Versions from `beacon_teku_version_total`, empty on a validator client.
+    pub beacon_versions: Vec<String>,
+    /// Versions from `validator_teku_version_total`, empty on a beacon node.
+    pub validator_versions: Vec<String>,
+    /// Whether this endpoint exports `validator_local_validator_counts`, the
+    /// family `validators` needs.
+    ///
+    /// Carried alongside the versions because it is what distinguishes a
+    /// process serving both roles from a validator client sitting where a
+    /// beacon node was expected: the first exports beacon versions too, the
+    /// second does not.
+    pub has_validator_families: bool,
+}
+
 const VALIDATOR_REQUESTS_METRIC: &str = "validator_beacon_node_requests_total";
 const VALIDATOR_COUNTS_METRIC: &str = "validator_local_validator_counts";
 const VALIDATOR_BALANCES_METRIC: &str = "validator_local_validator_balances";
@@ -301,6 +329,20 @@ impl MetricsClient {
         })
     }
 
+    /// Scrapes once and reports every family tekops can identify.
+    pub fn families(&self) -> Result<EndpointFamilies, ApiError> {
+        let samples = self.fetch()?;
+        Ok(EndpointFamilies {
+            beacon_versions: distinct_label_values(&samples, BEACON_VERSION_METRIC, "version"),
+            validator_versions: distinct_label_values(
+                &samples,
+                VALIDATOR_VERSION_METRIC,
+                "version",
+            ),
+            has_validator_families: has_metric(&samples, VALIDATOR_COUNTS_METRIC),
+        })
+    }
+
     /// Reads the running Teku version from whichever of the beacon-node or
     /// validator-client version metric is present on this scrape - only one
     /// exists at a time, depending on which process's `/metrics` endpoint
@@ -332,7 +374,8 @@ impl MetricsClient {
         }
         Err(ApiError::Malformed(format!(
             "metric {name} not found at {} - the endpoint responded but exports no such metric; \
-             check that this is the right process's metrics port",
+             check that this is the right process's metrics port. If one process serves both \
+             roles (an all-in-one deployment), point `vc_metric_url` at it.",
             self.url
         )))
     }
@@ -707,5 +750,109 @@ validator_local_validator_balances{pubkey="0x2"} 32000000000
         let client = MetricsClient::new("http://127.0.0.1:1/metrics");
         let err = client.version().unwrap_err();
         assert!(matches!(err, ApiError::Unreachable(_)));
+    }
+
+    #[test]
+    fn families_reads_a_beacon_node_endpoint() {
+        let mut server = mockito::Server::new();
+        let body = r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#;
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let f = MetricsClient::new(format!("{}/metrics", server.url()))
+            .families()
+            .unwrap();
+        assert_eq!(f.beacon_versions, vec!["teku/v25.4.1".to_string()]);
+        assert!(f.validator_versions.is_empty());
+        assert!(!f.has_validator_families);
+    }
+
+    #[test]
+    fn families_reads_a_validator_client_endpoint() {
+        let mut server = mockito::Server::new();
+        let body = "validator_teku_version_total{version=\"teku/v25.4.1\"} 1\n\
+                    validator_local_validator_counts{status=\"active_ongoing\"} 12";
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let f = MetricsClient::new(format!("{}/metrics", server.url()))
+            .families()
+            .unwrap();
+        assert!(f.beacon_versions.is_empty());
+        assert_eq!(f.validator_versions, vec!["teku/v25.4.1".to_string()]);
+        assert!(f.has_validator_families);
+    }
+
+    /// An all-in-one deployment: one process exporting both families on one
+    /// port. This is what eth-docker's `teku-allin1.yml` produces, and telling
+    /// it apart from a validator endpoint is the whole reason
+    /// `has_validator_families` is reported alongside the versions.
+    #[test]
+    fn families_reads_an_all_in_one_endpoint_exporting_both() {
+        let mut server = mockito::Server::new();
+        let body = "beacon_teku_version_total{version=\"teku/v25.4.1\"} 1\n\
+                    validator_teku_version_total{version=\"teku/v25.4.1\"} 1\n\
+                    validator_local_validator_counts{status=\"active_ongoing\"} 12";
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let f = MetricsClient::new(format!("{}/metrics", server.url()))
+            .families()
+            .unwrap();
+        assert_eq!(f.beacon_versions, vec!["teku/v25.4.1".to_string()]);
+        assert_eq!(f.validator_versions, vec!["teku/v25.4.1".to_string()]);
+        assert!(f.has_validator_families);
+    }
+
+    /// An endpoint that answers but is not Teku's. `families` reports the
+    /// emptiness rather than failing: only the caller knows whether an empty
+    /// family is fatal for what it was asked to do.
+    #[test]
+    fn families_reports_emptiness_rather_than_failing_on_a_foreign_endpoint() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body("go_goroutines 42")
+            .create();
+        let f = MetricsClient::new(format!("{}/metrics", server.url()))
+            .families()
+            .unwrap();
+        assert!(f.beacon_versions.is_empty());
+        assert!(f.validator_versions.is_empty());
+        assert!(!f.has_validator_families);
+    }
+
+    #[test]
+    fn families_fails_when_the_endpoint_is_unreachable() {
+        let client = MetricsClient::new("http://127.0.0.1:1/metrics".to_string());
+        assert!(client.families().is_err());
+    }
+
+    /// `duties` and `validators` deliberately do not fall back to the beacon
+    /// node's port when the validator families are missing: a silent repoint
+    /// is the same mistake `require_metric` exists to prevent. What they owe
+    /// the operator instead is the likely cause, since an all-in-one
+    /// deployment is the common way to land here.
+    #[test]
+    fn a_missing_validator_family_names_the_all_in_one_case() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#)
+            .create();
+        let err = MetricsClient::new(format!("{}/metrics", server.url()))
+            .validators()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("vc_metric_url"), "must name the fix: {msg}");
+        assert!(msg.contains("all-in-one"), "{msg}");
     }
 }
