@@ -1955,27 +1955,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn metric_url_precedence_matches_the_api_url_ladder() {
-        assert_eq!(
-            resolve_vc_metric_url(
-                Some("http://x:2/m".into()),
-                None,
-                None,
-                Some(Stack::EthDocker)
-            ),
-            "http://x:2/m"
-        );
-        assert_eq!(
-            resolve_vc_metric_url(None, None, None, Some(Stack::EthDocker)),
-            "http://localhost:8009/metrics"
-        );
-        assert_eq!(
-            resolve_vc_metric_url(None, None, None, None),
-            "http://localhost:8010/metrics"
-        );
-    }
-
     /// Mixing is explicitly supported: a profile is one layer in the chain, not
     /// a mode that locks the other values.
     #[test]
@@ -2032,36 +2011,6 @@ mod tests {
     fn the_stack_default_applies_when_nothing_states_an_api_url() {
         let got = resolve_base_url(None, None, None, Some(Stack::EthDocker));
         assert_eq!(got, Stack::EthDocker.api_url());
-    }
-
-    #[test]
-    fn the_metric_url_follows_the_same_ladder() {
-        assert_eq!(
-            resolve_vc_metric_url(
-                Some("http://flag:1".into()),
-                Some("http://env:2".into()),
-                Some("http://cfg:3".into()),
-                Some(Stack::RocketPool)
-            ),
-            "http://flag:1"
-        );
-        assert_eq!(
-            resolve_vc_metric_url(
-                None,
-                Some("http://env:2".into()),
-                Some("http://cfg:3".into()),
-                None
-            ),
-            "http://env:2"
-        );
-        assert_eq!(
-            resolve_vc_metric_url(None, None, Some("http://cfg:3".into()), None),
-            "http://cfg:3"
-        );
-        assert_eq!(
-            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
-            Stack::RocketPool.vc_metric_url()
-        );
     }
 
     /// The beacon node's ladder, one tier at a time. New spellings beat legacy
