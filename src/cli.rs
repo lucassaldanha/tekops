@@ -657,7 +657,7 @@ fn resolve_metric_url(
 ) -> String {
     flag.or(env)
         .or(cfg)
-        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).metric_url().to_string())
+        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).vc_metric_url().to_string())
 }
 
 /// The names of running containers, or `None` if Docker cannot be asked.
@@ -1964,7 +1964,7 @@ mod tests {
         );
         assert_eq!(
             resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
-            Stack::RocketPool.metric_url()
+            Stack::RocketPool.vc_metric_url()
         );
     }
 

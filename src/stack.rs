@@ -51,13 +51,28 @@ impl Stack {
         }
     }
 
-    /// The Prometheus scrape URL to use when nothing more specific was given.
+    /// The beacon node's Prometheus scrape URL for this stack.
     ///
-    /// This points at the **validator client**, not the beacon node. `duties`
-    /// and `validators` read VC metric families, and `version` tries the beacon
-    /// family then falls back to the validator one, so the VC endpoint answers
-    /// all three while the beacon endpoint answers only one.
-    pub fn metric_url(&self) -> &'static str {
+    /// Teku's own `--metrics-port` default is 8008, which both Docker stacks
+    /// keep for the consensus client; Rocket Pool moves it to 9100
+    /// (`defaultBnMetricsPort` in its `rocket-pool-config.go`).
+    pub fn bn_metric_url(&self) -> &'static str {
+        match self {
+            Stack::BareMetal | Stack::EthDocker => "http://localhost:8008/metrics",
+            Stack::RocketPool => "http://localhost:9100/metrics",
+        }
+    }
+
+    /// The validator client's Prometheus scrape URL for this stack.
+    ///
+    /// This answers `duties` and `validators`, which read VC metric families
+    /// exclusively.
+    ///
+    /// Note that 8010 for bare-metal is a tekops convention, not a Teku
+    /// default: Teku defaults *both* processes to 8008, so a separated
+    /// bare-metal node has necessarily repointed one of them by hand and will
+    /// be configuring this anyway.
+    pub fn vc_metric_url(&self) -> &'static str {
         match self {
             Stack::BareMetal => "http://localhost:8010/metrics",
             Stack::EthDocker => "http://localhost:8009/metrics",
@@ -215,7 +230,7 @@ mod tests {
     fn bare_metal_keeps_todays_defaults() {
         assert_eq!(Stack::BareMetal.api_url(), "http://localhost:5051");
         assert_eq!(
-            Stack::BareMetal.metric_url(),
+            Stack::BareMetal.vc_metric_url(),
             "http://localhost:8010/metrics"
         );
         assert_eq!(Stack::BareMetal.container_suffix(), None);
@@ -227,21 +242,60 @@ mod tests {
         assert_eq!(Stack::RocketPool.api_url(), "http://localhost:5052");
     }
 
-    /// `duties` and `validators` read validator-client metrics, and `version`
-    /// falls back across the beacon and validator metric families, so the
-    /// profile must point at the VC port. Pointing it at the beacon node's
-    /// port (8008 for Eth Docker, 9100 for Rocket Pool) would leave two of the
-    /// three metrics commands reporting a missing metric family.
+    /// The values `metric_url` used to return, kept byte-for-byte. Operators
+    /// already point at these ports; the rename must not move them.
     #[test]
-    fn metric_url_points_at_the_validator_client_not_the_beacon_node() {
+    fn vc_metric_urls_keep_todays_values() {
         assert_eq!(
-            Stack::EthDocker.metric_url(),
+            Stack::BareMetal.vc_metric_url(),
+            "http://localhost:8010/metrics"
+        );
+        assert_eq!(
+            Stack::EthDocker.vc_metric_url(),
             "http://localhost:8009/metrics"
         );
         assert_eq!(
-            Stack::RocketPool.metric_url(),
+            Stack::RocketPool.vc_metric_url(),
             "http://localhost:9101/metrics"
         );
+    }
+
+    /// Verified upstream: Teku's own `--metrics-port` default is 8008 for both
+    /// the main command and the `validator-client` subcommand; eth-docker's
+    /// `teku.yml` puts the CL on 8008; Rocket Pool's `rocket-pool-config.go`
+    /// declares `defaultBnMetricsPort = 9100`.
+    #[test]
+    fn bn_metric_urls_match_each_stacks_beacon_node_port() {
+        assert_eq!(
+            Stack::BareMetal.bn_metric_url(),
+            "http://localhost:8008/metrics"
+        );
+        assert_eq!(
+            Stack::EthDocker.bn_metric_url(),
+            "http://localhost:8008/metrics"
+        );
+        assert_eq!(
+            Stack::RocketPool.bn_metric_url(),
+            "http://localhost:9100/metrics"
+        );
+    }
+
+    /// The whole point of the split. If a stack ever returned one URL for both
+    /// processes, `doctor` would report the same endpoint twice under two
+    /// names and `version` would claim the same process is both.
+    ///
+    /// Driven off `value_variants()` so a stack added later is covered
+    /// automatically, the same shape as
+    /// `serde_matches_clap_values_for_every_variant`.
+    #[test]
+    fn bn_and_vc_metric_urls_differ_for_every_stack() {
+        for stack in Stack::value_variants() {
+            assert_ne!(
+                stack.bn_metric_url(),
+                stack.vc_metric_url(),
+                "{stack} points both processes at one endpoint"
+            );
+        }
     }
 
     #[test]
