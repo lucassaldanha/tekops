@@ -4,7 +4,8 @@
 //! helpers are pure and hold every formatting decision, and `run_dump` holds
 //! all the I/O.
 
-use crate::logs::{producer_argv, LogTarget, Mode};
+use crate::logs::{producer_argv, slot_target, LogSources, LogTarget, Mode};
+use crate::merge::{Merger, RecordBuilder, Source, MERGE_WINDOW};
 use crate::redact::Redactor;
 use crate::stack::Stack;
 use crate::term::sanitize;
@@ -12,6 +13,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 /// A ceiling on how much a single dump will hold in memory.
 ///
@@ -179,8 +181,18 @@ fn redact_line(r: &mut Redactor, raw: &str) -> String {
     r.redact(&sanitize(raw))
 }
 
-/// Spawns the producer, reads its output, and redacts each line.
-fn read_lines(target: &LogTarget, lines: u32, r: &mut Redactor) -> Result<Vec<String>, DumpError> {
+/// Reads one source to completion, grouping its lines into merge records.
+///
+/// `Mode::Once` producers end by themselves, so this drains to EOF and needs
+/// none of the pager, thread or signal machinery `run_logs` has. Reading the
+/// sources one after another cannot deadlock for the same reason: a producer
+/// whose pipe fills simply blocks until its turn comes.
+fn read_source(
+    source: Source,
+    target: &LogTarget,
+    lines: u32,
+    merger: &mut Merger,
+) -> Result<(), DumpError> {
     // Only a file can be checked up front; a container's absence surfaces as a
     // non-zero exit from `docker logs`. Same split as `run_logs`.
     if let LogTarget::File(p) = target {
@@ -205,20 +217,15 @@ fn read_lines(target: &LogTarget, lines: u32, r: &mut Redactor) -> Result<Vec<St
         .take()
         .ok_or_else(|| DumpError::Io("the producer had no stdout".to_string()))?;
 
-    let mut out = Vec::new();
-    let mut bytes = 0usize;
+    let mut builder = RecordBuilder::new(source, 0);
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|e| DumpError::Io(e.to_string()))?;
-        let redacted = redact_line(r, &line);
-        bytes = bytes.saturating_add(redacted.len() + 1);
-        if bytes > MAX_DUMP_BYTES {
-            out.push(format!(
-                "*** tekops: {} MiB limit reached, dump truncated here.",
-                MAX_DUMP_BYTES / (1024 * 1024)
-            ));
-            break;
+        if let Some(record) = builder.push_line(&line) {
+            merger.push(record, Instant::now());
         }
-        out.push(redacted);
+    }
+    if let Some(record) = builder.finish() {
+        merger.push(record, Instant::now());
     }
 
     let status = child.wait().map_err(|e| DumpError::Io(e.to_string()))?;
@@ -232,6 +239,76 @@ fn read_lines(target: &LogTarget, lines: u32, r: &mut Redactor) -> Result<Vec<St
             stderr: sanitize(stderr.trim()),
         });
     }
+    Ok(())
+}
+
+/// Reads every resolved source and returns one merged, tagged, redacted body.
+///
+/// A source that cannot be read does not abort the dump when the other one
+/// works: the reason goes into the artifact as a visible note instead. A dump
+/// exists to be handed to someone else, so silently omitting half of a
+/// separated node would be worse than saying so. When nothing can be read at
+/// all, the first failure is returned.
+fn read_sources(
+    sources: &LogSources,
+    lines: u32,
+    r: &mut Redactor,
+) -> Result<Vec<String>, DumpError> {
+    let active = sources.active();
+    // `drain_all` ignores the window and the EOF flags, so a `Mode::Once` read
+    // needs neither; the instant is only there to satisfy the constructor.
+    let mut merger = Merger::new(active.clone(), MERGE_WINDOW, Instant::now());
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut read_any = false;
+    let mut first_failure: Option<DumpError> = None;
+    for source in &active {
+        let Some(target) = slot_target(sources, *source) else {
+            continue;
+        };
+        match read_source(*source, target, lines, &mut merger) {
+            Ok(()) => read_any = true,
+            Err(e) => {
+                notes.push(format!(
+                    "*** tekops: could not read the {} log: {e}",
+                    source.tag()
+                ));
+                if first_failure.is_none() {
+                    first_failure = Some(e);
+                }
+            }
+        }
+    }
+    if !read_any {
+        return Err(first_failure.unwrap_or(DumpError::Io("no log source to read".to_string())));
+    }
+
+    // The tag is prepended *after* redaction, which is what makes it safe by
+    // construction rather than by luck: the redactor only ever sees the node's
+    // own bytes, so it cannot rewrite the one column saying which process a
+    // line came from.
+    let tagged = active.len() > 1;
+    let mut out = notes;
+    let mut bytes: usize = out.iter().map(|n| n.len() + 1).sum();
+    for record in merger.drain_all() {
+        for line in &record.lines {
+            let redacted = redact_line(r, line);
+            let text = if tagged {
+                format!("[{}] {redacted}", record.source.tag())
+            } else {
+                redacted
+            };
+            bytes = bytes.saturating_add(text.len() + 1);
+            if bytes > MAX_DUMP_BYTES {
+                out.push(format!(
+                    "*** tekops: {} MiB limit reached, dump truncated here.",
+                    MAX_DUMP_BYTES / (1024 * 1024)
+                ));
+                return Ok(out);
+            }
+            out.push(text);
+        }
+    }
     Ok(out)
 }
 
@@ -242,6 +319,20 @@ fn stack_label(stack: Option<Stack>) -> String {
         .and_then(|s| s.to_possible_value())
         .map(|v| v.get_name().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// A human label for everything that was read, for the header.
+///
+/// One source keeps the bare label it has always had, so a single-source
+/// dump's header is unchanged. Two get tagged, because a header naming only
+/// one of them is indistinguishable from a dump of only one of them.
+fn sources_label(sources: &LogSources) -> String {
+    match (&sources.bn, &sources.vc) {
+        (Some(bn), None) => target_label(bn),
+        (None, Some(vc)) => target_label(vc),
+        (Some(bn), Some(vc)) => format!("bn {}, vc {}", target_label(bn), target_label(vc)),
+        (None, None) => "no source".to_string(),
+    }
 }
 
 /// A human label for what was read, for the header.
@@ -334,7 +425,7 @@ fn confirm_upload(rendered: &str) -> Result<bool, DumpError> {
 }
 
 pub struct DumpConfig {
-    pub target: LogTarget,
+    pub sources: LogSources,
     pub lines: u32,
     pub output: Option<PathBuf>,
     pub gist: bool,
@@ -361,7 +452,7 @@ pub fn run_dump(cfg: DumpConfig) -> Result<(), DumpError> {
     let header_bits = cfg.header.then(|| {
         (
             redact_line(&mut r, &stack_label(cfg.stack)),
-            redact_line(&mut r, &target_label(&cfg.target)),
+            redact_line(&mut r, &sources_label(&cfg.sources)),
         )
     });
 
@@ -378,7 +469,7 @@ pub fn run_dump(cfg: DumpConfig) -> Result<(), DumpError> {
             .join("\n")
     });
 
-    let lines = read_lines(&cfg.target, cfg.lines, &mut r)?;
+    let lines = read_sources(&cfg.sources, cfg.lines, &mut r)?;
 
     let summary = r.summary();
     let header = header_bits.map(|(stack, source)| Header {
@@ -520,17 +611,109 @@ mod tests {
         drop(f);
 
         let mut r = Redactor::new();
-        let lines = read_lines(&LogTarget::File(path), 3, &mut r).unwrap();
+        let sources = LogSources {
+            bn: Some(LogTarget::File(path)),
+            vc: None,
+        };
+        let lines = read_sources(&sources, 3, &mut r).unwrap();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("<ip-1>"));
         assert!(!lines[0].contains("93.184.216.34"));
+        assert!(
+            !lines[0].starts_with("[bn] "),
+            "a single source carries no tag: {:?}",
+            lines[0]
+        );
     }
 
     #[test]
     fn a_missing_file_target_is_an_error_not_an_empty_dump() {
         let mut r = Redactor::new();
-        let target = LogTarget::File(PathBuf::from("/nope/absent.log"));
-        assert!(read_lines(&target, 10, &mut r).is_err());
+        let sources = LogSources {
+            bn: Some(LogTarget::File(PathBuf::from("/nope/absent.log"))),
+            vc: None,
+        };
+        assert!(read_sources(&sources, 10, &mut r).is_err());
+    }
+
+    /// The dump carries the same interleaving the operator saw, so whoever
+    /// they paste it to sees what they saw. This also pins that the tag
+    /// survives redaction: it is prepended after the redactor has run, so the
+    /// redactor only ever sees the node's own bytes and cannot rewrite the one
+    /// column saying which process a line came from.
+    #[test]
+    fn a_separated_dump_is_one_merged_tagged_redacted_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let bn = dir.path().join("bn.log");
+        let vc = dir.path().join("vc.log");
+        std::fs::write(
+            &bn,
+            "2026-09-14 01:00:00.000 INFO  - bn one from 93.184.216.34\n\
+             2026-09-14 01:00:02.000 INFO  - bn two\n",
+        )
+        .unwrap();
+        std::fs::write(&vc, "2026-09-14 01:00:01.000 INFO  - vc one\n").unwrap();
+
+        let mut r = Redactor::new();
+        let sources = LogSources {
+            bn: Some(LogTarget::File(bn)),
+            vc: Some(LogTarget::File(vc)),
+        };
+        let lines = read_sources(&sources, 10, &mut r).unwrap();
+
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        // Ordered by timestamp across sources, not concatenated per source.
+        assert!(lines[0].starts_with("[bn] ") && lines[0].contains("bn one"));
+        assert!(lines[1].starts_with("[vc] ") && lines[1].contains("vc one"));
+        assert!(lines[2].starts_with("[bn] ") && lines[2].contains("bn two"));
+        // Redacted, with the tag intact in front of it.
+        assert!(lines[0].contains("<ip-1>"), "{:?}", lines[0]);
+        assert!(!lines[0].contains("93.184.216.34"), "{:?}", lines[0]);
+    }
+
+    /// A source that cannot be read does not cost the dump its working half,
+    /// but it does not vanish either - the artifact says so, because it exists
+    /// to be handed to someone else.
+    #[test]
+    fn an_unreadable_source_becomes_a_visible_note_rather_than_a_silent_omission() {
+        let dir = tempfile::tempdir().unwrap();
+        let vc = dir.path().join("vc.log");
+        std::fs::write(&vc, "2026-09-14 01:00:01.000 INFO  - vc one\n").unwrap();
+
+        let mut r = Redactor::new();
+        let sources = LogSources {
+            bn: Some(LogTarget::File(PathBuf::from("/nope/absent.log"))),
+            vc: Some(LogTarget::File(vc)),
+        };
+        let lines = read_sources(&sources, 10, &mut r).unwrap();
+
+        assert!(
+            lines[0].contains("could not read the bn log"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(lines.iter().any(|l| l.contains("vc one")), "{lines:?}");
+    }
+
+    #[test]
+    fn the_header_names_both_sources() {
+        let label = sources_label(&LogSources {
+            bn: Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))),
+            vc: Some(LogTarget::Container("rocketpool_validator".into())),
+        });
+        assert!(label.contains("file /var/log/teku/teku.log"), "{label}");
+        assert!(label.contains("container rocketpool_validator"), "{label}");
+        assert!(label.contains("bn ") && label.contains("vc "), "{label}");
+    }
+
+    /// A single-source dump's header must not grow a tag it never had.
+    #[test]
+    fn a_single_source_header_label_is_unchanged() {
+        let label = sources_label(&LogSources {
+            bn: Some(LogTarget::Container("eth-docker-consensus-1".into())),
+            vc: None,
+        });
+        assert_eq!(label, "container eth-docker-consensus-1");
     }
 
     #[test]

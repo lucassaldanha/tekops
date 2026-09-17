@@ -181,6 +181,18 @@ enum Commands {
         /// Docker container to read logs from (or $TEKOPS_CONTAINER)
         #[arg(long)]
         container: Option<String>,
+        /// Docker container the validator client logs to (or $TEKOPS_VC_CONTAINER)
+        #[arg(long, conflicts_with = "vc_logs_file")]
+        vc_container: Option<String>,
+        /// Log file the validator client writes (or $TEKOPS_VC_LOGS_FILE)
+        #[arg(long)]
+        vc_logs_file: Option<PathBuf>,
+        /// Dump only the beacon node's log
+        #[arg(long, conflicts_with = "vc")]
+        bn: bool,
+        /// Dump only the validator client's log
+        #[arg(long)]
+        vc: bool,
         /// Deployment to narrow container detection to (or $TEKOPS_STACK)
         #[arg(long)]
         stack: Option<Stack>,
@@ -385,65 +397,72 @@ pub fn run() -> ExitCode {
             header,
             doctor,
             container,
+            vc_container,
+            vc_logs_file,
+            bn,
+            vc,
             stack,
         } => {
             // The same detection gate `logs` uses - see `needs_detection`.
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            // `dump-logs` has no `--vc-container`/`--vc-logs-file` flags yet
-            // and does not read `detected_vc` at all (Task 7 adds both,
-            // alongside `DumpConfig.sources`), so this passes `consumes_vc:
-            // false` - the pre-task, bn-only gate. Passing `true` here without
-            // a vc slot to answer would reintroduce a `docker ps` spawn for
-            // every operator who configured only their beacon node, which
-            // this command used to skip entirely.
-            let detected: Option<(Stack, String)> = if needs_detection(
+            // `dump-logs` now fills both slots, so `consumes_vc` is true and
+            // the gate is the same per-slot one `logs` uses. It was false
+            // while this command had no vc slot to answer, because a `true`
+            // there would have spawned `docker ps` for every operator who had
+            // configured only their beacon node - a command that used to skip
+            // detection entirely.
+            let vc_container_env = env::var("TEKOPS_VC_CONTAINER").ok();
+            let vc_logs_file_env = env::var("TEKOPS_VC_LOGS_FILE").ok();
+            let ps = needs_detection(
                 path.as_ref(),
                 container.as_ref(),
-                None,
-                None,
+                vc_container.as_ref(),
+                vc_logs_file.as_ref(),
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
-                None,
-                None,
-                false,
+                vc_container_env.as_ref(),
+                vc_logs_file_env.as_ref(),
+                true,
                 &cfg,
-            ) {
-                docker_ps_names(should_report_unaskable_docker(given_stack))
-                    .and_then(|ps| detect_or_note(&ps, given_stack))
-            } else {
-                None
-            };
+            )
+            .then(|| docker_ps_names(should_report_unaskable_docker(given_stack)))
+            .flatten();
+            let detected: Option<(Stack, String)> =
+                ps.as_deref().and_then(|ps| detect_or_note(ps, given_stack));
+            let detected_vc = ps
+                .as_deref()
+                .and_then(|ps| detect_validator_or_note(ps, given_stack))
+                .map(|(_, name)| name);
             // Unlike `logs`, which only ever wants the container name, the
             // header reports which stack this came from. Detection already
             // knows, so a detected stack beats "unknown" - the same
             // flag > env > config > detection ladder the rest of the command
             // uses.
             let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
-            // Interim: Task 5 rewires this arm through `resolve_log_sources`'s
-            // full two-slot ladder. Until then this takes only the `bn` slot,
-            // mirroring the same interim shape `logs::run_logs` uses.
+            let select = selector(bn, vc);
             let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
                 path,
                 container_flag: container,
-                vc_container_flag: None,
-                vc_logs_file_flag: None,
+                vc_container_flag: vc_container,
+                vc_logs_file_flag: vc_logs_file,
                 container_env,
                 logs_file_env,
-                vc_container_env: None,
-                vc_logs_file_env: None,
+                vc_container_env,
+                vc_logs_file_env,
                 container_cfg: cfg.container.clone(),
                 logs_file_cfg: cfg.logs_file.clone(),
-                vc_container_cfg: None,
-                vc_logs_file_cfg: None,
-                detected_bn: detected.map(|(_, name)| name),
-                detected_vc: None,
-                select: None,
+                vc_container_cfg: cfg.vc_container.clone(),
+                vc_logs_file_cfg: cfg.vc_logs_file.clone(),
+                detected_bn: detected.as_ref().map(|(_, name)| name.clone()),
+                detected_vc,
+                select,
             });
-            let target = sources.bn.unwrap_or_else(|| {
-                crate::logs::LogTarget::File(PathBuf::from(crate::logs::DEFAULT_TEKU_LOG))
-            });
+            if let Err(e) = check_selection(&sources, select) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
             // `--doctor` runs its own `docker ps` through `doctor_probe_config`
             // rather than reusing the detection above: doctor's ladder also
             // needs the container name and the two URLs, and duplicating that
@@ -456,7 +475,7 @@ pub fn run() -> ExitCode {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             exit_for(crate::dump::run_dump(crate::dump::DumpConfig {
-                target,
+                sources,
                 lines,
                 output,
                 gist,

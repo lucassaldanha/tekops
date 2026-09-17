@@ -385,7 +385,7 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
 /// at all - `resolve_log_sources`'s rule 2 already makes that the "nothing
 /// stated, nothing detected" case exclusively.
 /// The target for one slot, if that slot resolved to anything.
-fn slot_target(sources: &LogSources, source: Source) -> Option<&LogTarget> {
+pub(crate) fn slot_target(sources: &LogSources, source: Source) -> Option<&LogTarget> {
     match source {
         Source::Bn => sources.bn.as_ref(),
         Source::Vc => sources.vc.as_ref(),
