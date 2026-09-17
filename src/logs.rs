@@ -1,6 +1,5 @@
 use crate::logfmt::format_log_line;
 use crate::merge::Source;
-use std::env;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -311,37 +310,14 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
     }
 }
 
-pub fn run_logs(
-    path: Option<PathBuf>,
-    lines: u32,
-    container: Option<String>,
-    container_cfg: Option<String>,
-    logs_file_cfg: Option<PathBuf>,
-    detected: Option<String>,
-) -> ExitCode {
-    // Interim: Task 6 rewrites `run_logs` to drive both slots through
-    // `merge::Merger`. Until then this keeps the tree compiling and green by
-    // taking only the `bn` slot - the `unwrap_or_else` fallback exists because
-    // `resolve_log_sources` makes an empty `bn` unreachable in practice (with
-    // no vc inputs supplied, rule 2's default always fills it), so there is no
-    // panic path standing in for a case that cannot come up here.
-    let sources = resolve_log_sources(SourceInputs {
-        path,
-        container_flag: container,
-        vc_container_flag: None,
-        vc_logs_file_flag: None,
-        container_env: env::var("TEKOPS_CONTAINER").ok(),
-        logs_file_env: env::var("TEKOPS_LOGS_FILE").ok(),
-        vc_container_env: None,
-        vc_logs_file_env: None,
-        container_cfg,
-        logs_file_cfg,
-        vc_container_cfg: None,
-        vc_logs_file_cfg: None,
-        detected_bn: detected,
-        detected_vc: None,
-        select: None,
-    });
+/// Interim: Task 6 rewrites this to drive both slots through `merge::Merger`.
+/// Until then it keeps the tree compiling and green by taking only the `bn`
+/// slot from an already-resolved `LogSources` - the `unwrap_or_else` fallback
+/// exists because an empty `bn` cannot happen in practice for a caller going
+/// through `resolve_log_sources` (with no vc inputs supplied, rule 2's default
+/// always fills it), so there is no panic path standing in for a case that can
+/// come up here.
+pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
     let target = sources
         .bn
         .unwrap_or_else(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
@@ -703,7 +679,11 @@ mod tests {
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(Some(missing), 500, None, None, None, None);
+        let sources = LogSources {
+            bn: Some(LogTarget::File(missing)),
+            vc: None,
+        };
+        let code = run_logs(sources, 500);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 

@@ -8,6 +8,7 @@ use crate::loglevel::{
     self, resolve_log_level_target, LogLevelError, LogLevelSpec, LogLevelTarget,
 };
 use crate::logs::run_logs;
+use crate::merge::Source;
 use crate::metrics::MetricsClient;
 use crate::output::{
     format_about, format_doctor_report, format_duties_table, format_head_table,
@@ -134,6 +135,22 @@ enum Commands {
         /// Docker container to read logs from (or $TEKOPS_CONTAINER)
         #[arg(long)]
         container: Option<String>,
+        /// Docker container the validator client logs to (or $TEKOPS_VC_CONTAINER)
+        //
+        // Naming a container fully determines that slot, so a file for the
+        // same slot is meaningless - the same reasoning behind `path`
+        // conflicting with `--container`.
+        #[arg(long, conflicts_with = "vc_logs_file")]
+        vc_container: Option<String>,
+        /// Log file the validator client writes (or $TEKOPS_VC_LOGS_FILE)
+        #[arg(long)]
+        vc_logs_file: Option<PathBuf>,
+        /// Show only the beacon node's log
+        #[arg(long, conflicts_with = "vc")]
+        bn: bool,
+        /// Show only the validator client's log
+        #[arg(long)]
+        vc: bool,
         /// Deployment to narrow container detection to (or $TEKOPS_STACK)
         #[arg(long)]
         stack: Option<Stack>,
@@ -296,33 +313,62 @@ pub fn run() -> ExitCode {
             path,
             lines,
             container,
+            vc_container,
+            vc_logs_file,
+            bn,
+            vc,
             stack,
         } => {
             // Detection only runs when nothing else has answered - see
             // `needs_detection`.
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
-            let detected = if needs_detection(
+            let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
+            // One `docker ps`, read for both roles - the same shape
+            // `doctor_probe_config` uses.
+            let ps = needs_detection(
                 path.as_ref(),
                 container.as_ref(),
+                vc_container.as_ref(),
+                vc_logs_file.as_ref(),
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
                 &cfg,
-            ) {
-                let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-                docker_ps_names(should_report_unaskable_docker(only))
-                    .and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
-            } else {
-                None
-            };
-            run_logs(
-                path,
-                lines,
-                container,
-                cfg.container.clone(),
-                cfg.logs_file.clone(),
-                detected,
             )
+            .then(|| docker_ps_names(should_report_unaskable_docker(only)))
+            .flatten();
+            let detected_bn = ps
+                .as_deref()
+                .and_then(|ps| detect_or_note(ps, only))
+                .map(|(_, name)| name);
+            let detected_vc = ps
+                .as_deref()
+                .and_then(|ps| detect_validator_or_note(ps, only))
+                .map(|(_, name)| name);
+
+            let select = selector(bn, vc);
+            let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+                path,
+                container_flag: container,
+                vc_container_flag: vc_container,
+                vc_logs_file_flag: vc_logs_file,
+                container_env,
+                logs_file_env,
+                vc_container_env: env::var("TEKOPS_VC_CONTAINER").ok(),
+                vc_logs_file_env: env::var("TEKOPS_VC_LOGS_FILE").ok(),
+                container_cfg: cfg.container.clone(),
+                logs_file_cfg: cfg.logs_file.clone(),
+                vc_container_cfg: cfg.vc_container.clone(),
+                vc_logs_file_cfg: cfg.vc_logs_file.clone(),
+                detected_bn,
+                detected_vc,
+                select,
+            });
+            if let Err(e) = check_selection(&sources, select) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            run_logs(sources, lines)
         }
         Commands::DumpLogs {
             path,
@@ -339,9 +385,15 @@ pub fn run() -> ExitCode {
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
+            // No `--vc-container`/`--vc-logs-file` flags here yet (Task 7 adds
+            // them alongside `DumpConfig.sources`), so `None` for both - the
+            // vc slot can still be answered by its config/environment rungs,
+            // which `needs_detection` checks on its own.
             let detected: Option<(Stack, String)> = if needs_detection(
                 path.as_ref(),
                 container.as_ref(),
+                None,
+                None,
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
                 &cfg,
@@ -917,30 +969,86 @@ fn note_ambiguity(found: Result<(Stack, String), DetectError>) -> Option<(Stack,
 
 /// Whether `docker ps` has anything left to answer.
 ///
-/// The logical negation of every rung in `logs::resolve_log_sources`'s bn
-/// ladder above `detected_bn`. Extracted so the two call sites cannot drift
-/// apart and so the condition is testable without spawning Docker.
+/// The logical negation of every rung in `logs::resolve_log_sources`'s
+/// precedence ladder above `detected_bn`/`detected_vc`. Detection is worth
+/// its spawn while *either* slot is still unanswered, because one `docker ps`
+/// now feeds both.
 ///
-/// This checks only the bn rungs - it does not yet know about
-/// `vc_container`/`vc_logs_file`, so it still gates the single spawn that
-/// answers both `detected_bn` and `detected_vc`. `resolve_log_sources`'s own
-/// doc comment states the rule this must widen to: skippable only when
-/// *both* slots are already answered, because the bn rungs alone must not
-/// suppress the spawn that a separated deployment's vc slot still needs.
-/// Widening this function to that per-slot rule is a later task's job.
+/// Note the interaction with `resolve_log_sources`'s rule 1: stating one side
+/// only means the other is suppressed, so detection's answer for it goes
+/// unused. Skipping the spawn in that case would be correct but is
+/// deliberately not done - the condition is already the hardest thing in this
+/// file to keep in step with the ladder, and the cost of getting it wrong (a
+/// stream that silently stops appearing) is far worse than one wasted spawn.
+#[allow(clippy::too_many_arguments)]
 fn needs_detection(
     path: Option<&PathBuf>,
     container_flag: Option<&String>,
+    vc_container_flag: Option<&String>,
+    vc_logs_file_flag: Option<&PathBuf>,
     container_env: Option<&String>,
     logs_file_env: Option<&String>,
     cfg: &crate::config::Config,
 ) -> bool {
-    path.is_none()
-        && container_flag.is_none()
-        && container_env.is_none()
-        && logs_file_env.is_none()
-        && cfg.container.is_none()
-        && cfg.logs_file.is_none()
+    let bn_answered = path.is_some()
+        || container_flag.is_some()
+        || container_env.is_some()
+        || logs_file_env.is_some()
+        || cfg.container.is_some()
+        || cfg.logs_file.is_some();
+    let vc_answered = vc_container_flag.is_some()
+        || vc_logs_file_flag.is_some()
+        || env::var("TEKOPS_VC_CONTAINER").is_ok()
+        || env::var("TEKOPS_VC_LOGS_FILE").is_ok()
+        || cfg.vc_container.is_some()
+        || cfg.vc_logs_file.is_some();
+    !(bn_answered && vc_answered)
+}
+
+/// `--bn` / `--vc` as a selector. Clap has already rejected both at once.
+fn selector(bn: bool, vc: bool) -> Option<Source> {
+    match (bn, vc) {
+        (true, _) => Some(Source::Bn),
+        (_, true) => Some(Source::Vc),
+        _ => None,
+    }
+}
+
+/// Asking for a process that has no log source is a question tekops should
+/// answer, not a blank screen.
+///
+/// `resolve_log_sources` runs rule 1 (mutual exclusion by flag/env) before
+/// rule 3 (`select` filtering), so a selector naming a slot that rule 1 or
+/// detection never filled in resolves quietly to `None` rather than an error -
+/// `--bn` on a host where only a validator container is running, or
+/// `--container X --vc`, both land here. The generic "no log source" that
+/// `run_logs` falls back to would be true but unhelpful in that case: the
+/// operator named a process, so the message names it back and says what would
+/// fix it, rather than a blank session that looks like a quiet node.
+fn check_selection(
+    sources: &crate::logs::LogSources,
+    select: Option<Source>,
+) -> Result<(), String> {
+    let missing = match select {
+        Some(Source::Bn) => sources.bn.is_none(),
+        Some(Source::Vc) => sources.vc.is_none(),
+        None => false,
+    };
+    if missing {
+        let tag = select
+            .expect("missing is only set when a slot was selected")
+            .tag();
+        // Interpolating `--{tag}-container` would print `--bn-container`,
+        // which does not exist: the beacon node's flags are the unprefixed
+        // `--container` and the positional path, not a `bn`-prefixed pair.
+        let hint = match select {
+            Some(Source::Bn) => "name one with --container or a path argument",
+            Some(Source::Vc) => "name one with --vc-container or --vc-logs-file",
+            None => unreachable!("missing is only set when a slot was selected"),
+        };
+        return Err(format!("no {tag} log source found; {hint}"));
+    }
+    Ok(())
 }
 
 /// Generic over the error type so `UpdateError` shares the exit path with
@@ -2452,39 +2560,130 @@ mod tests {
     #[test]
     fn nothing_stated_anywhere_still_needs_detection() {
         let cfg = crate::config::Config::default();
-        assert!(needs_detection(None, None, None, None, &cfg));
+        assert!(needs_detection(None, None, None, None, None, None, &cfg));
     }
 
-    /// The regression this guards: a configured operator paying for a spawn whose
-    /// answer cannot be used. It is silent when it breaks - the symptom is a
-    /// `docker ps`, not an error.
+    /// The regression this guards: a fully configured operator paying for a
+    /// spawn whose answer cannot be used. It is silent when it breaks - the
+    /// symptom is a `docker ps`, not an error. Pairs the bn container rung
+    /// with the vc file rung (rather than repeating the same rung on both
+    /// sides) so this and the test below between them cover all four rungs.
     #[test]
     fn a_config_container_removes_the_need_to_detect() {
         let cfg = crate::config::Config {
             container: Some("c".into()),
+            vc_logs_file: Some(PathBuf::from("/vc.log")),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, &cfg));
+        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
     }
 
     #[test]
     fn a_config_logs_file_removes_the_need_to_detect() {
         let cfg = crate::config::Config {
             logs_file: Some(PathBuf::from("/x.log")),
+            vc_container: Some("vc-c".into()),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, &cfg));
+        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
     }
 
+    /// Since R12, the bn rungs alone are no longer enough: the vc slot has to
+    /// be answered too, because the same `docker ps` also answers
+    /// `detected_vc`.
     #[test]
-    fn any_stated_source_removes_the_need_to_detect() {
+    fn any_stated_bn_source_alone_still_needs_detection() {
         let cfg = crate::config::Config::default();
         let p = PathBuf::from("/x.log");
         let s = "c".to_string();
-        assert!(!needs_detection(Some(&p), None, None, None, &cfg));
-        assert!(!needs_detection(None, Some(&s), None, None, &cfg));
-        assert!(!needs_detection(None, None, Some(&s), None, &cfg));
-        assert!(!needs_detection(None, None, None, Some(&s), &cfg));
+        assert!(needs_detection(
+            Some(&p),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            None,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            None,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            &cfg
+        ));
+    }
+
+    /// The other half of the same rule: any one of the bn rungs, paired with
+    /// any one of the vc rungs, is enough to skip the spawn.
+    #[test]
+    fn any_stated_bn_source_paired_with_a_stated_vc_source_removes_the_need_to_detect() {
+        let cfg = crate::config::Config::default();
+        let p = PathBuf::from("/x.log");
+        let s = "c".to_string();
+        let vc = "vc-c".to_string();
+        let vc_file = PathBuf::from("/vc.log");
+        assert!(!needs_detection(
+            Some(&p),
+            None,
+            Some(&vc),
+            None,
+            None,
+            None,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            Some(&s),
+            None,
+            Some(&vc_file),
+            None,
+            None,
+            &cfg
+        ));
+    }
+
+    /// The gate must learn the VC rungs. Without this a fully configured
+    /// separated operator pays for a `docker ps` spawn whose answer cannot be
+    /// used - the exact failure `needs_detection` exists to prevent.
+    #[test]
+    fn a_configured_validator_source_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            container: Some("bn-c".into()),
+            vc_container: Some("vc-c".into()),
+            ..Default::default()
+        };
+        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
+    }
+
+    /// Only one side configured still needs detection for the other.
+    #[test]
+    fn only_the_beacon_node_configured_still_needs_detection() {
+        let cfg = crate::config::Config {
+            container: Some("bn-c".into()),
+            ..Default::default()
+        };
+        assert!(needs_detection(None, None, None, None, None, None, &cfg));
     }
 
     #[test]
@@ -2503,6 +2702,137 @@ mod tests {
     #[test]
     fn a_path_and_a_container_cannot_both_be_given() {
         assert!(Cli::try_parse_from(["tekops", "logs", "/a.log", "--container", "c"]).is_err());
+    }
+
+    /// The selectors are mutually exclusive: asking for both is a contradiction
+    /// clap should reject at parse time rather than something the resolver has
+    /// to arbitrate.
+    #[test]
+    fn bn_and_vc_selectors_cannot_be_combined() {
+        assert!(Cli::try_parse_from(["tekops", "logs", "--bn", "--vc"]).is_err());
+    }
+
+    #[test]
+    fn logs_accepts_the_validator_source_flags() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "--vc-container", "rocketpool_validator"])
+            .unwrap();
+        match cli.command {
+            Commands::Logs { vc_container, .. } => {
+                assert_eq!(vc_container.as_deref(), Some("rocketpool_validator"))
+            }
+            _ => panic!("expected a Logs command"),
+        }
+    }
+
+    /// Naming a container fully determines that slot, so a file for the same
+    /// slot is meaningless - the same reasoning that makes `path` conflict
+    /// with `--container`.
+    #[test]
+    fn the_validator_container_and_file_flags_conflict() {
+        assert!(Cli::try_parse_from([
+            "tekops",
+            "logs",
+            "--vc-container",
+            "c",
+            "--vc-logs-file",
+            "/x.log"
+        ])
+        .is_err());
+    }
+
+    /// Asking for a process that has no log source must say so, naming the
+    /// process and the flags that would fix it. A blank session would look
+    /// like a quiet node rather than a misconfiguration.
+    #[test]
+    fn selecting_a_slot_with_no_source_is_an_error_that_names_it() {
+        let bn_only = crate::logs::LogSources {
+            bn: Some(crate::logs::LogTarget::Container("c".into())),
+            vc: None,
+        };
+        let err = check_selection(&bn_only, Some(Source::Vc)).unwrap_err();
+        assert!(err.contains("vc"), "{err}");
+        assert!(err.contains("--vc-container"), "{err}");
+
+        assert!(check_selection(&bn_only, Some(Source::Bn)).is_ok());
+        assert!(check_selection(&bn_only, None).is_ok());
+    }
+
+    /// The bn-slot error must not accidentally suggest a flag that does not
+    /// exist (`--bn-container`) - the beacon node's flags are the unprefixed
+    /// `--container` and the positional path.
+    #[test]
+    fn selecting_the_bn_slot_with_no_source_names_the_flags_that_actually_exist() {
+        let vc_only = crate::logs::LogSources {
+            bn: None,
+            vc: Some(crate::logs::LogTarget::Container("v".into())),
+        };
+        let err = check_selection(&vc_only, Some(Source::Bn)).unwrap_err();
+        assert!(err.contains("bn"), "{err}");
+        assert!(err.contains("--container"), "{err}");
+        assert!(!err.contains("--bn-container"), "{err}");
+    }
+
+    /// Rule 2 (mutual exclusion by flag/env) runs before rule 3 (`select`
+    /// filtering), so `--bn` on a host where only a validator container is
+    /// detected resolves to `LogSources { bn: None, vc: None }` rather than an
+    /// error at the resolver level: `select` only filters what already
+    /// resolved, and nothing did. `check_selection` is what turns that into a
+    /// clear error instead of a session that looks like a quiet, working node.
+    #[test]
+    fn bn_selector_on_a_host_with_only_a_detected_validator_is_a_named_error() {
+        let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+            path: None,
+            container_flag: None,
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: Some("rocketpool_validator".into()),
+            select: Some(Source::Bn),
+        });
+        assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });
+
+        let err = check_selection(&sources, Some(Source::Bn)).unwrap_err();
+        assert!(err.contains("bn"), "{err}");
+        assert!(err.contains("--container"), "{err}");
+    }
+
+    /// The other real invocation the same gap allows: `--container X --vc`.
+    /// Rule 1 grants the whole answer to the stated bn side (`X`) and
+    /// suppresses vc, so rule 3 then drops the bn side too, again landing on
+    /// `LogSources { bn: None, vc: None }` - a silent empty session unless
+    /// `check_selection` names what happened.
+    #[test]
+    fn container_flag_with_vc_selector_is_a_named_error() {
+        let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+            path: None,
+            container_flag: Some("X".into()),
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: None,
+            select: Some(Source::Vc),
+        });
+        assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });
+
+        let err = check_selection(&sources, Some(Source::Vc)).unwrap_err();
+        assert!(err.contains("vc"), "{err}");
+        assert!(err.contains("--vc-container"), "{err}");
     }
 
     #[test]
