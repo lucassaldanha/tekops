@@ -439,6 +439,27 @@ fn file_failure(path: &Path) -> Option<String> {
     }
 }
 
+/// Says so when a file target is empty, because the session cannot.
+///
+/// An empty file is not a failure - `tail -F` will follow it and a log that
+/// has just been rotated is briefly empty - so the source still starts. But
+/// `tail -n 500` on an empty file prints nothing and follows forever, which
+/// on screen is indistinguishable from a healthy process that has not spoken
+/// yet. The likely cause is a stale placeholder at a path the process no
+/// longer writes to, and a node logging to journald or to a rotated filename
+/// leaves exactly that behind, so the note names the path and the process
+/// rather than leaving an empty pager to be interpreted.
+fn empty_file_note(path: &Path, source: Source) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    (len == 0).then(|| {
+        format!(
+            "{} log file is empty: {} - is that where this process writes?",
+            source.tag(),
+            path.display()
+        )
+    })
+}
+
 /// Tails every resolved source at once, merged into one timeline.
 ///
 /// One producer per source, one reader thread each feeding a shared `Merger`,
@@ -490,6 +511,10 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
     // output byte-identical to what it was before this feature existed.
     let mut producers: Vec<(Source, Child)> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // Not failures: the source starts, and may yet produce something. They
+    // exist because the buffer they are written into cannot distinguish an
+    // empty file from a quiet node, and the operator cannot either.
+    let mut notes: Vec<String> = Vec::new();
     for source in &active {
         let Some(target) = slot_target(&sources, *source) else {
             continue;
@@ -502,6 +527,9 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
             if let Some(why) = file_failure(p) {
                 failures.push(why);
                 continue;
+            }
+            if let Some(note) = empty_file_note(p, *source) {
+                notes.push(note);
             }
         }
 
@@ -579,10 +607,12 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
     // A source that did not start is named at the head of the buffer, where
     // the pager will show it. Failing to write the notes is not worth ending a
     // session over - the logs themselves are what the operator came for.
-    for why in &failures {
+    let mut said_something = false;
+    for why in failures.iter().chain(notes.iter()) {
         let _ = writeln!(writer, "*** tekops: {}", sanitize(why));
+        said_something = true;
     }
-    if !failures.is_empty() {
+    if said_something {
         let _ = writeln!(writer);
     }
 
@@ -1204,6 +1234,28 @@ mod tests {
             file_failure(&p),
             Some(format!("log file not found: {}", p.display()))
         );
+    }
+
+    /// The state the operator cannot read off the screen: a file that opens,
+    /// follows, and has nothing to show.
+    #[test]
+    fn an_empty_file_is_noted_without_being_a_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "").expect("write");
+
+        assert_eq!(file_failure(&p), None, "an empty file still starts");
+        let note = empty_file_note(&p, Source::Bn).expect("an empty file must be noted");
+        assert!(note.starts_with("bn log file is empty"), "{note}");
+        assert!(note.contains(&p.display().to_string()), "{note}");
+    }
+
+    #[test]
+    fn a_file_with_content_is_not_noted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        assert_eq!(empty_file_note(&p, Source::Bn), None);
     }
 
     #[test]
