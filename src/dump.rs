@@ -5,7 +5,7 @@
 //! all the I/O.
 
 use crate::logs::{producer_argv, slot_target, LogSources, LogTarget, Mode};
-use crate::merge::{Merger, RecordBuilder, Source, MERGE_WINDOW};
+use crate::merge::{Merger, Source, MERGE_WINDOW};
 use crate::redact::Redactor;
 use crate::stack::Stack;
 use crate::term::sanitize;
@@ -217,16 +217,14 @@ fn read_source(
         .take()
         .ok_or_else(|| DumpError::Io("the producer had no stdout".to_string()))?;
 
-    let mut builder = RecordBuilder::new(source, 0);
+    // The merger owns this source's record builder. `Mode::Once` reaches a
+    // real EOF, so `eof` is what finishes the last record here - `flush_stale`
+    // is for the follow-mode producers that never get one.
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|e| DumpError::Io(e.to_string()))?;
-        if let Some(record) = builder.push_line(&line) {
-            merger.push(record, Instant::now());
-        }
+        merger.push_line(source, &line, Instant::now());
     }
-    if let Some(record) = builder.finish() {
-        merger.push(record, Instant::now());
-    }
+    merger.eof(source);
 
     let status = child.wait().map_err(|e| DumpError::Io(e.to_string()))?;
     if !status.success() {
@@ -256,8 +254,10 @@ fn read_sources(
 ) -> Result<Vec<String>, DumpError> {
     let active = sources.active();
     // `drain_all` ignores the window and the EOF flags, so a `Mode::Once` read
-    // needs neither; the instant is only there to satisfy the constructor.
-    let mut merger = Merger::new(active.clone(), MERGE_WINDOW, Instant::now());
+    // needs neither; the instant is only there to satisfy the constructor. The
+    // 0 puts an undated line at the top of the artifact rather than beside the
+    // live ones, which is what `logs` wants and a dump does not.
+    let mut merger = Merger::new(active.clone(), MERGE_WINDOW, Instant::now(), 0);
 
     let mut notes: Vec<String> = Vec::new();
     let mut read_any = false;

@@ -73,7 +73,13 @@ const DAY_MS: i64 = 86_400_000;
 /// Holds the per-source state that dating a timestamp needs: the last time
 /// seen (for monotonicity and for rollover) and the last date seen (for the
 /// console layout's time-only variant).
-pub struct RecordBuilder {
+///
+/// Owned by `Merger` rather than by the thread reading the source. A reader
+/// thread blocks on `read_line`, so a builder living there can only ever act
+/// when a line arrives - which is exactly the wrong property for a record
+/// that needs releasing *because* no line has arrived. See
+/// `Merger::flush_stale`.
+struct RecordBuilder {
     source: Source,
     /// Where an undated record lands when this source has never carried a
     /// date - the session's start, supplied by the caller so this stays pure.
@@ -83,7 +89,7 @@ pub struct RecordBuilder {
 }
 
 impl RecordBuilder {
-    pub fn new(source: Source, session_start_ms: i64) -> Self {
+    fn new(source: Source, session_start_ms: i64) -> Self {
         RecordBuilder {
             source,
             session_start_ms,
@@ -101,16 +107,17 @@ impl RecordBuilder {
     /// **Until this source has produced its first recognised timestamp, an
     /// untimestamped line is its own record and is returned at once**, because
     /// it cannot be the continuation of a line that never arrived. That is not
-    /// a nicety. A held record is only released by the next timestamped line
-    /// or by `finish()` at EOF, and `tekops logs` runs its producers under
-    /// `tail -F` and `docker logs -f`, which never reach EOF - so a source
-    /// whose layout this module does not parse accumulates every line it ever
-    /// writes and emits none of them. A live beacon node then shows nothing at
-    /// all, with no error anywhere, which is exactly what a stock bare-metal
-    /// Teku did while `leading_timestamp` looked for the wrong JSON key. The
-    /// parsing bug is fixed, but any unparsed layout must degrade to
-    /// out-of-order output rather than to silence.
-    pub fn push_line(&mut self, raw: &str) -> Option<Record> {
+    /// a nicety. A held record is released only by the next timestamped line,
+    /// by `Merger::flush_stale` once the source goes quiet, or by `finish()`
+    /// at EOF - and `tekops logs` runs its producers under `tail -F` and
+    /// `docker logs -f`, which never reach EOF. Before the flush existed, a
+    /// source whose layout this module does not parse accumulated every line
+    /// it ever wrote and emitted none of them: a live beacon node showing
+    /// nothing at all, with no error anywhere, which is what a stock
+    /// bare-metal Teku did while `leading_timestamp` looked for the wrong JSON
+    /// key. Any unparsed layout must degrade to out-of-order output rather
+    /// than to silence.
+    fn push_line(&mut self, raw: &str) -> Option<Record> {
         let Some(stamp) = leading_timestamp(raw) else {
             match &mut self.pending {
                 Some(p) => p.lines.push(raw.to_string()),
@@ -145,8 +152,9 @@ impl RecordBuilder {
         })
     }
 
-    /// The record still in progress, if there is one. Called at EOF.
-    pub fn finish(&mut self) -> Option<Record> {
+    /// The record still in progress, if there is one. Taken at EOF, and by
+    /// `Merger::flush_stale` once the source has been silent for the window.
+    fn finish(&mut self) -> Option<Record> {
         self.pending.take()
     }
 
@@ -212,10 +220,22 @@ fn leading_timestamp(raw: &str) -> Option<Stamp> {
 /// The same rule covers the `-n` backlog and live follow with no mode switch.
 /// `tail -n 500` and `docker logs --tail 500` deliver their backlog as an
 /// immediate burst, so both queues fill and the comparison sorts it exactly.
+///
+/// **The per-source `RecordBuilder`s live here**, not in the threads reading
+/// the sources. A reader thread blocks on `read_line` and so can only act when
+/// a line arrives; releasing a record precisely *because* no line has arrived
+/// needs something that ticks, and the emitter already does. See
+/// `flush_stale`.
 pub struct Merger {
     sources: Vec<Source>,
+    builders: Vec<RecordBuilder>,
     queues: Vec<VecDeque<Record>>,
-    last_push: Vec<Instant>,
+    /// When each source last delivered a *line*, which is not the same as
+    /// when it last completed a record: a long stack trace delivers lines for
+    /// as long as it takes to write without completing anything. Idleness is a
+    /// statement about the producer, so it is measured on the producer's
+    /// output rather than on this type's own bookkeeping.
+    last_line: Vec<Instant>,
     eof: Vec<bool>,
     window: Duration,
 }
@@ -229,12 +249,26 @@ impl Merger {
     /// wait forever on one that has not spoken yet. That is a silent hang on
     /// a quiet node, which is the worst failure this type could have, so the
     /// type makes it unrepresentable instead of documenting it.
-    pub fn new(sources: Vec<Source>, window: Duration, started_at: Instant) -> Self {
+    ///
+    /// `session_start_ms` is where a record lands when its source has given no
+    /// date to place it by. `logs` passes the wall clock, so an undated line
+    /// sorts next to the live ones; `dump` passes 0, so one sorts to the top
+    /// of the artifact.
+    pub fn new(
+        sources: Vec<Source>,
+        window: Duration,
+        started_at: Instant,
+        session_start_ms: i64,
+    ) -> Self {
         let n = sources.len();
         Merger {
+            builders: sources
+                .iter()
+                .map(|s| RecordBuilder::new(*s, session_start_ms))
+                .collect(),
             sources,
             queues: vec![VecDeque::new(); n],
-            last_push: vec![started_at; n],
+            last_line: vec![started_at; n],
             eof: vec![false; n],
             window,
         }
@@ -247,19 +281,75 @@ impl Merger {
             .expect("record from a source this merger was not built with")
     }
 
+    /// Feeds one raw line from one source, queueing whatever record it
+    /// completed.
+    ///
+    /// `at` is when the line arrived, and it is what `flush_stale` and the
+    /// emission rule both measure silence against.
+    pub fn push_line(&mut self, source: Source, raw: &str, at: Instant) {
+        let i = self.index(source);
+        self.last_line[i] = at;
+        if let Some(record) = self.builders[i].push_line(raw) {
+            self.queues[i].push_back(record);
+        }
+    }
+
+    /// Releases any record whose source has been silent for the window.
+    ///
+    /// Called on the emitter's tick, which is the whole point of the builders
+    /// living here. A record is held open only because a continuation line
+    /// might still join it, and log4j writes a stack trace's lines in one
+    /// burst - so once a source has said nothing for `window`, whatever it is
+    /// holding is finished, and waiting longer just hides the newest thing the
+    /// node wrote. Under `tail -F` and `docker logs -f` "longer" means until
+    /// the node next writes, or forever.
+    ///
+    /// The released record is the newest one that source has, and every record
+    /// already queued for it is older, so appending keeps the queue
+    /// non-decreasing - which is the invariant the whole comparison rests on.
+    pub fn flush_stale(&mut self, now: Instant) {
+        for i in 0..self.sources.len() {
+            if now.duration_since(self.last_line[i]) < self.window {
+                continue;
+            }
+            if let Some(record) = self.builders[i].finish() {
+                self.queues[i].push_back(record);
+            }
+        }
+    }
+
+    /// Queues an already-built record. Test-only since the builders moved in
+    /// here: production has nothing but raw lines to offer, and feeds them
+    /// through `push_line`.
+    ///
+    /// `#[cfg(test)]` rather than `#[allow(dead_code)]` because the two say
+    /// different things - this is not a use waiting to be found, it is a seam
+    /// the tests need. The emission rule is worth testing against records with
+    /// timestamps stated outright, independently of whether `leading_timestamp`
+    /// can parse them; routing those tests through `push_line` would couple
+    /// every one of them to the layout parser and hide a broken rule behind a
+    /// working parser, or the reverse.
+    #[cfg(test)]
     pub fn push(&mut self, record: Record, at: Instant) {
         let i = self.index(record.source);
         self.queues[i].push_back(record);
-        self.last_push[i] = at;
+        self.last_line[i] = at;
     }
 
+    /// The source is finished, so nothing can continue the record it was
+    /// holding: that record is queued here rather than being left for a line
+    /// that cannot come.
     pub fn eof(&mut self, source: Source) {
         let i = self.index(source);
+        if let Some(record) = self.builders[i].finish() {
+            self.queues[i].push_back(record);
+        }
         self.eof[i] = true;
     }
 
     /// Whether every source has finished and everything queued has been
-    /// emitted.
+    /// emitted. The builders need no check of their own: `eof` empties each
+    /// one as it is marked, so nothing can be held behind a finished source.
     pub fn is_done(&self) -> bool {
         self.eof.iter().all(|e| *e) && self.queues.iter().all(|q| q.is_empty())
     }
@@ -273,9 +363,18 @@ impl Merger {
         out
     }
 
-    /// Everything queued, in order, ignoring the window. For EOF, where
-    /// waiting cannot produce anything new.
+    /// Everything queued, in order, ignoring the window. For EOF and for
+    /// teardown, where waiting cannot produce anything new.
+    ///
+    /// Open records are finished first. Nothing else will ever close them, so
+    /// leaving them held would drop the last line of every source from a
+    /// session the operator ended - which is the tail they were watching.
     pub fn drain_all(&mut self) -> Vec<Record> {
+        for i in 0..self.sources.len() {
+            if let Some(record) = self.builders[i].finish() {
+                self.queues[i].push_back(record);
+            }
+        }
         let mut out = Vec::new();
         while let Some(i) = self.earliest_head() {
             out.push(self.queues[i].pop_front().expect("head was just checked"));
@@ -304,10 +403,15 @@ impl Merger {
                 || self.eof[i]
                 // A source that has not spoken since the session began is
                 // idle once the window has passed from *that* point, which is
-                // why `new` seeds the clock. Treating "never pushed" as idle
+                // why `new` seeds the clock. Treating "never spoken" as idle
                 // outright would emit one source's whole backlog before the
                 // other had a chance to deliver its first line.
-                || now.duration_since(self.last_push[i]) >= self.window
+                //
+                // Measured on lines rather than on completed records: a source
+                // part-way through a long stack trace has an empty queue and
+                // nothing finished, but it is plainly not idle, and emitting
+                // past it would put the other source's output inside the trace.
+                || now.duration_since(self.last_line[i]) >= self.window
         });
         safe.then_some(candidate)
     }
@@ -323,6 +427,98 @@ mod tests {
             time: LogTime(ms),
             lines: vec![text.to_string()],
         }
+    }
+
+    /// The one-record lag. A timestamped line opens a record that only the
+    /// *next* timestamped line can close, so under `tail -F` - which has no
+    /// next line to offer and no EOF either - the newest thing the node wrote
+    /// is the one thing the operator cannot see. On a quiet source that is a
+    /// whole slot of waiting, and on a source that stops writing it is
+    /// forever.
+    #[test]
+    fn a_pending_record_is_released_once_its_source_goes_quiet() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
+        m.push_line(Source::Bn, "01:00:00.000 INFO  - newest", t0);
+
+        // Still open: a stack trace may yet follow, and it must travel with
+        // the line that introduced it.
+        assert!(
+            m.drain_ready(t0).is_empty(),
+            "a fresh record waits for the continuation that may follow"
+        );
+
+        let later = t0 + Duration::from_millis(300);
+        m.flush_stale(later);
+        assert_eq!(
+            texts(&m.drain_ready(later)),
+            vec!["01:00:00.000 INFO  - newest"],
+            "a record whose source has gone quiet is released, not held"
+        );
+    }
+
+    /// The property the flush must not break: log4j writes a trace's lines in
+    /// one burst, so every line refreshes the source's clock and the record
+    /// stays open across all of them.
+    #[test]
+    fn a_stack_trace_arriving_in_a_burst_is_not_split_by_the_flush() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
+        m.push_line(Source::Bn, "01:00:00.000 ERROR - boom", t0);
+        m.push_line(
+            Source::Bn,
+            "\tat org.example.Thing",
+            t0 + Duration::from_millis(1),
+        );
+        m.push_line(
+            Source::Bn,
+            "\tat org.example.Other",
+            t0 + Duration::from_millis(2),
+        );
+
+        let later = t0 + Duration::from_millis(300);
+        m.flush_stale(later);
+        let out = m.drain_ready(later);
+        assert_eq!(out.len(), 1, "one record, not three");
+        assert_eq!(out[0].lines.len(), 3, "the trace travels whole");
+    }
+
+    /// A flushed record must never land behind one already emitted, because
+    /// `Merger` only ever compares queue heads.
+    #[test]
+    fn a_flushed_record_keeps_its_queue_non_decreasing() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
+        m.push_line(Source::Bn, "01:00:00.000 INFO  - first", t0);
+        m.push_line(Source::Bn, "01:00:01.000 INFO  - second", t0);
+        let first = m.drain_ready(t0);
+        assert_eq!(texts(&first), vec!["01:00:00.000 INFO  - first"]);
+
+        let later = t0 + Duration::from_millis(300);
+        m.flush_stale(later);
+        let second = m.drain_ready(later);
+        assert_eq!(texts(&second), vec!["01:00:01.000 INFO  - second"]);
+        assert!(
+            second[0].time >= first[0].time,
+            "the flushed record is not older than what preceded it"
+        );
+    }
+
+    /// `flush_stale` is about silence, so a source still delivering lines
+    /// keeps its record open however long the session has run.
+    #[test]
+    fn a_busy_source_keeps_its_record_open() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
+        m.push_line(Source::Bn, "01:00:00.000 INFO  - open", t0);
+        let busy = t0 + Duration::from_millis(200);
+        m.push_line(Source::Bn, "\tstill writing", busy);
+
+        m.flush_stale(busy + Duration::from_millis(100));
+        assert!(
+            m.drain_ready(busy + Duration::from_millis(100)).is_empty(),
+            "only 100ms of silence: the record is still being written"
+        );
     }
 
     /// One real line from a bare-metal Teku, copied verbatim off a node.
@@ -396,7 +592,7 @@ mod tests {
     #[test]
     fn emits_both_sources_in_timestamp_order() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 200, "bn-mid"), t0);
         m.push(rec(Source::Vc, 100, "vc-early"), t0);
         m.push(rec(Source::Bn, 300, "bn-late"), t0);
@@ -412,7 +608,7 @@ mod tests {
     #[test]
     fn an_active_but_empty_source_blocks_emission() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "bn"), t0);
 
         // Vc has said nothing, but has not been quiet long enough to assume it
@@ -425,7 +621,7 @@ mod tests {
     #[test]
     fn an_idle_source_stops_blocking_after_the_window() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "bn"), t0);
 
         let later = t0 + MERGE_WINDOW + Duration::from_millis(1);
@@ -437,7 +633,7 @@ mod tests {
     #[test]
     fn a_source_at_eof_stops_blocking_at_once() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "bn"), t0);
         m.eof(Source::Vc);
 
@@ -449,7 +645,7 @@ mod tests {
     #[test]
     fn two_non_empty_queues_emit_without_waiting() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 200, "bn"), t0);
         m.push(rec(Source::Vc, 100, "vc"), t0);
 
@@ -463,7 +659,7 @@ mod tests {
     #[test]
     fn equal_timestamps_break_deterministically_towards_the_beacon_node() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Vc, 100, "vc"), t0);
         m.push(rec(Source::Bn, 100, "bn"), t0);
         m.eof(Source::Bn);
@@ -580,7 +776,7 @@ mod tests {
     #[test]
     fn one_source_never_waits() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "a"), t0);
         m.push(rec(Source::Bn, 200, "b"), t0);
 
@@ -593,7 +789,7 @@ mod tests {
     #[test]
     fn a_backlog_is_held_until_the_other_source_speaks_then_interleaves() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "bn-1"), t0);
         m.push(rec(Source::Bn, 300, "bn-2"), t0);
         assert!(
@@ -612,7 +808,7 @@ mod tests {
     #[test]
     fn is_done_only_once_every_source_is_at_eof_and_drained() {
         let t0 = Instant::now();
-        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0, 0);
         m.push(rec(Source::Bn, 100, "a"), t0);
         m.eof(Source::Bn);
         assert!(!m.is_done(), "Vc has not finished");

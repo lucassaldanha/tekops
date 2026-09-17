@@ -1,5 +1,5 @@
 use crate::logfmt::format_log_line;
-use crate::merge::{Merger, Record, RecordBuilder, Source, MERGE_WINDOW};
+use crate::merge::{Merger, Record, Source, MERGE_WINDOW};
 use crate::term::sanitize;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
@@ -110,7 +110,14 @@ fn emit_loop(
             let ready = if stopping {
                 m.drain_all()
             } else {
-                m.drain_ready(Instant::now())
+                // This tick is the only thing that releases the newest record
+                // of a source that has gone quiet. Neither producer ever
+                // reaches EOF, so without it the last line the node wrote
+                // would wait for the next one - a whole slot on a quiet
+                // beacon node, and forever on one that has stopped.
+                let now = Instant::now();
+                m.flush_stale(now);
+                m.drain_ready(now)
             };
             (ready, m.is_done())
         };
@@ -628,6 +635,7 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         started.clone(),
         MERGE_WINDOW,
         Instant::now(),
+        session_start_ms,
     )));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -655,7 +663,12 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
 
         let merger = Arc::clone(&merger);
         workers.push(thread::spawn(move || -> io::Result<()> {
-            let mut builder = RecordBuilder::new(source, session_start_ms);
+            // Lines go straight into the merger, which owns this source's
+            // `RecordBuilder`. This thread blocks on `read_line` between lines,
+            // so it is the wrong place to decide that a record has waited long
+            // enough - the emitter's tick does that, through
+            // `Merger::flush_stale`.
+            //
             // The read loop is wrapped so that EOF is recorded even when a line
             // read fails. A source that never reaches EOF is never idle either,
             // so the merger would hold the other source's records forever
@@ -663,21 +676,17 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
             let result = (|| -> io::Result<()> {
                 for line in BufReader::new(stdout).lines() {
                     let line = line?;
-                    if let Some(record) = builder.push_line(&line) {
-                        merger
-                            .lock()
-                            .expect("merger mutex poisoned")
-                            .push(record, Instant::now());
-                    }
+                    merger.lock().expect("merger mutex poisoned").push_line(
+                        source,
+                        &line,
+                        Instant::now(),
+                    );
                 }
                 Ok(())
             })();
 
-            let mut m = merger.lock().expect("merger mutex poisoned");
-            if let Some(record) = builder.finish() {
-                m.push(record, Instant::now());
-            }
-            m.eof(source);
+            // `eof` finishes whatever record this source was still holding.
+            merger.lock().expect("merger mutex poisoned").eof(source);
             result
         }));
     }
@@ -1055,24 +1064,24 @@ mod tests {
             started.clone(),
             MERGE_WINDOW,
             Instant::now(),
+            0,
         )));
         let stop = Arc::new(AtomicBool::new(false));
 
         let reader = {
             let merger = Arc::clone(&merger);
             thread::spawn(move || -> io::Result<()> {
-                let mut builder = RecordBuilder::new(Source::Bn, 0);
+                // The same shape as the reader in `run_logs`: lines straight
+                // into the merger, which owns the builder, and `eof` to finish
+                // whatever record was still open.
                 for line in BufReader::new(stdout).lines() {
                     let line = line?;
-                    if let Some(r) = builder.push_line(&line) {
-                        merger.lock().unwrap().push(r, Instant::now());
-                    }
+                    merger
+                        .lock()
+                        .unwrap()
+                        .push_line(Source::Bn, &line, Instant::now());
                 }
-                let mut m = merger.lock().unwrap();
-                if let Some(r) = builder.finish() {
-                    m.push(r, Instant::now());
-                }
-                m.eof(Source::Bn);
+                merger.lock().unwrap().eof(Source::Bn);
                 Ok(())
             })
         };
@@ -1100,6 +1109,7 @@ mod tests {
                 vec![Source::Bn],
                 MERGE_WINDOW,
                 Instant::now(),
+                0,
             )));
             // No `eof` is ever recorded, standing in for a reader thread that
             // died before it could.

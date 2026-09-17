@@ -526,20 +526,40 @@ timestamp, so sorting lines would scatter a trace through the other source's
 output. This is a correctness requirement, not an optimisation: a line-level
 merge is wrong on any node that logs an exception.
 
-**A record is only closed by the next timestamped line, or by `finish()` at
-EOF - and under `tekops logs` there is no EOF.** Both producers follow
-forever, so anything held is held for the life of the session. That makes an
-unrecognised layout catastrophic rather than untidy: if no line parses, every
-line looks like a continuation, the whole source accumulates in `pending`, and
-the process shows nothing at all with no error anywhere. A stock bare-metal
+**Under `tekops logs` there is no EOF**, so anything a record holds is held
+until something other than the producer releases it. Both producers follow
+forever. Three things close a record, and the third exists because the first
+two are not enough:
+
+1. the next timestamped line from that source,
+2. `Merger::eof`, which `dump.rs` reaches for real and `logs.rs` only when a
+   producer dies,
+3. `Merger::flush_stale`, once the source has been silent for `MERGE_WINDOW`.
+
+Without (3) the newest line of every source was unreachable: a timestamped
+line opens a record that only the *next* one can close, so the operator saw
+everything except the thing they were watching for - a whole slot of lag on a
+quiet beacon node, and permanent on a source that stopped writing. A stack
+trace is unaffected because log4j writes its lines in one burst, which keeps
+refreshing the source's clock; only genuine silence flushes.
+
+The same hole, in its severe form, is why (1) alone is dangerous: if *no* line
+parses, every line looks like a continuation and the whole source accumulates
+in `pending`, showing nothing at all with no error anywhere. A stock bare-metal
 Teku did exactly that, because `leading_timestamp` looked for `@timestamp`
-while Teku writes `timestamp`. The parsing bug is fixed, but the shape of the
-failure is the lesson, so `push_line` now emits an untimestamped line
+while Teku writes `timestamp`. So `push_line` also emits an untimestamped line
 immediately **until its source has produced a first recognised timestamp** - a
 line that nothing precedes cannot be a continuation. An unparsed layout now
 degrades to out-of-order output rather than to silence. Anything added here
 that can hold a record back needs the same question asked of it: what releases
 this when the producer never ends?
+
+**The `RecordBuilder`s live in `Merger`, not in the reader threads.** A reader
+blocks on `read_line`, so it can only ever act when a line arrives - precisely
+the wrong property for a record that needs releasing *because* no line has
+arrived. The emitter already ticks every `EMIT_TICK`, so it calls
+`flush_stale(now)` before each `drain_ready(now)`. Readers now hand over raw
+lines (`merger.push_line(source, raw, at)`) and own no merge state at all.
 
 **The rule.** Each source's own records are non-decreasing in time, so only
 the head of each queue matters. Emit the earliest head when every *other*
@@ -547,6 +567,11 @@ source either has a head to compare against, or has been silent longer than
 `MERGE_WINDOW`, or is at EOF. A source with an empty queue that is neither
 idle nor finished may still deliver something older, and emitting past it is
 the exact inversion this exists to prevent.
+
+Silence is measured on **lines arriving** (`last_line`), not on records being
+completed. A source part-way through a long stack trace has an empty queue and
+nothing finished, but it is plainly not idle, and emitting past it would drop
+the other source's output into the middle of the trace.
 
 That one rule covers both the `-n` backlog and live follow with no mode
 switch. `tail -n 500` and `docker logs --tail 500` deliver their backlog as an
@@ -643,6 +668,13 @@ the same `docker ps` is what finds the validator container beside it.
 `run_logs` spawns one producer per resolved source, gives each a reader thread
 feeding a shared `Merger`, and runs a single emitter thread writing the merged
 result into the file `less` reads.
+
+A reader hands over **raw lines** (`push_line`) and holds no merge state of its
+own; the `RecordBuilder`s live in the `Merger`. That is deliberate and is
+explained under `merge.rs`: a reader blocks on `read_line`, so it cannot be
+what releases a record that is waiting on silence. **The emitter's tick has two
+jobs**, `flush_stale(now)` then `drain_ready(now)`, and dropping the first
+brings back the lag where the newest line of a quiet source is never shown.
 
 **The emitter is the sole writer**, which is what keeps `MAX_BUFFER_BYTES`
 bounding the session as a whole. Letting each producer write its own would
