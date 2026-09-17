@@ -357,15 +357,29 @@ pub fn run() -> ExitCode {
             // flag > env > config > detection ladder the rest of the command
             // uses.
             let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
-            let target = crate::logs::resolve_log_target(
+            // Interim: Task 5 rewires this arm through `resolve_log_sources`'s
+            // full two-slot ladder. Until then this takes only the `bn` slot,
+            // mirroring the same interim shape `logs::run_logs` uses.
+            let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
                 path,
-                container,
+                container_flag: container,
+                vc_container_flag: None,
+                vc_logs_file_flag: None,
                 container_env,
                 logs_file_env,
-                cfg.container.clone(),
-                cfg.logs_file.clone(),
-                detected.map(|(_, name)| name),
-            );
+                vc_container_env: None,
+                vc_logs_file_env: None,
+                container_cfg: cfg.container.clone(),
+                logs_file_cfg: cfg.logs_file.clone(),
+                vc_container_cfg: None,
+                vc_logs_file_cfg: None,
+                detected_bn: detected.map(|(_, name)| name),
+                detected_vc: None,
+                select: None,
+            });
+            let target = sources.bn.unwrap_or_else(|| {
+                crate::logs::LogTarget::File(PathBuf::from(crate::logs::DEFAULT_TEKU_LOG))
+            });
             // `--doctor` runs its own `docker ps` through `doctor_probe_config`
             // rather than reusing the detection above: doctor's ladder also
             // needs the container name and the two URLs, and duplicating that

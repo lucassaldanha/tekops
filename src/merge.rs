@@ -12,13 +12,14 @@ use crate::logfmt::{parse_timestamp, LogTime, Stamp};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-// Nothing in this module is reachable from main yet - a later task wires
-// `Merger` and `RecordBuilder` into `run_logs`. Until then this module's
-// public API is dead code to rustc, and so, transitively, is everything it
-// calls (parse_timestamp and its helpers in logfmt.rs, days_from_civil in
-// dump.rs). The #[allow(dead_code)] attributes below suppress warnings that
-// would otherwise fail the build under -D warnings. They will be removed
-// once that task wires merge.rs into run_logs.
+// `Source` is reachable from `main` now (`logs::SourceInputs`/`LogSources`
+// use it), but `Merger` and `RecordBuilder` are not - a later task wires them
+// into `run_logs`. Until then they, and everything they alone call
+// transitively (parse_timestamp and its helpers in logfmt.rs, days_from_civil
+// in dump.rs), are dead code to rustc. The remaining #[allow(dead_code)]
+// attributes below suppress warnings that would otherwise fail the build
+// under -D warnings. They will be removed once that task wires merge.rs into
+// run_logs.
 
 /// How long a record waits for the other source to speak before it is emitted.
 ///
@@ -33,7 +34,10 @@ use std::time::{Duration, Instant};
 pub const MERGE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Which process a record came from.
-#[allow(dead_code)]
+///
+/// No `#[allow(dead_code)]` here: `logs::LogSources::active` constructs both
+/// variants, and that is enough to keep them live even though `active` itself
+/// is not yet called from `main`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
     Bn,
@@ -506,6 +510,28 @@ mod tests {
         m.push(rec(Source::Bn, 200, "b"), t0);
 
         assert_eq!(texts(&m.drain_ready(t0)), vec!["a", "b"]);
+    }
+
+    /// The `-n` backlog case end to end: one source's burst is held until the
+    /// other speaks, then both interleave. The rule's clauses are tested
+    /// individually above; this pins them composing across drain calls.
+    #[test]
+    fn a_backlog_is_held_until_the_other_source_speaks_then_interleaves() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(vec![Source::Bn, Source::Vc], MERGE_WINDOW, t0);
+        m.push(rec(Source::Bn, 100, "bn-1"), t0);
+        m.push(rec(Source::Bn, 300, "bn-2"), t0);
+        assert!(
+            m.drain_ready(t0).is_empty(),
+            "Vc may still have something older"
+        );
+
+        let t1 = t0 + Duration::from_millis(10);
+        m.push(rec(Source::Vc, 50, "vc-1"), t1);
+        m.push(rec(Source::Vc, 200, "vc-2"), t1);
+
+        assert_eq!(texts(&m.drain_ready(t1)), vec!["vc-1", "bn-1", "vc-2"]);
+        // bn-2 is held: Vc is empty again and neither idle nor at EOF.
     }
 
     #[test]

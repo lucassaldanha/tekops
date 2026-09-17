@@ -1,4 +1,5 @@
 use crate::logfmt::format_log_line;
+use crate::merge::Source;
 use std::env;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
@@ -56,7 +57,7 @@ pub fn stream_logs_capped<R: BufRead, W: Write>(
 }
 
 /// The path the old bashrc function tailed.
-const DEFAULT_TEKU_LOG: &str = "/var/log/teku/teku.log";
+pub(crate) const DEFAULT_TEKU_LOG: &str = "/var/log/teku/teku.log";
 
 /// Where one `tekops logs` session reads from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,65 +66,167 @@ pub enum LogTarget {
     Container(String),
 }
 
-/// Resolves what `tekops logs` should read, given everything that can say so.
+/// What one `tekops logs` session reads, per process.
 ///
-/// Precedence, highest first: the `--container` flag or positional path (clap
-/// keeps those mutually exclusive, so there is no ordering question between
-/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then the config
-/// file's `container`, then its `logs_file`, then `docker ps` detection, then
-/// the hardcoded default.
+/// `None` in a slot means that process has no log source, which is the normal
+/// state of an all-in-one node's `vc` slot - not an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSources {
+    pub bn: Option<LogTarget>,
+    pub vc: Option<LogTarget>,
+}
+
+// `run_logs` only reads `.bn` until the task that wires `merge::Merger` into
+// it drives both slots through `active()`; until then `active` and
+// `is_empty` are unreached from `main` and `-D warnings` would fail the
+// build on them, same as the `#[allow(dead_code)]` block in merge.rs.
+#[allow(dead_code)]
+impl LogSources {
+    /// The sources that resolved, in a stable order. Feeds `Merger::new`, so
+    /// the order here is also the tie-break order for equal timestamps.
+    pub fn active(&self) -> Vec<Source> {
+        let mut out = Vec::new();
+        if self.bn.is_some() {
+            out.push(Source::Bn);
+        }
+        if self.vc.is_some() {
+            out.push(Source::Vc);
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bn.is_none() && self.vc.is_none()
+    }
+}
+
+/// Everything that can say where the logs are.
 ///
-/// The principle is: flags beat environment beats config beats detection beats
-/// hardcoded default. Config sits below the environment because a variable is
-/// the more specific act - it was typed for this session - and above detection
-/// because a value the operator wrote down beats one tekops guessed. Within
-/// each tier, naming a container beats naming a file, for the same reason in
-/// both: it is the more specific statement.
-///
-/// Detection sits below everything the operator stated and above the hardcoded
-/// path, which is the only placement that behaves. Above the positional path,
-/// `tekops logs /var/log/teku/teku.log` would tail a container on any host
-/// that also runs Docker; below the hardcoded default, a Docker host would
-/// always fail on a path that does not exist there.
-///
-/// Every input arrives as a parameter rather than being read here, so the whole
+/// A struct rather than fifteen positional parameters, and every field
+/// arrives as a value rather than being read here, so the whole precedence
 /// ladder is testable with no environment races and no Docker installed.
+pub struct SourceInputs {
+    pub path: Option<PathBuf>,
+    pub container_flag: Option<String>,
+    pub vc_container_flag: Option<String>,
+    pub vc_logs_file_flag: Option<PathBuf>,
+    pub container_env: Option<String>,
+    pub logs_file_env: Option<String>,
+    pub vc_container_env: Option<String>,
+    pub vc_logs_file_env: Option<String>,
+    pub container_cfg: Option<String>,
+    pub logs_file_cfg: Option<PathBuf>,
+    pub vc_container_cfg: Option<String>,
+    pub vc_logs_file_cfg: Option<PathBuf>,
+    pub detected_bn: Option<String>,
+    pub detected_vc: Option<String>,
+    /// `--bn` / `--vc`: filters what resolved, rather than naming anything.
+    pub select: Option<Source>,
+}
+
+/// Resolves both processes' log sources.
+///
+/// Each slot runs the same ladder the single source used to:
+/// flag > environment > config file > detection. Within a tier, naming a
+/// container beats naming a file, because it is the more specific statement.
+///
+/// Three rules sit on top, and each exists to stop a specific wrong answer:
+///
+/// 1. **Stating one side by flag or environment variable yields that side
+///    only.** The config file does not count, and neither does detection -
+///    only the flag and environment tiers gate this. A flag or a variable is
+///    typed for this invocation; config is ambient, describing the node
+///    rather than expressing an intent for this run, so it free-mixes with
+///    the other side exactly as detection does. This is what keeps `tekops
+///    logs --container rocketpool_validator` printing exactly the one stream
+///    it prints today, on a host where detection also finds a consensus
+///    container - an invocation that works today must keep working
+///    unchanged. It also means a *configured* `container` alongside a
+///    *detected* validator now yields both streams: that is the separated
+///    deployment this feature exists for, and the new behaviour is
+///    intentional, not a regression of rule 1.
+/// 2. **The hardcoded default is a whole-command last resort**, not a
+///    per-slot one, so a pure Rocket Pool node is not handed a "file not
+///    found" for `/var/log/teku/teku.log`, a path it never had.
+/// 3. **`select` filters afterwards.** It names nothing, so it cannot
+///    interact with rule 1.
 ///
 /// `cli.rs::needs_detection` is this function's precedence list negated by
-/// hand. Adding a rung above `detected` means adding a clause there, or a
-/// configured operator pays for a `docker ps` spawn whose answer cannot be
-/// used.
-pub fn resolve_log_target(
-    path: Option<PathBuf>,
-    container_flag: Option<String>,
-    container_env: Option<String>,
-    teku_logs_file_env: Option<String>,
-    container_cfg: Option<String>,
-    logs_file_cfg: Option<PathBuf>,
-    detected: Option<String>,
-) -> LogTarget {
-    if let Some(c) = container_flag {
-        return LogTarget::Container(c);
+/// hand. A rung added above `detected_bn`/`detected_vc` means a clause added
+/// there, or a configured operator pays for a `docker ps` spawn whose answer
+/// cannot be used.
+pub fn resolve_log_sources(inputs: SourceInputs) -> LogSources {
+    let bn_flags = [
+        inputs.container_flag.map(LogTarget::Container),
+        inputs.path.map(LogTarget::File),
+    ];
+    let bn_env = [
+        inputs.container_env.map(LogTarget::Container),
+        inputs
+            .logs_file_env
+            .map(|p| LogTarget::File(PathBuf::from(p))),
+    ];
+    let bn_cfg = [
+        inputs.container_cfg.map(LogTarget::Container),
+        inputs.logs_file_cfg.map(LogTarget::File),
+    ];
+    // Rule 1's gate: flag or environment variable only, never config.
+    let bn_explicit = first_target(bn_flags.clone(), bn_env.clone(), [None, None]);
+    let bn_stated = first_target(bn_flags, bn_env, bn_cfg);
+
+    let vc_flags = [
+        inputs.vc_container_flag.map(LogTarget::Container),
+        inputs.vc_logs_file_flag.map(LogTarget::File),
+    ];
+    let vc_env = [
+        inputs.vc_container_env.map(LogTarget::Container),
+        inputs
+            .vc_logs_file_env
+            .map(|p| LogTarget::File(PathBuf::from(p))),
+    ];
+    let vc_cfg = [
+        inputs.vc_container_cfg.map(LogTarget::Container),
+        inputs.vc_logs_file_cfg.map(LogTarget::File),
+    ];
+    let vc_explicit = first_target(vc_flags.clone(), vc_env.clone(), [None, None]);
+    let vc_stated = first_target(vc_flags, vc_env, vc_cfg);
+
+    // Rule 1: an unstated side stays silent when the other was stated by
+    // flag or environment variable. Config and detection free-mix on both
+    // sides otherwise, which is why the fallthrough arm below still resolves
+    // both independently through the full ladder.
+    let (mut bn, mut vc) = match (bn_explicit.is_some(), vc_explicit.is_some()) {
+        (true, false) => (bn_stated, None),
+        (false, true) => (None, vc_stated),
+        _ => (
+            bn_stated.or_else(|| inputs.detected_bn.map(LogTarget::Container)),
+            vc_stated.or_else(|| inputs.detected_vc.map(LogTarget::Container)),
+        ),
+    };
+
+    // Rule 2: the hardcoded path answers for the whole command or not at all.
+    if bn.is_none() && vc.is_none() {
+        bn = Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
     }
-    if let Some(p) = path {
-        return LogTarget::File(p);
+
+    // Rule 3.
+    match inputs.select {
+        Some(Source::Bn) => vc = None,
+        Some(Source::Vc) => bn = None,
+        None => {}
     }
-    if let Some(c) = container_env {
-        return LogTarget::Container(c);
-    }
-    if let Some(p) = teku_logs_file_env {
-        return LogTarget::File(PathBuf::from(p));
-    }
-    if let Some(c) = container_cfg {
-        return LogTarget::Container(c);
-    }
-    if let Some(p) = logs_file_cfg {
-        return LogTarget::File(p);
-    }
-    if let Some(c) = detected {
-        return LogTarget::Container(c);
-    }
-    LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
+
+    LogSources { bn, vc }
+}
+
+/// The first target present, tier by tier, container before file within a
+/// tier.
+fn first_target(
+    flags: [Option<LogTarget>; 2],
+    env: [Option<LogTarget>; 2],
+    cfg: [Option<LogTarget>; 2],
+) -> Option<LogTarget> {
+    flags.into_iter().chain(env).chain(cfg).flatten().next()
 }
 
 /// Whether a producer follows the log forever or stops at the end of it.
@@ -209,15 +312,32 @@ pub fn run_logs(
     logs_file_cfg: Option<PathBuf>,
     detected: Option<String>,
 ) -> ExitCode {
-    let target = resolve_log_target(
+    // Interim: Task 6 rewrites `run_logs` to drive both slots through
+    // `merge::Merger`. Until then this keeps the tree compiling and green by
+    // taking only the `bn` slot - the `unwrap_or_else` fallback exists because
+    // `resolve_log_sources` makes an empty `bn` unreachable in practice (with
+    // no vc inputs supplied, rule 2's default always fills it), so there is no
+    // panic path standing in for a case that cannot come up here.
+    let sources = resolve_log_sources(SourceInputs {
         path,
-        container,
-        env::var("TEKOPS_CONTAINER").ok(),
-        env::var("TEKOPS_LOGS_FILE").ok(),
+        container_flag: container,
+        vc_container_flag: None,
+        vc_logs_file_flag: None,
+        container_env: env::var("TEKOPS_CONTAINER").ok(),
+        logs_file_env: env::var("TEKOPS_LOGS_FILE").ok(),
+        vc_container_env: None,
+        vc_logs_file_env: None,
         container_cfg,
         logs_file_cfg,
-        detected,
-    );
+        vc_container_cfg: None,
+        vc_logs_file_cfg: None,
+        detected_bn: detected,
+        detected_vc: None,
+        select: None,
+    });
+    let target = sources
+        .bn
+        .unwrap_or_else(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
 
     // Only a file can be checked for existence up front. A container's absence
     // surfaces as `docker logs` exiting non-zero, which reaches the operator
@@ -580,147 +700,278 @@ mod tests {
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
-    fn target(
-        path: Option<&str>,
-        container_flag: Option<&str>,
-        container_env: Option<&str>,
-        logs_file_env: Option<&str>,
-        detected: Option<&str>,
-    ) -> LogTarget {
-        resolve_log_target(
-            path.map(PathBuf::from),
-            container_flag.map(String::from),
-            container_env.map(String::from),
-            logs_file_env.map(String::from),
-            None,
-            None,
-            detected.map(String::from),
-        )
+    fn inputs() -> SourceInputs {
+        SourceInputs {
+            path: None,
+            container_flag: None,
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: None,
+            select: None,
+        }
+    }
+
+    /// The reported deployment: a Rocket Pool validator container detected
+    /// alongside a beacon node that is not under Docker. Both sources, no flags.
+    #[test]
+    fn detection_alone_resolves_both_sources() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            logs_file_cfg: Some(PathBuf::from("/var/log/teku/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
+        );
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+    }
+
+    /// The back-compatibility rule, and the most important test in this task.
+    /// Naming one side and not the other means that one stream only - so every
+    /// invocation that works today prints exactly what it prints today, even on a
+    /// host where a validator container is sitting there detectable.
+    #[test]
+    fn naming_only_the_beacon_node_suppresses_a_detected_validator() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            detected_vc: Some("rocketpool_validator".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
+        assert_eq!(got.vc, None, "an unstated side stays silent");
+    }
+
+    #[test]
+    fn naming_only_the_validator_suppresses_a_detected_beacon_node() {
+        let got = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("rocketpool_validator".into()),
+            detected_bn: Some("eth-docker-consensus-1".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+    }
+
+    #[test]
+    fn naming_both_sides_gives_both() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("bn-c".into()),
+            vc_container_flag: Some("vc-c".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("bn-c".into())));
+        assert_eq!(got.vc, Some(LogTarget::Container("vc-c".into())));
+    }
+
+    /// The hardcoded default is a last resort for the whole command, not for the
+    /// beacon node's slot. A pure Rocket Pool node must not be handed a "file not
+    /// found" for a path it never had.
+    #[test]
+    fn the_default_path_applies_only_when_neither_slot_resolved() {
+        let nothing = resolve_log_sources(inputs());
+        assert_eq!(
+            nothing.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+        );
+        assert_eq!(nothing.vc, None);
+
+        let vc_only = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            vc_only.bn, None,
+            "no spurious default on a validator-only host"
+        );
+    }
+
+    /// The VC ladder has the same shape as the BN's: flag > env > config, and
+    /// naming a container beats naming a file within a tier.
+    #[test]
+    fn the_validator_ladder_matches_the_beacon_nodes_shape() {
+        let flag_wins = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("flag".into()),
+            vc_container_env: Some("env".into()),
+            vc_container_cfg: Some("cfg".into()),
+            ..inputs()
+        });
+        assert_eq!(flag_wins.vc, Some(LogTarget::Container("flag".into())));
+
+        let env_wins = resolve_log_sources(SourceInputs {
+            vc_container_env: Some("env".into()),
+            vc_container_cfg: Some("cfg".into()),
+            ..inputs()
+        });
+        assert_eq!(env_wins.vc, Some(LogTarget::Container("env".into())));
+
+        let container_beats_file = resolve_log_sources(SourceInputs {
+            vc_container_cfg: Some("cfg".into()),
+            vc_logs_file_cfg: Some(PathBuf::from("/cfg/validator.log")),
+            ..inputs()
+        });
+        assert_eq!(
+            container_beats_file.vc,
+            Some(LogTarget::Container("cfg".into()))
+        );
+    }
+
+    /// `--vc` filters what was resolved; it does not name anything.
+    #[test]
+    fn selecting_one_slot_drops_the_other() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("eth-docker-consensus-1".into()),
+            detected_vc: Some("eth-docker-validator-1".into()),
+            select: Some(Source::Vc),
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("eth-docker-validator-1".into()))
+        );
+    }
+
+    #[test]
+    fn active_lists_the_sources_that_resolved() {
+        let both = resolve_log_sources(SourceInputs {
+            detected_bn: Some("c".into()),
+            detected_vc: Some("v".into()),
+            ..inputs()
+        });
+        assert_eq!(both.active(), vec![Source::Bn, Source::Vc]);
+
+        let one = resolve_log_sources(SourceInputs {
+            container_flag: Some("c".into()),
+            ..inputs()
+        });
+        assert_eq!(one.active(), vec![Source::Bn]);
     }
 
     /// The two config rungs sit below both environment variables.
     #[test]
     fn the_logs_file_env_beats_the_config_container() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            Some("/var/log/teku/teku.log".into()),
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/var/log/teku/teku.log".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
         assert_eq!(
-            got,
-            LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
         );
     }
 
     #[test]
     fn the_container_env_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            None,
-            None,
-            Some("env-container".into()),
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("env-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_env: Some("env-container".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("env-container".into())));
     }
 
     /// Within the config tier, naming a container is the more specific statement,
     /// mirroring why $TEKOPS_CONTAINER beats $TEKOPS_LOGS_FILE.
     #[test]
     fn the_config_container_beats_the_config_logs_file() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("cfg-container".into())));
     }
 
     /// Config beats detection: a value the operator wrote down beats one tekops
     /// guessed.
     #[test]
     fn the_config_logs_file_beats_detection() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(PathBuf::from("/cfg/teku.log")),
-            Some("detected-container".into()),
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            detected_bn: Some("detected-container".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/cfg/teku.log")))
         );
-        assert_eq!(got, LogTarget::File(PathBuf::from("/cfg/teku.log")));
     }
 
     #[test]
     fn the_config_container_beats_detection() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            None,
-            Some("detected-container".into()),
-        );
-        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_cfg: Some("cfg-container".into()),
+            detected_bn: Some("detected-container".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("cfg-container".into())));
     }
 
     /// Detection still beats the hardcoded default when the config says nothing.
     #[test]
     fn detection_still_beats_the_default_with_an_empty_config() {
-        let got = resolve_log_target(None, None, None, None, None, None, Some("d".into()));
-        assert_eq!(got, LogTarget::Container("d".into()));
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("d".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("d".into())));
     }
 
     /// The positional path outranks everything in the config, so naming a file on
     /// a configured host still reads that file.
     #[test]
     fn the_positional_path_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            Some(PathBuf::from("/tmp/x.log")),
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::File(PathBuf::from("/tmp/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            path: Some(PathBuf::from("/tmp/x.log")),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/tmp/x.log"))));
     }
 
     #[test]
     fn container_flag_wins_over_everything_below_it() {
-        let t = target(None, Some("mine"), Some("env"), Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::Container("mine".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            container_env: Some("env".into()),
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
     }
 
-    /// The `target()` helper is frozen at `None, None` for the two config
-    /// rungs, so it cannot exercise flag-versus-config ordering. Called
-    /// directly here so a future edit that moved the config rungs above the
-    /// flag check would fail a test.
+    /// Called directly with the config rungs populated, so a future edit that
+    /// moved the config rungs above the flag check would fail this test.
     #[test]
     fn container_flag_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            None,
-            Some("mine".into()),
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("mine".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
     }
 
     /// The case that pins the ordering: naming a file on a host that also runs
@@ -728,26 +979,36 @@ mod tests {
     /// positional path and would have tailed a container instead.
     #[test]
     fn explicit_path_beats_a_successful_detection() {
-        let t = target(
-            Some("/var/log/teku/teku.log"),
-            None,
-            None,
-            None,
-            Some("det"),
+        let got = resolve_log_sources(SourceInputs {
+            path: Some(PathBuf::from("/var/log/teku/teku.log")),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
         );
-        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/teku/teku.log")));
     }
 
     #[test]
     fn container_env_beats_logs_file_env_and_detection() {
-        let t = target(None, None, Some("env"), Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::Container("env".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_env: Some("env".into()),
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("env".into())));
     }
 
     #[test]
     fn logs_file_env_beats_detection() {
-        let t = target(None, None, None, Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/x.log"))));
     }
 
     /// Detection sits above the hardcoded default because on a Docker host that
@@ -755,15 +1016,19 @@ mod tests {
     /// answer than a guaranteed "file not found".
     #[test]
     fn detection_beats_the_hardcoded_default_path() {
-        let t = target(None, None, None, None, Some("rocketpool_eth2"));
-        assert_eq!(t, LogTarget::Container("rocketpool_eth2".into()));
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("rocketpool_eth2".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("rocketpool_eth2".into())));
     }
 
     #[test]
     fn falls_back_to_the_default_path_when_nothing_is_known() {
+        let got = resolve_log_sources(inputs());
         assert_eq!(
-            target(None, None, None, None, None),
-            LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
+            got.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
         );
     }
 
@@ -771,16 +1036,22 @@ mod tests {
     /// gate it on any more.
     #[test]
     fn teku_logs_file_env_is_honoured() {
-        let t = target(None, None, None, Some("/x.log"), None);
-        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/x.log".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/x.log"))));
     }
 
     /// A custom stack tekops does not recognize is a supported deployment: the
     /// container override must work with detection having found nothing.
     #[test]
     fn custom_container_works_with_no_detection_at_all() {
-        let t = target(None, Some("mynode-teku"), None, None, None);
-        assert_eq!(t, LogTarget::Container("mynode-teku".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mynode-teku".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mynode-teku".into())));
     }
 
     #[test]
