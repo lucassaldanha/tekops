@@ -270,12 +270,37 @@ consensus container's own mounts, picking the most specific one; `--data-dir`
 a greyed-out "n/a" row, just absent, since a bare-metal node has no restart
 count to show.
 
-**`consensus container` and `container restarts` inspect only the consensus
-client's own container** - `eth-docker-consensus-1`, `rocketpool_eth2` - the
-same one `tekops logs` detects. A dead execution or validator-client
-container is not checked directly; it is usually caught indirectly instead
-(`execution layer` if Teku notices the execution client is offline,
-`validator metrics` if the validator client stops answering its scrape).
+**`doctor` detects the two processes separately.** It looks for a consensus
+container (`*-consensus-1`, `*_eth2`) and a validator container
+(`*-validator-1`, `*_validator`), and lets them answer independently. That
+matters on a separated deployment: Rocket Pool in External Consensus Client
+mode runs the validator under Docker against a beacon node it did not start,
+which used to be reported as plain `bare-metal` with the validator container
+unchecked and the validator metrics probed on the bare-metal port.
+
+The report header names both processes when they disagree, and collapses to
+one name when they don't:
+
+    bare-metal · teku/v25.1.0 · linux x86_64                  # all-in-one
+    bn bare-metal teku/v25.1.0 · vc rocketpool teku/v25.1.0   # separated
+    bn bare-metal teku/v25.9.0 · vc bare-metal teku/v25.7.1   # mid-upgrade
+
+The version half splits on the same rule, so a validator left behind on an
+older Teku than the beacon node is visible rather than hidden behind the
+beacon node's number. Neither process borrows the other's version: an
+unreachable endpoint reads `version unknown`.
+
+**`validator container` appears only on a deployment that has one.** A
+combined deployment runs Teku's validator inside the consensus container, so
+there is no second container to inspect and no row for it - absence is not a
+failure here, unlike a missing consensus container. `container restarts`
+stays a single row covering whichever container has restarted most, whether
+that is the consensus one, the validator one, or the only one on the host.
+
+A dead execution container is not checked directly; it is usually caught
+indirectly instead (`execution layer` if Teku notices the execution client is
+offline, `validator metrics` if the validator client stops answering its
+scrape).
 
 #### Exit code
 
@@ -304,6 +329,7 @@ starting point.
 | validator keys | any `active_ongoing` | 0 `active_ongoing` (none loaded, or only other statuses) | - |
 | duties published | any of blocks/attestations/sync messages/aggregates > 0 | all four are 0 | - |
 | consensus container (Docker stacks only) | the consensus container is up | - | the consensus container is not running, or none found |
+| validator container (when a separate one exists) | the validator container is up | - | the validator container is not running |
 | container restarts (Docker stacks only) | 0 restarts | 1-4 restarts | >= 5 restarts |
 | disk free | >= 50 GiB | < 50 GiB | < 20 GiB |
 | memory available | >= 1 GiB | < 1 GiB | - |
@@ -340,6 +366,7 @@ all-in-one deployment.
       ✔  validator keys       142 active_ongoing, 4544.00 ETH
       ⚠  duties published     none yet (normal if the validator client restarted recently)
       ✔  consensus container  eth-docker-consensus-1 up
+      ✔  validator container  eth-docker-validator-1 up
       ✔  container restarts   0
       ✔  disk free            412.0 GiB on /var/lib/docker/volumes/eth-docker_consensus-data/_data
       ⚠  memory available     0.8 GiB of 31.3 GiB
@@ -479,7 +506,16 @@ default path) rather than failing the session outright.
 On a host that runs both a bare-metal node and Docker, `--stack bare-metal`
 (or `TEKOPS_STACK=bare-metal`) turns container detection off entirely and
 restores the plain file-path behaviour, since narrowing to a stack with no
-container suffix can never match anything `docker ps` returns.
+container suffix can never match anything `docker ps` returns. That switch is
+total: it turns off `doctor`'s validator-container detection too, and `doctor`
+skips the `docker ps` spawn altogether.
+
+`doctor` looks for a validator container as well - `*-validator-1` on Eth
+Docker, `*_validator` on Rocket Pool - and resolves the two independently, so
+a validator running under Docker against a beacon node that isn't is reported
+as what it is. Naming a stack yourself still outranks both detections and
+applies to both processes. `tekops logs` asks only the consensus question,
+since a log target is one file or one container.
 
 ### Stack profiles
 

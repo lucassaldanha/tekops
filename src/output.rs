@@ -232,6 +232,62 @@ pub(crate) fn plural(n: usize, word: &str) -> String {
     }
 }
 
+/// What the two processes are and what they are running, in one line.
+///
+/// Collapsed to a single stack and a single version when the two agree, which
+/// is every all-in-one node and most separated ones. When they disagree the
+/// line names both, because that disagreement is the fact the operator most
+/// needs: a Rocket Pool validator against a bare-metal beacon node reads as
+/// plain "bare-metal" otherwise, and a half-finished upgrade reads as though
+/// both processes were on the new version.
+///
+/// `bn`/`vc` rather than "beacon node"/"validator client": the same
+/// vocabulary as `--bn-metric-url` and `--vc-metric-url`, and short enough
+/// that the split line still fits an 80-column terminal.
+fn doctor_header_summary(f: &Facts) -> String {
+    let bn_stack = stack_name(f.stack);
+    let vc_stack = stack_name(f.vc_stack);
+    let bn_version = crate::term::sanitize(&beacon_version(f));
+    let vc_version = crate::term::sanitize(&validator_version(f));
+
+    if bn_stack == vc_stack && bn_version == vc_version {
+        format!("{bn_stack} · {bn_version}")
+    } else {
+        format!("bn {bn_stack} {bn_version} · vc {vc_stack} {vc_version}")
+    }
+}
+
+fn stack_name(stack: Option<crate::stack::Stack>) -> String {
+    stack
+        .map(|st| st.to_string())
+        .unwrap_or_else(|| "unknown stack".to_string())
+}
+
+/// The beacon node's version, from the endpoint that speaks for it.
+///
+/// Read from `bn_families` alone, with no fallback to the validator's: on a
+/// separated node those are two different processes and borrowing one's
+/// version for the other would state a fact nothing measured. A combined
+/// deployment scrapes one endpoint into both slots, so it still agrees with
+/// itself and the header still collapses to one version.
+fn beacon_version(f: &Facts) -> String {
+    match &f.bn_families {
+        crate::doctor::Probe::Ok(bn) if !bn.beacon_versions.is_empty() => {
+            bn.beacon_versions.join(", ")
+        }
+        _ => "version unknown".to_string(),
+    }
+}
+
+fn validator_version(f: &Facts) -> String {
+    match &f.vc_families {
+        crate::doctor::Probe::Ok(vc) if !vc.validator_versions.is_empty() => {
+            vc.validator_versions.join(", ")
+        }
+        _ => "version unknown".to_string(),
+    }
+}
+
 /// The doctor report.
 ///
 /// Deliberately not a `comfy-table`: pasting this into a chat when asking for
@@ -240,26 +296,9 @@ pub(crate) fn plural(n: usize, word: &str) -> String {
 pub fn format_doctor_report(f: &Facts, findings: &[Finding]) -> String {
     let mut s = String::new();
 
-    let stack = f
-        .stack
-        .map(|st| st.to_string())
-        .unwrap_or_else(|| "unknown stack".to_string());
-    // Prefer the beacon node's version, falling back to the validator
-    // client's - an all-in-one deployment reports both, and a separated one
-    // still has a version to show even when only one process answered.
-    let version = match (&f.bn_families, &f.vc_families) {
-        (crate::doctor::Probe::Ok(bn), _) if !bn.beacon_versions.is_empty() => {
-            bn.beacon_versions.join(", ")
-        }
-        (_, crate::doctor::Probe::Ok(vc)) if !vc.validator_versions.is_empty() => {
-            vc.validator_versions.join(", ")
-        }
-        _ => "version unknown".to_string(),
-    };
     s.push_str(&format!(
-        "\n  {} · {} · {} {}\n\n",
-        stack,
-        crate::term::sanitize(&version),
+        "\n  {} · {} {}\n\n",
+        doctor_header_summary(f),
         f.os,
         f.arch
     ));
@@ -499,6 +538,7 @@ mod tests {
 
         crate::doctor::Facts {
             stack: Some(Stack::EthDocker),
+            vc_stack: Some(Stack::EthDocker),
             api_url: "http://localhost:5052".to_string(),
             bn_metric_url: "http://localhost:8008/metrics".to_string(),
             vc_metric_url: "http://localhost:8009/metrics".to_string(),
@@ -539,6 +579,7 @@ mod tests {
                 total_eth: Some(4544.0),
             }),
             containers: Probe::Skipped("no container for this stack"),
+            vc_containers: Probe::Skipped("no separate validator container"),
             disk: Some(Disk {
                 available_bytes: 400 * 1024 * 1024 * 1024,
                 mount_point: "/var/lib/teku".to_string(),
@@ -593,6 +634,96 @@ mod tests {
         let out = format_doctor_report(&facts_for_output(), &[]);
         assert!(out.contains("eth-docker"));
         assert!(out.contains("linux"));
+    }
+
+    /// Two processes that agree get one name and one version. Naming them
+    /// separately on every node would be noise on the ordinary one.
+    #[test]
+    fn doctor_report_header_collapses_when_both_processes_agree() {
+        let out = format_doctor_report(&facts_for_output(), &[]);
+        assert!(
+            out.contains("eth-docker · teku/v25.1.0 · linux x86_64"),
+            "{out}"
+        );
+        assert!(!out.contains(" bn "), "{out}");
+        assert!(!out.contains(" vc "), "{out}");
+    }
+
+    /// The reported bug, at the line it shows up on: a Rocket Pool validator
+    /// against a bare-metal beacon node. The header used to print a confident
+    /// "bare-metal" and say nothing about the Docker half of the deployment.
+    #[test]
+    fn doctor_report_header_names_both_stacks_when_they_differ() {
+        let mut f = facts_for_output();
+        f.stack = Some(crate::stack::Stack::BareMetal);
+        f.vc_stack = Some(crate::stack::Stack::RocketPool);
+
+        let out = format_doctor_report(&f, &[]);
+        assert!(out.contains("bn bare-metal"), "{out}");
+        assert!(out.contains("vc rocketpool"), "{out}");
+    }
+
+    /// A half-finished upgrade: the beacon node is on the new build and the
+    /// validator is not. Preferring the beacon node's version, as the header
+    /// used to, hides exactly the discrepancy worth seeing - and it hides it
+    /// on a node where both processes are bare-metal, so the stacks agreeing
+    /// cannot be what gates the split.
+    #[test]
+    fn doctor_report_header_names_both_versions_when_they_differ() {
+        use crate::doctor::Probe;
+        use crate::metrics::EndpointFamilies;
+
+        let mut f = facts_for_output();
+        f.stack = Some(crate::stack::Stack::BareMetal);
+        f.vc_stack = Some(crate::stack::Stack::BareMetal);
+        f.bn_families = Probe::Ok(EndpointFamilies {
+            beacon_versions: vec!["teku/v25.9.0".to_string()],
+            validator_versions: vec![],
+            has_validator_families: false,
+        });
+        f.vc_families = Probe::Ok(EndpointFamilies {
+            beacon_versions: vec![],
+            validator_versions: vec!["teku/v25.7.1".to_string()],
+            has_validator_families: true,
+        });
+
+        let out = format_doctor_report(&f, &[]);
+        assert!(out.contains("bn bare-metal teku/v25.9.0"), "{out}");
+        assert!(out.contains("vc bare-metal teku/v25.7.1"), "{out}");
+    }
+
+    /// No borrowing the validator's version for the beacon node. The two are
+    /// separate processes on a separated node, and an unreachable beacon-node
+    /// endpoint is a fact the header should state rather than paper over with
+    /// a number measured somewhere else.
+    #[test]
+    fn an_unreachable_beacon_endpoint_does_not_borrow_the_validators_version() {
+        use crate::doctor::Probe;
+
+        let mut f = facts_for_output();
+        f.bn_families = Probe::Failed("connection refused".to_string());
+
+        let out = format_doctor_report(&f, &[]);
+        assert!(out.contains("bn eth-docker version unknown"), "{out}");
+        assert!(out.contains("vc eth-docker teku/v25.1.0"), "{out}");
+    }
+
+    /// Versions come from a metrics label, which tekops did not author - see
+    /// term.rs's entry in CLAUDE.md.
+    #[test]
+    fn the_header_sanitizes_a_version_from_the_metrics_endpoint() {
+        use crate::doctor::Probe;
+        use crate::metrics::EndpointFamilies;
+
+        let mut f = facts_for_output();
+        f.bn_families = Probe::Ok(EndpointFamilies {
+            beacon_versions: vec!["teku/v25.1.0\u{1b}[31m".to_string()],
+            validator_versions: vec![],
+            has_validator_families: false,
+        });
+
+        let out = format_doctor_report(&f, &[]);
+        assert!(!out.contains('\u{1b}'), "{out:?}");
     }
 
     #[test]

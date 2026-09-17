@@ -203,7 +203,10 @@ rung added to the ladder but not to the predicate costs a `docker ps` spawn
 whose answer can never be used, which is not an error and not a wrong
 result - so the per-clause tests exist to catch the predicate *shrinking*
 even though nothing catches the ladder *growing*. `doctor` has its own
-equivalent, `doctor_needs_stack_detection`, extracted for the same reason.
+equivalent, `doctor_needs_docker_ps`, extracted for the same reason - but it
+asks a different question. `logs` skips the spawn once anything has answered;
+`doctor` skips it only for bare-metal stated outright, because it needs two
+container *names* and neither is knowable from a stack alone.
 
 ### Doctor's stack ladder, and why it prints no hint
 
@@ -216,6 +219,25 @@ already running `docker ps` for the container checks and detection costs
 nothing extra at that point. The `Stack` that lands in `Facts` is therefore
 already the detected one, so by the time an endpoint check could render
 `Fail` there is nothing left for a hint to suggest.
+
+It runs that ladder twice, once per process, from one `docker ps`:
+`resolve_doctor_stack` for the beacon node and `resolve_doctor_vc_stack` for
+the validator client. **The asymmetry between them is load-bearing, because
+the two absences mean opposite things.** A validator container with no
+consensus container beside it is a beacon node running somewhere else - Rocket
+Pool calls it External Consensus Client mode - so the beacon node's ladder is
+right to terminate in bare-metal, and dragging it onto the validator's stack
+would probe `:5052` and `:9100` on a node serving `:5051` and `:8008`. A
+consensus container with no validator beside it is the ordinary combined
+deployment, where Teku runs both processes in one container: that container's
+stack is the validator's stack too, which is why `resolve_doctor_vc_stack`
+takes the consensus detection as its last rung before bare-metal. Terminating
+in bare-metal there would hand an eth-docker node the bare-metal validator
+metrics port (8010) instead of its own (8009).
+
+Both are extracted and tested directly, because `doctor_probe_config` cannot
+be tested without Docker and the failure mode is a silently wrong port rather
+than an error.
 
 ### `command()`
 
@@ -441,6 +463,18 @@ prints a second, separate Field/Value table for the total ETH figure.
 `comfy-table`, since the Discord-paste case is a stated goal of that command
 and box-drawing characters are noise there. A test asserts the rendered
 report contains zero ESC bytes.
+
+Its header (`doctor_header_summary`) collapses to one stack and one version
+when the two processes agree, and names both when they don't. The split is
+what makes a separated deployment legible - a Rocket Pool validator against a
+bare-metal beacon node reads as plain `bare-metal` otherwise - and it is
+driven by disagreement rather than by the stacks differing, so a half-finished
+upgrade shows up on an all-bare-metal node too. **Neither process borrows the
+other's version**: an earlier version preferred the beacon node's and fell
+back to the validator's, which on a separated node states a fact nothing
+measured. An endpoint that didn't answer reads `version unknown`, and a
+combined deployment scrapes one endpoint into both slots, so it still agrees
+with itself and still collapses.
 
 ### `--json` output
 
@@ -890,17 +924,36 @@ was silently reinterpreted for them does not.
 
 ### Container checks are omitted on bare-metal, never rendered as "n/a"
 
-`check_containers` returns immediately, pushing nothing, when `f.stack` is
-`Some(Stack::BareMetal)` or `None` - a bare-metal node has no container to
-have a restart count, so the question does not apply and a placeholder row
-would be actively misleading. This has to stay distinct from two other
-states that *do* produce a finding: `Probe::Ok(vec![])` on a Docker stack
-(Docker answered and named zero containers - the failure this command exists
-to catch) and `Probe::Failed` (Docker was asked and didn't answer). `probe`
-maps a bare-metal or unnamed-container config directly to
+`check_consensus_container` returns immediately, pushing nothing, when
+`f.stack` is `Some(Stack::BareMetal)` or `None` - a bare-metal node has no
+container to have a restart count, so the question does not apply and a
+placeholder row would be actively misleading. This has to stay distinct from
+two other states that *do* produce a finding: `Probe::Ok(vec![])` on a Docker
+stack (Docker answered and named zero containers - the failure this command
+exists to catch) and `Probe::Failed` (Docker was asked and didn't answer).
+`probe` maps a bare-metal or unnamed-container config directly to
 `Probe::Skipped(NO_CONTAINER)`, so the omission decision is really made
-twice - once by what `probe` records, once by `check_containers`'s early
-return - and both have to agree, which is why both are tested per stack.
+twice - once by what `probe` records, once by the check's early return - and
+both have to agree, which is why both are tested per stack.
+
+`check_container_restarts` is gated on the same question, per process, and
+**on the stack rather than on the list being non-empty** - a bare-metal
+operator must never see a restart row however the list they arrive with got
+populated. It is one row for the whole deployment, not one per container: the
+detail names the container it is talking about, so a second row would repeat
+the label without adding a fact.
+
+### A missing validator container is silence, not a failure
+
+`check_validator_container` inverts the consensus check's reading of absent.
+Every Docker deployment has a consensus container, so none found is a
+reportable failure; but the commonest layout there is runs Teku's validator
+*inside* that container, so no second container is the normal case and a row
+saying otherwise would be a false alarm on a healthy node. `probe` therefore
+records `Probe::Skipped(NO_VALIDATOR_CONTAINER)` rather than `Ok(vec![])`
+when no validator container was detected, which is why it does not reuse
+`inspect_for_stack` - this is the absent-is-not-zero pattern applied to a
+container rather than a metric.
 
 ### An absent metric family is a wrong-port diagnosis, never a measured zero
 
@@ -1006,7 +1059,11 @@ picking 8010 costs it nothing and gives every stack a distinct VC port. And
 **`container_suffix` is a suffix, not a name**, because neither prefix is
 knowable from the stack alone - Eth Docker's is the Compose project (the
 directory it was cloned into) and Rocket Pool's is its configurable
-`ProjectName`.
+`ProjectName`. `validator_container_suffix` is its counterpart
+(`*-validator-1`, `*_validator`) and the reason a separated deployment can be
+named at all: Rocket Pool's External Consensus Client mode supervises the
+validator against a beacon node it did not start, so `_eth2` never exists and
+only the validator suffix can tell tekops that Docker is involved.
 
 `detect_stack` takes `docker ps` output as a parameter rather than running
 `docker` itself, so the matching rule is testable with no Docker installed -
@@ -1014,6 +1071,17 @@ the same shape as `logs::resolve_log_target`. It requires exactly one match:
 zero is an error rather than a fallback and two is an error rather than a
 guess, since tailing the wrong node's logs looks exactly like tailing the
 right one until it matters.
+
+`detect_validator_stack` applies that identical rule to the validator
+container; both delegate to one private `detect_role` so they cannot drift on
+whitespace, `only` narrowing, or the refusal to guess. They stay two public
+functions rather than one with a `Role` parameter because the two answers are
+independent facts about one host, and most callers want only the first:
+`logs` and `dump-logs` ask the consensus question alone, since a log target
+is one file or one container. `DetectError` carries the `Role` so a failure
+names the container the caller asked about and suggests an escape hatch that
+exists - `--container` points `logs` at a consensus container and has never
+meant the validator.
 
 `Stack`'s per-variant `#[serde(rename)]` matches its `#[value(name)]`
 exactly, which is what lets `config.rs` deserialize straight to `Stack` and

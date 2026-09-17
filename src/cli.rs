@@ -15,7 +15,7 @@ use crate::output::{
     format_validator_metrics_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
-use crate::stack::{detect_stack, DetectError, Stack};
+use crate::stack::{detect_stack, detect_validator_stack, DetectError, Stack};
 use crate::term::sanitize;
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -508,15 +508,38 @@ pub fn run() -> ExitCode {
 /// independently when handed `None`, so leaving this rung off let the report
 /// header say "unknown stack" directly above two confidently bare-metal URLs -
 /// two different facts that must not disagree.
-fn resolve_doctor_stack(
-    flag: Option<Stack>,
-    env: Option<String>,
-    detected: Option<Stack>,
-    cfg: Option<Stack>,
+///
+/// Called once per process, with that process's own detection. A stated stack
+/// applies to both: an operator who says `--stack rocketpool` has described
+/// their deployment, and detection is the rung below, not above.
+fn resolve_doctor_stack(stated: Option<Stack>, detected: Option<Stack>) -> Option<Stack> {
+    stated.or(detected).or(Some(Stack::BareMetal))
+}
+
+/// The validator client's stack ladder: the beacon node's, plus one rung.
+///
+/// The extra rung is a consensus container found under some stack, and the
+/// asymmetry with `resolve_doctor_stack` is the point, because the two
+/// absences mean opposite things.
+///
+/// A validator container with no consensus container beside it is a beacon
+/// node running somewhere else - Rocket Pool's External Consensus Client mode,
+/// and Eth Docker's equivalent - so the beacon node's own ladder is right to
+/// terminate in bare-metal. A consensus container with no validator beside it
+/// is the ordinary combined deployment, where Teku runs both processes in the
+/// one container: that container's stack is the validator's stack too, and
+/// terminating in bare-metal here would hand an eth-docker node the bare-metal
+/// validator metrics port instead of its own.
+///
+/// Extracted rather than inlined at the one call site for the same reason as
+/// `doctor_needs_docker_ps`: it is a precedence rule guarding a silent wrong
+/// answer, and `doctor_probe_config` cannot be tested without Docker.
+fn resolve_doctor_vc_stack(
+    stated: Option<Stack>,
+    detected_vc: Option<Stack>,
+    detected_bn: Option<Stack>,
 ) -> Option<Stack> {
-    resolve_stack(flag, env, cfg)
-        .or(detected)
-        .or(Some(Stack::BareMetal))
+    resolve_doctor_stack(stated, detected_vc.or(detected_bn))
 }
 
 /// Teku's conventional bare-metal data directory. `--data-dir` (or
@@ -555,21 +578,20 @@ fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
     }
 }
 
-/// Whether `doctor_probe_config` has to run `docker ps` to learn the stack.
+/// Whether `doctor_probe_config` has anything to gain from running `docker ps`.
 ///
-/// True exactly when no stack has been stated by flag, environment, or config
-/// file - the same `resolve_stack` ladder every other command reads. A
-/// configured stack makes the spawn pointless: its answer would only be
-/// overridden by `resolve_doctor_stack`, which already prefers a stated stack
-/// over a detected one. Extracted, the same shape `logs::needs_detection`
-/// uses for the identical failure mode, so a configured operator's spawn-skip
-/// is directly testable without mocking `docker ps`.
-fn doctor_needs_stack_detection(
-    flag: Option<Stack>,
-    env: Option<String>,
-    cfg: Option<Stack>,
-) -> bool {
-    resolve_stack(flag, env, cfg).is_none()
+/// False for exactly one answer: bare-metal, stated outright by flag,
+/// environment or config file. That operator has said there are no containers,
+/// so there is neither a stack left to detect nor a container left to name.
+///
+/// Every other case spawns, a stated Docker stack included - stating
+/// `--stack rocketpool` fixes the ports but not the container names, which are
+/// only knowable from `docker ps` because both stacks let the operator rename
+/// the project prefix. Extracted, the same shape `logs::needs_detection` uses
+/// for the identical failure mode, so the bare-metal spawn-skip is directly
+/// testable without mocking Docker.
+fn doctor_needs_docker_ps(stated: Option<Stack>) -> bool {
+    stated != Some(Stack::BareMetal)
 }
 
 /// The three spellings of the metrics endpoints, as given on the command line.
@@ -598,49 +620,53 @@ fn doctor_probe_config(
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
-    // Read once, used for both `doctor_needs_stack_detection` (below) and
-    // `resolve_doctor_stack`.
+    // Read once, used for both `doctor_needs_docker_ps` (below) and the two
+    // stack ladders.
     let stack_env = env::var("TEKOPS_STACK").ok();
+    let stated = resolve_stack(stack_flag, stack_env, cfg.stack);
 
-    // `docker ps` runs only when nothing else has answered - see
-    // `doctor_needs_stack_detection` - matching the `needs_detection` gate in
-    // `logs`, so a configured or bare-metal operator never pays for the spawn.
+    // One `docker ps`, read for both roles. Detection is the rung beneath a
+    // stated stack, so on the face of it a stated stack should skip the spawn
+    // entirely - but the container names are only knowable from `docker ps`,
+    // and doctor inspects both containers. The gate is therefore "is there
+    // anything left to find", not "is the stack still unknown": bare-metal,
+    // stated outright, is the one answer that makes the spawn pointless.
     //
-    // This rung is speculative by construction - it is reached only when no
-    // stack has been named - so a `docker ps` that cannot answer is reported
-    // by neither `false` here nor the lookup below, whose gate has since
-    // resolved to bare-metal. That is issue #16: the two together are what
-    // keep a node with no containers from hearing about Docker.
-    let detected: Option<(Stack, String)> =
-        if doctor_needs_stack_detection(stack_flag, stack_env.clone(), cfg.stack) {
-            docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
-        } else {
-            None
-        };
-    // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
-    // consuming it would leave nothing for the container lookup below.
-    let stack = resolve_doctor_stack(
-        stack_flag,
-        stack_env,
-        detected.as_ref().map(|(s, _)| *s),
-        cfg.stack,
-    );
-
-    // The container name: from detection when it ran, otherwise from a fresh
-    // `docker ps` narrowed to the named stack.
-    let container = match &detected {
-        Some((_, name)) => Some(name.clone()),
-        None => stack
-            .filter(|s| s.container_suffix().is_some())
-            .and_then(|s| {
-                docker_ps_names(should_report_unaskable_docker(Some(s)))
-                    .and_then(|ps| detect_or_note(&ps, Some(s)))
-            })
-            .map(|(_, name)| name),
+    // When nothing is stated this rung is speculative by construction, which
+    // is why `should_report_unaskable_docker(None)` is false: a `docker ps`
+    // that cannot answer is not news to a host whose ladder is about to
+    // terminate in bare-metal. That is issue #16.
+    let ps: Option<String> = if doctor_needs_docker_ps(stated) {
+        docker_ps_names(should_report_unaskable_docker(stated))
+    } else {
+        None
     };
+    let detected = ps.as_deref().and_then(|ps| detect_or_note(ps, stated));
+    let detected_vc = ps
+        .as_deref()
+        .and_then(|ps| detect_validator_or_note(ps, stated));
+
+    // Two ladders, not one. The beacon node's stack answers the Beacon API,
+    // its own metrics endpoint and the disk target; the validator client's
+    // answers its metrics endpoint. On an all-in-one node they resolve to the
+    // same value and nothing downstream can tell the difference.
+    //
+    // The validator's ladder has one rung the beacon node's does not - see
+    // `resolve_doctor_vc_stack` for why the asymmetry is the correct one.
+    //
+    // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
+    // consuming it would leave nothing for the container names below.
+    let detected_stack = detected.as_ref().map(|(s, _)| *s);
+    let stack = resolve_doctor_stack(stated, detected_stack);
+    let vc_stack = resolve_doctor_vc_stack(
+        stated,
+        detected_vc.as_ref().map(|(s, _)| *s),
+        detected_stack,
+    );
 
     crate::doctor::ProbeConfig {
         stack,
+        vc_stack,
         api_url: resolve_base_url(
             api_url,
             env::var("TEKOPS_API_URL").ok(),
@@ -660,9 +686,10 @@ fn doctor_probe_config(
             metrics.vc,
             env::var("TEKOPS_VC_METRIC_URL").ok(),
             cfg.vc_metric_url.clone(),
-            stack,
+            vc_stack,
         ),
-        container,
+        container: detected.map(|(_, name)| name),
+        vc_container: detected_vc.map(|(_, name)| name),
         data_dir: resolve_doctor_data_dir(
             data_dir,
             env::var("TEKOPS_DATA_DIR").ok(),
@@ -847,12 +874,27 @@ fn should_report_unaskable_docker(stack: Option<Stack>) -> bool {
 /// they're sanitized before they reach the terminal - see term.rs's entry in
 /// CLAUDE.md.
 fn detect_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
-    match detect_stack(ps, only) {
+    note_ambiguity(detect_stack(ps, only))
+}
+
+/// `detect_validator_stack`, with an ambiguous result reported rather than
+/// swallowed - the validator counterpart to `detect_or_note`, and the rung
+/// that lets doctor name a stack on a host whose only container is a
+/// validator.
+fn detect_validator_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
+    note_ambiguity(detect_validator_stack(ps, only))
+}
+
+/// Folds a detection down to an `Option`, reporting only the failure the
+/// operator can act on. `DetectError` already words itself for the role it was
+/// given, so one body serves both.
+fn note_ambiguity(found: Result<(Stack, String), DetectError>) -> Option<(Stack, String)> {
+    match found {
         Ok(found) => Some(found),
         // A bare-metal host that never wanted Docker must not be nagged
         // about detection finding nothing.
-        Err(DetectError::NotFound) => None,
-        Err(e @ DetectError::Ambiguous(_)) => {
+        Err(DetectError::NotFound(_)) => None,
+        Err(e @ DetectError::Ambiguous(..)) => {
             eprintln!("note: {}", sanitize(&e.to_string()));
             None
         }
@@ -2536,7 +2578,7 @@ mod tests {
     /// report that prints is one the note would have contradicted.
     #[test]
     fn failed_detection_leaves_doctor_on_a_stack_that_reports_no_docker() {
-        let stack = resolve_doctor_stack(None, None, None, None);
+        let stack = resolve_doctor_stack(None, None);
         assert_eq!(stack, Some(Stack::BareMetal));
         assert!(!should_report_unaskable_docker(stack));
     }
@@ -2637,29 +2679,75 @@ mod tests {
     /// Doctor is the one API command that applies detection to the URL, not
     /// just to a container name, because it runs `docker ps` anyway.
     #[test]
-    fn doctor_stack_ladder_prefers_flag_then_env_then_detection() {
+    fn doctor_stack_ladder_prefers_a_stated_stack_then_detection() {
+        // Flag, env and config are already folded into `stated` by
+        // `resolve_stack`, whose own precedence is tested above.
         assert_eq!(
-            resolve_doctor_stack(Some(Stack::BareMetal), None, Some(Stack::EthDocker), None),
+            resolve_doctor_stack(
+                resolve_stack(Some(Stack::BareMetal), None, None),
+                Some(Stack::EthDocker)
+            ),
             Some(Stack::BareMetal)
         );
         assert_eq!(
             resolve_doctor_stack(
-                None,
-                Some("rocketpool".to_string()),
-                Some(Stack::EthDocker),
-                None
+                resolve_stack(None, Some("rocketpool".to_string()), None),
+                Some(Stack::EthDocker)
             ),
             Some(Stack::RocketPool)
         );
         assert_eq!(
-            resolve_doctor_stack(None, None, Some(Stack::EthDocker), None),
+            resolve_doctor_stack(None, Some(Stack::EthDocker)),
             Some(Stack::EthDocker)
         );
         // The ladder terminates in bare-metal, not None: the report header
         // and the (bare-metal-defaulted) URLs it prints alongside it must
         // never disagree about what "nothing was given" means.
+        assert_eq!(resolve_doctor_stack(None, None), Some(Stack::BareMetal));
+    }
+
+    /// The combined deployment: a consensus container and no validator
+    /// container beside it means the validator is inside that container, so
+    /// its stack answers for both. Terminating in bare-metal instead would
+    /// hand an eth-docker node running Teku in combined mode the bare-metal
+    /// validator metrics port.
+    #[test]
+    fn an_undetected_validator_inherits_the_consensus_containers_stack() {
         assert_eq!(
-            resolve_doctor_stack(None, None, None, None),
+            resolve_doctor_vc_stack(None, None, Some(Stack::EthDocker)),
+            Some(Stack::EthDocker)
+        );
+    }
+
+    /// The reported bug, at the rung that decides it: Rocket Pool supervising
+    /// only a validator, against a beacon node it did not start. The validator
+    /// is on rocketpool and the beacon node is not - the whole report used to
+    /// say "bare-metal" and mean it about both.
+    #[test]
+    fn a_validator_only_stack_does_not_drag_the_beacon_node_with_it() {
+        let detected_bn = None;
+        let detected_vc = Some(Stack::RocketPool);
+
+        assert_eq!(
+            resolve_doctor_stack(None, detected_bn),
+            Some(Stack::BareMetal)
+        );
+        assert_eq!(
+            resolve_doctor_vc_stack(None, detected_vc, detected_bn),
+            Some(Stack::RocketPool)
+        );
+    }
+
+    /// A stated stack describes the whole deployment and outranks both
+    /// detections, the same way it does on every other command.
+    #[test]
+    fn a_stated_stack_beats_validator_detection_too() {
+        assert_eq!(
+            resolve_doctor_vc_stack(
+                Some(Stack::BareMetal),
+                Some(Stack::RocketPool),
+                Some(Stack::EthDocker)
+            ),
             Some(Stack::BareMetal)
         );
     }
@@ -2765,58 +2853,46 @@ mod tests {
 
     /// Carried over from Task 1's review: `resolve_doctor_stack` must prefer a
     /// configured stack over one `docker ps` detected, consistent with
-    /// `flag > env > config > detection`. `resolve_stack` (which this
-    /// delegates to) already folds the config rung in ahead of the `.or(detected)`
-    /// fallback, so a config value wins even when detection found something else.
+    /// `flag > env > config > detection`. `resolve_stack` folds the config
+    /// rung into `stated`, which this prefers over the detected value.
     #[test]
     fn resolve_doctor_stack_prefers_the_config_over_detection() {
+        let stated = resolve_stack(None, None, Some(Stack::RocketPool));
         assert_eq!(
-            resolve_doctor_stack(None, None, Some(Stack::EthDocker), Some(Stack::RocketPool)),
+            resolve_doctor_stack(stated, Some(Stack::EthDocker)),
             Some(Stack::RocketPool)
         );
     }
 
-    /// Carried over from Task 1's review: a configured stack must suppress the
-    /// `docker ps` detection spawn in `doctor_probe_config`, the same way a
-    /// flag or env var already does. The four tests below are pinned directly
-    /// on the extracted gate, `doctor_needs_stack_detection`, rather than on
-    /// `doctor_probe_config`'s output - asserting on the final `stack` would
-    /// still pass even if the `cfg` clause were dropped from the gate
-    /// entirely, since `resolve_doctor_stack` independently prefers a
-    /// configured stack over a detected one.
+    /// Bare-metal, stated by flag, environment or config file, is the one
+    /// answer that leaves `docker ps` nothing to contribute: no stack to
+    /// detect and no container to name. Pinned on the extracted gate rather
+    /// than on `doctor_probe_config`'s output, which cannot be tested without
+    /// Docker.
     #[test]
-    fn doctor_needs_stack_detection_when_nothing_is_stated() {
-        assert!(doctor_needs_stack_detection(None, None, None));
+    fn a_stated_bare_metal_stack_skips_the_docker_ps_spawn() {
+        for stated in [
+            resolve_stack(Some(Stack::BareMetal), None, None),
+            resolve_stack(None, Some("bare-metal".into()), None),
+            resolve_stack(None, None, Some(Stack::BareMetal)),
+        ] {
+            assert!(!doctor_needs_docker_ps(stated));
+        }
+    }
+
+    /// The regression this guards against: a stated Docker stack used to skip
+    /// the spawn, because the gate asked "is the stack still unknown". Doctor
+    /// now inspects two containers, and neither name is knowable without
+    /// asking Docker - both stacks let the operator rename the project prefix.
+    #[test]
+    fn a_stated_docker_stack_still_needs_docker_ps_for_the_container_names() {
+        assert!(doctor_needs_docker_ps(Some(Stack::EthDocker)));
+        assert!(doctor_needs_docker_ps(Some(Stack::RocketPool)));
     }
 
     #[test]
-    fn a_stack_flag_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            Some(Stack::BareMetal),
-            None,
-            None
-        ));
-    }
-
-    #[test]
-    fn a_stack_env_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            None,
-            Some("rocketpool".into()),
-            None
-        ));
-    }
-
-    /// The clause that matters here: with only `cfg` set, removing it from
-    /// `doctor_needs_stack_detection`'s body is exactly what would make this
-    /// test fail - confirmed by testing the change directly and reverting it.
-    #[test]
-    fn a_configured_stack_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            None,
-            None,
-            Some(Stack::RocketPool)
-        ));
+    fn doctor_needs_docker_ps_when_nothing_is_stated() {
+        assert!(doctor_needs_docker_ps(None));
     }
 
     /// Two different endpoints, both answering.
