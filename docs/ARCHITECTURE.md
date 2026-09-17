@@ -526,6 +526,21 @@ timestamp, so sorting lines would scatter a trace through the other source's
 output. This is a correctness requirement, not an optimisation: a line-level
 merge is wrong on any node that logs an exception.
 
+**A record is only closed by the next timestamped line, or by `finish()` at
+EOF - and under `tekops logs` there is no EOF.** Both producers follow
+forever, so anything held is held for the life of the session. That makes an
+unrecognised layout catastrophic rather than untidy: if no line parses, every
+line looks like a continuation, the whole source accumulates in `pending`, and
+the process shows nothing at all with no error anywhere. A stock bare-metal
+Teku did exactly that, because `leading_timestamp` looked for `@timestamp`
+while Teku writes `timestamp`. The parsing bug is fixed, but the shape of the
+failure is the lesson, so `push_line` now emits an untimestamped line
+immediately **until its source has produced a first recognised timestamp** - a
+line that nothing precedes cannot be a continuation. An unparsed layout now
+degrades to out-of-order output rather than to silence. Anything added here
+that can hold a record back needs the same question asked of it: what releases
+this when the producer never ends?
+
 **The rule.** Each source's own records are non-decreasing in time, so only
 the head of each queue matters. Emit the earliest head when every *other*
 source either has a head to compare against, or has been silent longer than

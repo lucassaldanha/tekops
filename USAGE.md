@@ -111,11 +111,14 @@ error naming that process rather than an empty session.
 
 #### Two limitations worth knowing
 
-**Timezone.** Teku's JSON layout stamps UTC; its console layout, which both
-Docker stacks use, states no zone at all and is taken at face value. If a
-bare-metal beacon node logging JSON sits beside a validator container running
-a non-UTC `TZ`, the merge is wrong by that offset. Containers default to UTC
-and servers usually run UTC, so this is documented rather than corrected.
+**Timezone.** Almost nothing Teku writes states a zone. A stock bare-metal
+node's JSON is `2026-09-17T19:17:51,172` and the console layout both Docker
+stacks use is `2026-09-14 01:16:54.217`; only log4j2's ECS template writes the
+`Z`-suffixed UTC form. Anything without a zone is taken at face value, so if a
+bare-metal beacon node logging local time sits beside a validator container
+running a non-UTC `TZ`, the merge is wrong by that offset. Containers default
+to UTC and servers usually run UTC, so this is documented rather than
+corrected.
 
 **Midnight in a backlog.** Teku's console layout has a time-only variant with
 no date. Those lines inherit the date of the last full timestamp from the same

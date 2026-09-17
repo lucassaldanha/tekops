@@ -84,16 +84,23 @@ fn date_days(s: &str) -> Option<i64> {
 ///
 /// | Layout | Shape | Zone |
 /// | --- | --- | --- |
-/// | JSON, bare-metal | `2026-09-01T10:00:00.000Z` | UTC |
+/// | JSON, bare-metal | `2026-09-17T19:17:51,172` | none stated |
+/// | JSON, ECS template | `2026-09-01T10:00:00.000Z` | UTC |
 /// | Console, both Docker stacks | `2026-09-14 01:16:54.217` | none stated |
 /// | Console, time-only | `01:16:54.217` | none stated, no date |
 ///
-/// **The console layouts state no timezone and are taken at face value.** If
-/// a beacon node logs JSON in UTC while a validator container runs a non-UTC
-/// `TZ`, a merge across the two is wrong by that offset. Containers default
-/// to UTC and servers usually run UTC, so this is a documented limitation
-/// rather than a correction; the fix, if a real node shows it, is to estimate
-/// a per-source offset from arrival times.
+/// The first row is what a stock bare-metal Teku writes, taken off a real
+/// node: a comma before the milliseconds and no zone at all. The `Z`-suffixed
+/// form belongs to log4j2's ECS template, which this table once claimed was
+/// the bare-metal shape - it is not, and assuming so cost `merge.rs` every
+/// line of a bare-metal beacon node.
+///
+/// **Only the ECS form states a timezone; everything else is taken at face
+/// value.** If a beacon node logs local time while a validator container runs
+/// a non-UTC `TZ`, a merge across the two is wrong by that offset. Containers
+/// default to UTC and servers usually run UTC, so this is a documented
+/// limitation rather than a correction; the fix, if a real node shows it, is
+/// to estimate a per-source offset from arrival times.
 ///
 /// Returning `None` is meaningful rather than a failure: a line with no
 /// timestamp is a stack trace's continuation, and `merge.rs` uses exactly
