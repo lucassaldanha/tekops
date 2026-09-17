@@ -310,17 +310,32 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
     }
 }
 
-/// Interim: Task 6 rewrites this to drive both slots through `merge::Merger`.
-/// Until then it keeps the tree compiling and green by taking only the `bn`
-/// slot from an already-resolved `LogSources` - the `unwrap_or_else` fallback
-/// exists because an empty `bn` cannot happen in practice for a caller going
-/// through `resolve_log_sources` (with no vc inputs supplied, rule 2's default
-/// always fills it), so there is no panic path standing in for a case that can
-/// come up here.
-pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
-    let target = sources
+/// The single stream this interim `run_logs` shows, from an already-resolved
+/// `LogSources`.
+///
+/// Task 5 widened `resolve_log_sources` to fill the `vc` slot on its own -
+/// `tekops logs --vc-container x` resolves to `{ bn: None, vc: Some(x) }` -
+/// so a target picker that only ever looked at `.bn` would tail the
+/// hardcoded default path (or report it missing) for an operator who never
+/// mentioned it and explicitly asked for the validator's log instead. Falling
+/// back to `.vc` when `.bn` is empty fixes that; preferring `.bn` when both
+/// are present keeps today's single-source behaviour unchanged on every
+/// combined deployment, where `.bn` is what used to print. The hardcoded
+/// default is the true last resort, reached only when neither slot resolved
+/// at all - `resolve_log_sources`'s rule 2 already makes that the "nothing
+/// stated, nothing detected" case exclusively.
+fn pick_target(sources: LogSources) -> LogTarget {
+    sources
         .bn
-        .unwrap_or_else(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
+        .or(sources.vc)
+        .unwrap_or_else(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+}
+
+/// Interim: Task 6 rewrites this to drive both slots through `merge::Merger`,
+/// showing both streams merged into one timeline. Until then it shows a
+/// single stream, picked by `pick_target`.
+pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
+    let target = pick_target(sources);
 
     // Only a file can be checked for existence up front. A container's absence
     // surfaces as `docker logs` exiting non-zero, which reaches the operator
@@ -685,6 +700,38 @@ mod tests {
         };
         let code = run_logs(sources, 500);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    #[test]
+    fn pick_target_prefers_bn_when_both_are_present() {
+        let sources = LogSources {
+            bn: Some(LogTarget::Container("bn".into())),
+            vc: Some(LogTarget::Container("vc".into())),
+        };
+        assert_eq!(pick_target(sources), LogTarget::Container("bn".into()));
+    }
+
+    /// The regression this pins: `tekops logs --vc-container x` resolves to
+    /// `{ bn: None, vc: Some(x) }`, and a picker that only read `.bn` would
+    /// silently fall through to the hardcoded default path instead - showing
+    /// the operator a stream they never asked for, or a "file not found" for
+    /// a path they never mentioned.
+    #[test]
+    fn pick_target_falls_back_to_vc_when_bn_is_absent() {
+        let sources = LogSources {
+            bn: None,
+            vc: Some(LogTarget::Container("vc".into())),
+        };
+        assert_eq!(pick_target(sources), LogTarget::Container("vc".into()));
+    }
+
+    #[test]
+    fn pick_target_falls_back_to_the_default_path_when_both_are_absent() {
+        let sources = LogSources { bn: None, vc: None };
+        assert_eq!(
+            pick_target(sources),
+            LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
+        );
     }
 
     fn inputs() -> SourceInputs {

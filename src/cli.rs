@@ -323,9 +323,12 @@ pub fn run() -> ExitCode {
             // `needs_detection`.
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
+            let vc_container_env = env::var("TEKOPS_VC_CONTAINER").ok();
+            let vc_logs_file_env = env::var("TEKOPS_VC_LOGS_FILE").ok();
             let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
             // One `docker ps`, read for both roles - the same shape
-            // `doctor_probe_config` uses.
+            // `doctor_probe_config` uses. `logs` reads both slots, so it
+            // passes `true` - see `needs_detection`'s `consumes_vc`.
             let ps = needs_detection(
                 path.as_ref(),
                 container.as_ref(),
@@ -333,6 +336,9 @@ pub fn run() -> ExitCode {
                 vc_logs_file.as_ref(),
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
+                vc_container_env.as_ref(),
+                vc_logs_file_env.as_ref(),
+                true,
                 &cfg,
             )
             .then(|| docker_ps_names(should_report_unaskable_docker(only)))
@@ -354,8 +360,8 @@ pub fn run() -> ExitCode {
                 vc_logs_file_flag: vc_logs_file,
                 container_env,
                 logs_file_env,
-                vc_container_env: env::var("TEKOPS_VC_CONTAINER").ok(),
-                vc_logs_file_env: env::var("TEKOPS_VC_LOGS_FILE").ok(),
+                vc_container_env,
+                vc_logs_file_env,
                 container_cfg: cfg.container.clone(),
                 logs_file_cfg: cfg.logs_file.clone(),
                 vc_container_cfg: cfg.vc_container.clone(),
@@ -385,10 +391,13 @@ pub fn run() -> ExitCode {
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            // No `--vc-container`/`--vc-logs-file` flags here yet (Task 7 adds
-            // them alongside `DumpConfig.sources`), so `None` for both - the
-            // vc slot can still be answered by its config/environment rungs,
-            // which `needs_detection` checks on its own.
+            // `dump-logs` has no `--vc-container`/`--vc-logs-file` flags yet
+            // and does not read `detected_vc` at all (Task 7 adds both,
+            // alongside `DumpConfig.sources`), so this passes `consumes_vc:
+            // false` - the pre-task, bn-only gate. Passing `true` here without
+            // a vc slot to answer would reintroduce a `docker ps` spawn for
+            // every operator who configured only their beacon node, which
+            // this command used to skip entirely.
             let detected: Option<(Stack, String)> = if needs_detection(
                 path.as_ref(),
                 container.as_ref(),
@@ -396,6 +405,9 @@ pub fn run() -> ExitCode {
                 None,
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
+                None,
+                None,
+                false,
                 &cfg,
             ) {
                 docker_ps_names(should_report_unaskable_docker(given_stack))
@@ -970,9 +982,22 @@ fn note_ambiguity(found: Result<(Stack, String), DetectError>) -> Option<(Stack,
 /// Whether `docker ps` has anything left to answer.
 ///
 /// The logical negation of every rung in `logs::resolve_log_sources`'s
-/// precedence ladder above `detected_bn`/`detected_vc`. Detection is worth
-/// its spawn while *either* slot is still unanswered, because one `docker ps`
-/// now feeds both.
+/// precedence ladder above `detected_bn`/`detected_vc`. Every environment
+/// variable and config rung arrives as a parameter, the same shape
+/// `resolve_stack`/`resolve_base_url` use, so the whole gate is testable
+/// without spawning Docker or racing the real environment.
+///
+/// `consumes_vc` is false for a caller with no vc slot to fill yet -
+/// `dump-logs`, until Task 7 gives it `--vc-container`/`--vc-logs-file` and
+/// wires `DumpConfig.sources` - and true for `tekops logs`, which already
+/// reads both `detected_bn` and `detected_vc`. A caller that does not consume
+/// the vc slot must not be told to keep spawning `docker ps` just because
+/// that slot looks unanswered: it was never going to read the answer, and
+/// doing so anyway reintroduces the wasted spawn for every operator who
+/// used to skip it by naming only their beacon node - exactly the regression
+/// this parameter exists to prevent. When `consumes_vc` is true, detection is
+/// worth its spawn while *either* slot is still unanswered, because one
+/// `docker ps` now feeds both.
 ///
 /// Note the interaction with `resolve_log_sources`'s rule 1: stating one side
 /// only means the other is suppressed, so detection's answer for it goes
@@ -988,6 +1013,9 @@ fn needs_detection(
     vc_logs_file_flag: Option<&PathBuf>,
     container_env: Option<&String>,
     logs_file_env: Option<&String>,
+    vc_container_env: Option<&String>,
+    vc_logs_file_env: Option<&String>,
+    consumes_vc: bool,
     cfg: &crate::config::Config,
 ) -> bool {
     let bn_answered = path.is_some()
@@ -996,10 +1024,13 @@ fn needs_detection(
         || logs_file_env.is_some()
         || cfg.container.is_some()
         || cfg.logs_file.is_some();
+    if !consumes_vc {
+        return !bn_answered;
+    }
     let vc_answered = vc_container_flag.is_some()
         || vc_logs_file_flag.is_some()
-        || env::var("TEKOPS_VC_CONTAINER").is_ok()
-        || env::var("TEKOPS_VC_LOGS_FILE").is_ok()
+        || vc_container_env.is_some()
+        || vc_logs_file_env.is_some()
         || cfg.vc_container.is_some()
         || cfg.vc_logs_file.is_some();
     !(bn_answered && vc_answered)
@@ -2560,32 +2591,40 @@ mod tests {
     #[test]
     fn nothing_stated_anywhere_still_needs_detection() {
         let cfg = crate::config::Config::default();
-        assert!(needs_detection(None, None, None, None, None, None, &cfg));
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
     }
 
-    /// The regression this guards: a fully configured operator paying for a
-    /// spawn whose answer cannot be used. It is silent when it breaks - the
-    /// symptom is a `docker ps`, not an error. Pairs the bn container rung
-    /// with the vc file rung (rather than repeating the same rung on both
-    /// sides) so this and the test below between them cover all four rungs.
+    /// A bn config rung alone is *not* enough since R12 - the vc slot must
+    /// also answer, because the same `docker ps` also answers `detected_vc`.
+    /// Renamed from `a_config_container_removes_the_need_to_detect`, whose
+    /// old name claimed exactly what `only_the_beacon_node_configured_...`
+    /// below disproves; pairing the bn container rung with the vc file rung
+    /// (rather than repeating the same rung on both sides) means this test
+    /// and the one after it between them cover all four rungs.
     #[test]
-    fn a_config_container_removes_the_need_to_detect() {
+    fn a_config_container_paired_with_a_vc_rung_removes_the_need_to_detect() {
         let cfg = crate::config::Config {
             container: Some("c".into()),
             vc_logs_file: Some(PathBuf::from("/vc.log")),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
     }
 
     #[test]
-    fn a_config_logs_file_removes_the_need_to_detect() {
+    fn a_config_logs_file_paired_with_a_vc_rung_removes_the_need_to_detect() {
         let cfg = crate::config::Config {
             logs_file: Some(PathBuf::from("/x.log")),
             vc_container: Some("vc-c".into()),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
     }
 
     /// Since R12, the bn rungs alone are no longer enough: the vc slot has to
@@ -2603,6 +2642,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            true,
             &cfg
         ));
         assert!(needs_detection(
@@ -2612,6 +2654,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            true,
             &cfg
         ));
         assert!(needs_detection(
@@ -2621,6 +2666,9 @@ mod tests {
             None,
             Some(&s),
             None,
+            None,
+            None,
+            true,
             &cfg
         ));
         assert!(needs_detection(
@@ -2630,19 +2678,21 @@ mod tests {
             None,
             None,
             Some(&s),
+            None,
+            None,
+            true,
             &cfg
         ));
     }
 
-    /// The other half of the same rule: any one of the bn rungs, paired with
-    /// any one of the vc rungs, is enough to skip the spawn.
+    /// The other half of the same rule: each of the four bn rungs, paired
+    /// with a stated vc rung, is enough to skip the spawn.
     #[test]
     fn any_stated_bn_source_paired_with_a_stated_vc_source_removes_the_need_to_detect() {
         let cfg = crate::config::Config::default();
         let p = PathBuf::from("/x.log");
         let s = "c".to_string();
         let vc = "vc-c".to_string();
-        let vc_file = PathBuf::from("/vc.log");
         assert!(!needs_detection(
             Some(&p),
             None,
@@ -2650,15 +2700,106 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            true,
             &cfg
         ));
         assert!(!needs_detection(
             None,
             Some(&s),
+            Some(&vc),
             None,
-            Some(&vc_file),
             None,
             None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            None,
+            Some(&vc),
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            None,
+            Some(&vc),
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            true,
+            &cfg
+        ));
+    }
+
+    /// The vc rungs, symmetric with `any_stated_bn_source_alone_still_needs_detection`
+    /// above: a vc-only answer is likewise not enough alone, and this is the
+    /// exact case the shared unit tests were missing before this fix - a bn
+    /// side answered only by its env vars, read the same way the vc side's
+    /// now are, rather than double-reading `env::var` behind the function's
+    /// back.
+    #[test]
+    fn any_stated_vc_source_alone_still_needs_detection() {
+        let cfg = crate::config::Config::default();
+        let s = "vc-c".to_string();
+        let f = PathBuf::from("/vc.log");
+        assert!(needs_detection(
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            Some(&f),
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            true,
             &cfg
         ));
     }
@@ -2673,7 +2814,9 @@ mod tests {
             vc_container: Some("vc-c".into()),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, None, None, &cfg));
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
     }
 
     /// Only one side configured still needs detection for the other.
@@ -2683,7 +2826,41 @@ mod tests {
             container: Some("bn-c".into()),
             ..Default::default()
         };
-        assert!(needs_detection(None, None, None, None, None, None, &cfg));
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
+    }
+
+    /// `dump-logs` has no vc slot to consume yet, so it must keep its
+    /// pre-task, bn-only gate: a bn config rung alone still skips the spawn,
+    /// unlike `tekops logs`'s `consumes_vc: true` case just above. This pins
+    /// the regression the review caught - `consumes_vc: true` here would
+    /// reintroduce a `docker ps` spawn for every `dump-logs` invocation on a
+    /// host with only `container` configured, which used to skip it entirely.
+    #[test]
+    fn a_caller_not_consuming_the_vc_slot_only_needs_the_bn_rungs_answered() {
+        let cfg = crate::config::Config {
+            container: Some("c".into()),
+            ..Default::default()
+        };
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, false, &cfg
+        ));
+    }
+
+    /// The other side of the same pin: with the vc slot unconsumed, a stated
+    /// vc rung must not be read as an answer at all - it should have no
+    /// effect either way, since a caller that never reads `detected_vc` gets
+    /// nothing from spawning `docker ps` to learn it.
+    #[test]
+    fn a_caller_not_consuming_the_vc_slot_ignores_vc_rungs_entirely() {
+        let cfg = crate::config::Config {
+            vc_container: Some("vc-c".into()),
+            ..Default::default()
+        };
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, false, &cfg
+        ));
     }
 
     #[test]

@@ -49,7 +49,9 @@ impl Source {
     /// The tag printed at the head of the line. Matches the `bn`/`vc`
     /// vocabulary of `--bn-metric-url` and `--vc-metric-url`, so the operator
     /// reads the same two words everywhere.
-    #[allow(dead_code)]
+    ///
+    /// No `#[allow(dead_code)]` here: `cli.rs::check_selection` calls this to
+    /// build its error message, and that path is reachable from `main`.
     pub fn tag(&self) -> &'static str {
         match self {
             Source::Bn => "bn",
