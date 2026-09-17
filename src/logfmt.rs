@@ -40,8 +40,12 @@ pub enum Stamp {
 }
 
 /// Milliseconds since midnight from `HH:MM:SS` or `HH:MM:SS.mmm`.
+///
+/// The separator before the milliseconds may be a comma: Teku's JSON layout
+/// writes `19:17:51,172`, which is what log4j2's `%d{DEFAULT}` produces, while
+/// its console layout writes a dot. Both are real and both arrive here.
 fn time_of_day_ms(s: &str) -> Option<i64> {
-    let (hms, millis) = match s.split_once('.') {
+    let (hms, millis) = match s.split_once(['.', ',']) {
         Some((hms, ms)) => {
             if ms.len() > 3 || ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
@@ -173,6 +177,26 @@ fn parse_console(raw: &str) -> Option<Fields> {
     })
 }
 
+/// The timestamp field of a JSON log line, under either of the two names it
+/// is written with.
+///
+/// Teku's own JSON layout calls it `timestamp`; `@timestamp` is what log4j2's
+/// ECS and Logstash templates emit, and what a node configured with one of
+/// those writes. This module looked only for `@timestamp`, so a stock
+/// bare-metal Teku - which writes `timestamp` - rendered every line with an
+/// empty timestamp column, and `merge::leading_timestamp`, which shares this
+/// lookup, read every line as having no timestamp at all. That second one was
+/// not cosmetic: see the note on `RecordBuilder::push_line`.
+///
+/// `timestamp` is checked first because it is Teku's own; a line carrying
+/// both is a template that added one, and the node's own field is the one to
+/// trust.
+pub fn json_timestamp(value: &Value) -> Option<&str> {
+    ["timestamp", "@timestamp"]
+        .into_iter()
+        .find_map(|k| value.get(k).and_then(Value::as_str))
+}
+
 /// Log fields carry data the node didn't author - peer identifiers, remote
 /// agent strings, exception text from malformed gossip. The colorized output is
 /// written to a temp file that `less -R` renders with escapes live, so an
@@ -189,7 +213,7 @@ fn parse_json(value: &Value) -> Fields {
     let thread = get("thread");
     let class = get("class");
     Fields {
-        timestamp: get("@timestamp"),
+        timestamp: json_timestamp(value).map(sanitize).unwrap_or_default(),
         level: get("level"),
         // Built unconditionally, brackets and all, even when thread/class are
         // empty - see the note on `Fields::middle` for why this can't move
@@ -239,6 +263,44 @@ pub fn format_log_line(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line copied verbatim off a bare-metal node. Teku's own JSON layout
+    /// names the field `timestamp` and separates the milliseconds with a
+    /// comma; this module knew only `@timestamp` and a dot, so it rendered
+    /// every one of these lines with an empty timestamp column.
+    #[test]
+    fn the_real_bare_metal_json_line_keeps_its_timestamp() {
+        let raw = r#"{"timestamp":"2026-09-17T19:17:51,172","host":"validator","level":"INFO","thread":"TimeTickTask","class":"teku-event-log","message":"Slot Event  *** Slot: 15233787","throwable":""}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("2026-09-17T19:17:51,172"), "{out}");
+        assert!(out.contains("Slot Event"), "{out}");
+        assert!(!out.contains("  INFO"), "no empty timestamp column: {out}");
+    }
+
+    /// The other spelling still works: `@timestamp` is what log4j2's ECS and
+    /// Logstash templates write, and a node configured with one emits it.
+    #[test]
+    fn the_ecs_timestamp_field_is_still_read() {
+        let value: Value =
+            serde_json::from_str(r#"{"@timestamp":"2026-09-01T10:00:00.000Z"}"#).expect("json");
+        assert_eq!(json_timestamp(&value), Some("2026-09-01T10:00:00.000Z"));
+    }
+
+    /// Teku's own field wins when a template has added the other.
+    #[test]
+    fn tekus_own_timestamp_field_wins_over_an_added_one() {
+        let value: Value =
+            serde_json::from_str(r#"{"timestamp":"a","@timestamp":"b"}"#).expect("json");
+        assert_eq!(json_timestamp(&value), Some("a"));
+    }
+
+    #[test]
+    fn milliseconds_parse_after_a_comma_as_well_as_a_dot() {
+        assert_eq!(
+            parse_timestamp("19:17:51,172"),
+            parse_timestamp("19:17:51.172")
+        );
+    }
 
     #[test]
     fn formats_info_line_green() {

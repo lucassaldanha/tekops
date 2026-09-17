@@ -8,7 +8,7 @@
 //!
 //! `logs.rs` owns the threads that feed this.
 
-use crate::logfmt::{parse_timestamp, LogTime, Stamp};
+use crate::logfmt::{json_timestamp, parse_timestamp, LogTime, Stamp};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -97,13 +97,34 @@ impl RecordBuilder {
     /// A line with a timestamp starts a new record and closes the previous
     /// one. A line without one is a continuation and joins the record in
     /// progress.
+    ///
+    /// **Until this source has produced its first recognised timestamp, an
+    /// untimestamped line is its own record and is returned at once**, because
+    /// it cannot be the continuation of a line that never arrived. That is not
+    /// a nicety. A held record is only released by the next timestamped line
+    /// or by `finish()` at EOF, and `tekops logs` runs its producers under
+    /// `tail -F` and `docker logs -f`, which never reach EOF - so a source
+    /// whose layout this module does not parse accumulates every line it ever
+    /// writes and emits none of them. A live beacon node then shows nothing at
+    /// all, with no error anywhere, which is exactly what a stock bare-metal
+    /// Teku did while `leading_timestamp` looked for the wrong JSON key. The
+    /// parsing bug is fixed, but any unparsed layout must degrade to
+    /// out-of-order output rather than to silence.
     pub fn push_line(&mut self, raw: &str) -> Option<Record> {
         let Some(stamp) = leading_timestamp(raw) else {
-            // A continuation. With no record in progress it is still output
-            // and must not be dropped, so it opens one of its own at whatever
-            // time this source last reached.
             match &mut self.pending {
                 Some(p) => p.lines.push(raw.to_string()),
+                // Nothing to continue, and nothing that ever will: emit.
+                None if self.last.is_none() => {
+                    return Some(Record {
+                        source: self.source,
+                        time: LogTime(self.session_start_ms),
+                        lines: vec![raw.to_string()],
+                    })
+                }
+                // This source does carry timestamps, so a later line will
+                // close this record. It opens at whatever time the source
+                // last reached.
                 None => {
                     self.pending = Some(Record {
                         source: self.source,
@@ -160,15 +181,12 @@ impl RecordBuilder {
 
 /// The timestamp at the head of a raw line, in either layout.
 ///
-/// JSON carries it in `@timestamp`; the console layout puts it first, before
-/// the level. Anything else has none, which is what marks a continuation
-/// line.
+/// JSON carries it in `timestamp` or `@timestamp` (see
+/// `logfmt::json_timestamp`); the console layout puts it first, before the
+/// level. Anything else has none, which is what marks a continuation line.
 fn leading_timestamp(raw: &str) -> Option<Stamp> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        return value
-            .get("@timestamp")
-            .and_then(|v| v.as_str())
-            .and_then(parse_timestamp);
+        return json_timestamp(&value).and_then(parse_timestamp);
     }
     // The console layout's head is `<timestamp> <LEVEL> - `, so the timestamp
     // is everything before the last space of the head. Splitting on " - "
@@ -307,6 +325,62 @@ mod tests {
         }
     }
 
+    /// One real line from a bare-metal Teku, copied verbatim off a node.
+    ///
+    /// Two things in it that the parser did not expect: the JSON key is
+    /// `timestamp`, not `@timestamp`, and the millisecond separator is a
+    /// comma. Teku's own JSON layout writes both that way.
+    const REAL_BARE_METAL_LINE: &str = r#"{"timestamp":"2026-09-17T19:17:51,172","host":"validator","level":"INFO","thread":"TimeTickTask","class":"teku-event-log","message":"Slot Event  *** Slot: 15233787, Peers: 95","throwable":""}"#;
+
+    #[test]
+    fn the_real_bare_metal_json_line_has_a_timestamp() {
+        let stamp = leading_timestamp(REAL_BARE_METAL_LINE)
+            .expect("a Teku JSON line must carry a timestamp");
+        let Stamp::Absolute(t) = stamp else {
+            panic!("a dated line is absolute, got {stamp:?}");
+        };
+        // 2026-09-17T19:17:51.172Z
+        assert_eq!(t, LogTime(1789672671172));
+    }
+
+    /// The failure this caused, which is worse than a misordered line. An
+    /// unrecognised timestamp makes every line look like a stack trace's
+    /// continuation, and a continuation is held until the *next* timestamped
+    /// line closes the record it belongs to. Under `tail -F` that line never
+    /// comes, so the whole source accumulates in `pending` and nothing is ever
+    /// pushed - a live beacon node that shows absolutely nothing, forever.
+    #[test]
+    fn a_source_whose_format_is_not_understood_still_emits() {
+        let mut b = RecordBuilder::new(Source::Bn, 1_000);
+        let got: Vec<Record> = ["not a log line at all", "nor this one", "nor this"]
+            .iter()
+            .filter_map(|l| b.push_line(l))
+            .collect();
+        assert_eq!(
+            got.len(),
+            3,
+            "every line must reach the merger without waiting for an EOF that never comes"
+        );
+        assert!(b.finish().is_none(), "nothing left held back");
+    }
+
+    /// The reason the rule above is "until the first timestamp" rather than
+    /// "always": a stack trace still has to stay attached to the line that
+    /// introduced it.
+    #[test]
+    fn a_continuation_after_a_timestamped_line_still_joins_it() {
+        let mut b = RecordBuilder::new(Source::Bn, 1_000);
+        assert!(b.push_line("01:00:00.000 INFO  - boom").is_none());
+        assert!(
+            b.push_line("\tat org.example.Thing").is_none(),
+            "a trace line joins the record above it"
+        );
+        let closed = b
+            .push_line("01:00:01.000 INFO  - next")
+            .expect("the next timestamped line closes the record");
+        assert_eq!(closed.lines.len(), 2);
+    }
+
     fn texts(records: &[Record]) -> Vec<&str> {
         records
             .iter()
@@ -423,13 +497,23 @@ mod tests {
 
     /// A line with no timestamp and nothing before it still has to go
     /// somewhere, and dropping it would lose output.
+    ///
+    /// It is now returned immediately rather than held for `finish()`, and
+    /// this line is the reason the distinction matters: `producer_argv` merges
+    /// `docker logs`'s stderr into the stream precisely so that a missing
+    /// container reports itself this way, and that is documented as the whole
+    /// error-reporting path for one. Held until EOF, it reached the operator
+    /// in `dump-logs` and never in `logs`, where `docker logs -f` has no EOF -
+    /// so `tekops logs --vc-container nope` sat there showing nothing.
     #[test]
-    fn a_leading_untimestamped_line_is_not_dropped() {
+    fn a_leading_untimestamped_line_is_emitted_at_once() {
         let mut b = RecordBuilder::new(Source::Vc, 7_000);
-        assert!(b.push_line("docker: no such container").is_none());
-        let done = b.finish().expect("a record is still owed");
+        let done = b
+            .push_line("docker: no such container")
+            .expect("nothing precedes it, so nothing can close it later");
         assert_eq!(done.lines, vec!["docker: no such container"]);
         assert_eq!(done.time, LogTime(7_000), "falls back to session start");
+        assert!(b.finish().is_none(), "and nothing is left owed");
     }
 
     /// The queues are only sorted if each source is monotonic, so a backwards
