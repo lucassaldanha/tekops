@@ -1,8 +1,9 @@
 use crate::logfmt::format_log_line;
 use crate::merge::{Merger, Record, RecordBuilder, Source, MERGE_WINDOW};
+use crate::term::sanitize;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -417,6 +418,27 @@ pub(crate) fn slot_target(sources: &LogSources, source: Source) -> Option<&LogTa
     }
 }
 
+/// Why a file target cannot be read, if it cannot be.
+///
+/// An `exists()` check is not enough, and the gap is not theoretical: a
+/// bare-metal Teku writes `/var/log/teku/teku.log` owned by its own service
+/// user, so the path is plainly there and unreadable to the operator running
+/// tekops. Existence alone let that slot spawn a `tail` that died instantly,
+/// and because a file producer's stderr is the terminal `less` is about to
+/// paint over, the session then showed the *other* process's lines under a
+/// `[vc]` tag and said nothing at all about the missing half. Opening the file
+/// is what distinguishes the two, so the reason can be named before the pager
+/// starts.
+fn file_failure(path: &Path) -> Option<String> {
+    match std::fs::File::open(path) {
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Some(format!("log file not found: {}", path.display()))
+        }
+        Err(e) => Some(format!("cannot read log file {}: {e}", path.display())),
+    }
+}
+
 /// Tails every resolved source at once, merged into one timeline.
 ///
 /// One producer per source, one reader thread each feeding a shared `Merger`,
@@ -473,12 +495,12 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
             continue;
         };
 
-        // Only a file can be checked for existence up front. A container's
-        // absence surfaces as `docker logs` exiting non-zero, which reaches the
-        // operator through the pager's own teardown.
+        // Only a file can be checked up front. A container's absence surfaces
+        // as `docker logs` exiting non-zero, which reaches the operator
+        // through the pager's own teardown.
         if let LogTarget::File(p) = target {
-            if !p.exists() {
-                failures.push(format!("log file not found: {}", p.display()));
+            if let Some(why) = file_failure(p) {
+                failures.push(why);
                 continue;
             }
         }
@@ -506,9 +528,11 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         }
         return ExitCode::FAILURE;
     }
-    for why in &failures {
-        eprintln!("note: {why}");
-    }
+    // The surviving sources' failures are NOT reported on stderr. `less` is
+    // about to take the alternate screen and paint over anything written here,
+    // so a note printed now is a note the operator never sees - which is how a
+    // beacon node that failed to start managed to look like a beacon node with
+    // nothing to say. They go into the buffer instead, below.
 
     // `less` is fed through a real temp file rather than piped directly into its
     // stdin. A pipe has no knowable end short of reading more of it, so a search
@@ -542,7 +566,7 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
     // This can fail for real (fd exhaustion, /tmp remounted read-only) and it
     // happens with the pager already on screen, so a panic here would dump a
     // Rust backtrace over a live `less` and skip the cleanup below.
-    let writer = match sink.reopen() {
+    let mut writer = match sink.reopen() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to open temp file for writing: {e}");
@@ -551,6 +575,16 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // A source that did not start is named at the head of the buffer, where
+    // the pager will show it. Failing to write the notes is not worth ending a
+    // session over - the logs themselves are what the operator came for.
+    for why in &failures {
+        let _ = writeln!(writer, "*** tekops: {}", sanitize(why));
+    }
+    if !failures.is_empty() {
+        let _ = writeln!(writer);
+    }
 
     // Only the sources that actually started get a slot in the merger, so a
     // source that was dropped above cannot block the merge waiting for lines
@@ -1135,6 +1169,49 @@ mod tests {
             default_log_present: false,
             select: None,
         }
+    }
+
+    /// The second half of the reported bug. A bare-metal Teku writes its log
+    /// as its own service user, so the path exists and the operator cannot
+    /// read it. An `exists()` check passed, the slot spawned a `tail` that
+    /// died at once, and the session showed the validator alone under a `[vc]`
+    /// tag with nothing said about the other half.
+    #[test]
+    fn an_unreadable_file_is_named_rather_than_silently_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::File::open(&p).is_ok() {
+            // Running as root, where the mode bits do not apply.
+            return;
+        }
+
+        let why = file_failure(&p).expect("an unreadable file must be reported");
+        assert!(why.starts_with("cannot read log file"), "{why}");
+        assert!(why.contains(&p.display().to_string()), "{why}");
+    }
+
+    /// The pre-existing case keeps its pre-existing wording.
+    #[test]
+    fn a_missing_file_is_still_reported_as_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("nope.log");
+        assert!(!p.exists(), "test precondition");
+        assert_eq!(
+            file_failure(&p),
+            Some(format!("log file not found: {}", p.display()))
+        );
+    }
+
+    #[test]
+    fn a_readable_file_is_no_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        assert_eq!(file_failure(&p), None);
     }
 
     /// The reported bug. A bare-metal beacon node writing the default path,
