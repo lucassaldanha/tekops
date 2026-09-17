@@ -12,15 +12,6 @@ use crate::logfmt::{parse_timestamp, LogTime, Stamp};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-// `Source` is reachable from `main` now (`logs::SourceInputs`/`LogSources`
-// use it), but `Merger` and `RecordBuilder` are not - a later task wires them
-// into `run_logs`. Until then they, and everything they alone call
-// transitively (parse_timestamp and its helpers in logfmt.rs, days_from_civil
-// in dump.rs), are dead code to rustc. The remaining #[allow(dead_code)]
-// attributes below suppress warnings that would otherwise fail the build
-// under -D warnings. They will be removed once that task wires merge.rs into
-// run_logs.
-
 /// How long a record waits for the other source to speak before it is emitted.
 ///
 /// Correct ordering needs a line held long enough to see whether the other
@@ -30,7 +21,6 @@ use std::time::{Duration, Instant};
 ///
 /// Deliberately not a flag. A knob here would be one more thing to get wrong
 /// in exchange for a number nobody can pick better than this one.
-#[allow(dead_code)]
 pub const MERGE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Which process a record came from.
@@ -92,7 +82,6 @@ pub struct RecordBuilder {
     pending: Option<Record>,
 }
 
-#[allow(dead_code)]
 impl RecordBuilder {
     pub fn new(source: Source, session_start_ms: i64) -> Self {
         RecordBuilder {
@@ -213,7 +202,6 @@ pub struct Merger {
     window: Duration,
 }
 
-#[allow(dead_code)]
 impl Merger {
     /// `started_at` seeds every source's idle clock.
     ///

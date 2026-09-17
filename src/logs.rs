@@ -1,10 +1,13 @@
 use crate::logfmt::format_log_line;
-use crate::merge::Source;
+use crate::merge::{Merger, Record, RecordBuilder, Source, MERGE_WINDOW};
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// How much colorized output one session may buffer before it stops following.
 ///
@@ -16,43 +19,109 @@ use std::thread;
 /// truncating a file `less` is holding offsets into corrupts what it displays.
 pub const MAX_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 
-pub fn stream_logs<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::Result<()> {
-    stream_logs_capped(reader, writer, MAX_BUFFER_BYTES)
+/// How often the emitter asks the merger what is ready.
+///
+/// Short enough that the merge window dominates the latency an operator can
+/// perceive, long enough that a quiet node is not a spin loop.
+const EMIT_TICK: Duration = Duration::from_millis(50);
+
+/// Writes merged records out, formatted and tagged.
+///
+/// **The tag appears only when there is more than one source**, so a
+/// single-source session's bytes are exactly what they were before this
+/// feature existed. Continuation lines are tagged too: a stack trace whose
+/// second line lost its tag would read as the other process's output.
+///
+/// `written` carries the running byte count across calls because the cap
+/// bounds the whole session rather than one batch, and `max_bytes` is a
+/// parameter so the cap's behaviour is testable without writing 256 MiB.
+/// Returns `true` when the cap was reached, which ends the session's writing.
+/// Hitting it is a normal end, not an error: the session keeps working as
+/// scrollback, so it says so in-band and returns `Ok`.
+fn emit_records<W: Write>(
+    writer: &mut W,
+    records: Vec<Record>,
+    sources: &[Source],
+    written: &mut u64,
+    max_bytes: u64,
+) -> io::Result<bool> {
+    let tagged = sources.len() > 1;
+    for record in records {
+        for line in &record.lines {
+            let formatted = format_log_line(line);
+            let text = if tagged {
+                format!("[{}] {formatted}", record.source.tag())
+            } else {
+                formatted
+            };
+            // +1 for the newline `writeln!` adds.
+            let next = written.saturating_add(text.len() as u64 + 1);
+            if next > max_bytes {
+                writeln!(writer)?;
+                writeln!(
+                    writer,
+                    "*** tekops: {} MiB buffer limit reached, stopped following.",
+                    max_bytes / (1024 * 1024)
+                )?;
+                writeln!(
+                    writer,
+                    "*** Scrollback and search still work. Quit and rerun to resume."
+                )?;
+                writer.flush()?;
+                return Ok(true);
+            }
+            writeln!(writer, "{text}")?;
+            *written = next;
+        }
+    }
+    Ok(false)
 }
 
-/// Formats each line into `writer` until the reader ends or `max_bytes` have
-/// been written, whichever comes first. Hitting the cap is a normal end to the
-/// stream, not an error: the session keeps working as scrollback, so it says so
-/// in-band and returns `Ok`.
-pub fn stream_logs_capped<R: BufRead, W: Write>(
-    reader: R,
-    writer: &mut W,
-    max_bytes: u64,
+/// Drains the merger into the pager's file until every source is finished or
+/// the session is torn down.
+///
+/// **The sole writer**, which is what keeps `MAX_BUFFER_BYTES` bounding the
+/// session as a whole. Letting each producer write its own would split the cap
+/// between them and quietly halve it - the failure `producer_argv`'s doc
+/// comment was already worried about when it chose to merge stderr in the
+/// shell rather than add a second writing thread.
+///
+/// `stop` exists because `is_done` is not reachable from every ending. A
+/// reader thread that dies on an IO error still marks its source EOF (see
+/// `run_logs`), but one that panics does not, and this loop polls rather than
+/// blocking on a pipe, so closing the producers' stdout says nothing to it.
+/// Without an external signal it would spin after the pager exited and
+/// `supervise_pager`'s join would hang on a thread that never returns.
+fn emit_loop(
+    merger: Arc<Mutex<Merger>>,
+    stop: Arc<AtomicBool>,
+    mut writer: impl Write,
+    sources: Vec<Source>,
 ) -> io::Result<()> {
     let mut written: u64 = 0;
-    for line in reader.lines() {
-        let line = line?;
-        let formatted = format_log_line(&line);
-        // +1 for the newline `writeln!` adds.
-        let next = written.saturating_add(formatted.len() as u64 + 1);
-        if next > max_bytes {
-            writeln!(writer)?;
-            writeln!(
-                writer,
-                "*** tekops: {} MiB buffer limit reached, stopped following.",
-                max_bytes / (1024 * 1024)
-            )?;
-            writeln!(
-                writer,
-                "*** Scrollback and search still work. Quit and rerun to resume."
-            )?;
-            writer.flush()?;
+
+    loop {
+        let stopping = stop.load(Ordering::Relaxed);
+        let (ready, done) = {
+            let mut m = merger.lock().expect("merger mutex poisoned");
+            // Once stopping, the window can produce nothing new: take
+            // everything rather than leaving the session's tail unwritten.
+            let ready = if stopping {
+                m.drain_all()
+            } else {
+                m.drain_ready(Instant::now())
+            };
+            (ready, m.is_done())
+        };
+
+        if emit_records(&mut writer, ready, &sources, &mut written, MAX_BUFFER_BYTES)? {
             return Ok(());
         }
-        writeln!(writer, "{formatted}")?;
-        written = next;
+        if done || stopping {
+            return Ok(());
+        }
+        thread::sleep(EMIT_TICK);
     }
-    Ok(())
 }
 
 /// The path the old bashrc function tailed.
@@ -75,11 +144,6 @@ pub struct LogSources {
     pub vc: Option<LogTarget>,
 }
 
-// `run_logs` only reads `.bn` until the task that wires `merge::Merger` into
-// it drives both slots through `active()`; until then `active` and
-// `is_empty` are unreached from `main` and `-D warnings` would fail the
-// build on them, same as the `#[allow(dead_code)]` block in merge.rs.
-#[allow(dead_code)]
 impl LogSources {
     /// The sources that resolved, in a stable order. Feeds `Merger::new`, so
     /// the order here is also the tie-break order for equal timestamps.
@@ -92,10 +156,6 @@ impl LogSources {
             out.push(Source::Vc);
         }
         out
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bn.is_none() && self.vc.is_none()
     }
 }
 
@@ -324,27 +384,25 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
 /// default is the true last resort, reached only when neither slot resolved
 /// at all - `resolve_log_sources`'s rule 2 already makes that the "nothing
 /// stated, nothing detected" case exclusively.
-fn pick_target(sources: LogSources) -> LogTarget {
-    sources
-        .bn
-        .or(sources.vc)
-        .unwrap_or_else(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+/// The target for one slot, if that slot resolved to anything.
+fn slot_target(sources: &LogSources, source: Source) -> Option<&LogTarget> {
+    match source {
+        Source::Bn => sources.bn.as_ref(),
+        Source::Vc => sources.vc.as_ref(),
+    }
 }
 
-/// Interim: Task 6 rewrites this to drive both slots through `merge::Merger`,
-/// showing both streams merged into one timeline. Until then it shows a
-/// single stream, picked by `pick_target`.
+/// Tails every resolved source at once, merged into one timeline.
+///
+/// One producer per source, one reader thread each feeding a shared `Merger`,
+/// and a single emitter thread writing the merged result into the file `less`
+/// reads. The merge rule itself lives in `merge.rs` and is pure; everything
+/// here is the IO around it.
 pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
-    let target = pick_target(sources);
-
-    // Only a file can be checked for existence up front. A container's absence
-    // surfaces as `docker logs` exiting non-zero, which reaches the operator
-    // through the pager's own teardown.
-    if let LogTarget::File(ref p) = target {
-        if !p.exists() {
-            eprintln!("error: log file not found: {}", p.display());
-            return ExitCode::FAILURE;
-        }
+    let active = sources.active();
+    if active.is_empty() {
+        eprintln!("error: no log source to read");
+        return ExitCode::FAILURE;
     }
 
     // The terminal delivers Ctrl+C to the whole foreground process group. `less`
@@ -377,22 +435,55 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (prog, args) = producer_argv(&target, lines, Mode::Follow);
-    let mut producer = match Command::new(&prog)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("error: failed to spawn {prog}: {e}");
-            if let LogTarget::Container(_) = target {
-                eprintln!("reading container logs needs the docker CLI on $PATH");
+    // One producer per resolved source. A source that cannot start is recorded
+    // rather than fatal: on a separated node the commonest failure is a beacon
+    // node whose default log path does not exist, and killing the session over
+    // it would take the working half down too. The reasons are only promoted to
+    // `error:` if NO source starts, which keeps a single-source session's
+    // output byte-identical to what it was before this feature existed.
+    let mut producers: Vec<(Source, Child)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for source in &active {
+        let Some(target) = slot_target(&sources, *source) else {
+            continue;
+        };
+
+        // Only a file can be checked for existence up front. A container's
+        // absence surfaces as `docker logs` exiting non-zero, which reaches the
+        // operator through the pager's own teardown.
+        if let LogTarget::File(p) = target {
+            if !p.exists() {
+                failures.push(format!("log file not found: {}", p.display()));
+                continue;
             }
-            return ExitCode::FAILURE;
         }
-    };
+
+        let (prog, args) = producer_argv(target, lines, Mode::Follow);
+        match Command::new(&prog)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+        {
+            Ok(child) => producers.push((*source, child)),
+            Err(e) => {
+                let mut why = format!("failed to spawn {prog}: {e}");
+                if let LogTarget::Container(_) = target {
+                    why.push_str("\nreading container logs needs the docker CLI on $PATH");
+                }
+                failures.push(why);
+            }
+        }
+    }
+    if producers.is_empty() {
+        for why in &failures {
+            eprintln!("error: {why}");
+        }
+        return ExitCode::FAILURE;
+    }
+    for why in &failures {
+        eprintln!("note: {why}");
+    }
 
     // `less` is fed through a real temp file rather than piped directly into its
     // stdin. A pipe has no knowable end short of reading more of it, so a search
@@ -405,12 +496,12 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to create temp file for log output: {e}");
-            let _ = producer.kill();
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
 
-    let mut pager = match Command::new("less")
+    let pager = match Command::new("less")
         .args(["-R", "+F"])
         .arg(sink.path())
         .spawn()
@@ -418,49 +509,114 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         Ok(child) => child,
         Err(e) => {
             eprintln!("error: failed to spawn less: {e}");
-            let _ = producer.kill();
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
 
-    // Both of these can fail for real (fd exhaustion, /tmp remounted read-only)
-    // and both happen with the pager already on screen, so a panic here would
-    // dump a Rust backtrace over a live `less` and skip the cleanup below.
-    //
-    // On the container path, a container that isn't running makes `docker logs`
-    // write an error to stderr and exit non-zero. Because `producer_argv` merged
-    // that stderr into this same stdout stream with `2>&1`, it arrives here as
-    // just another line, flows through `stream_logs` and `format_log_line` like
-    // any other, and is sanitized by the passthrough branch rather than reaching
-    // the terminal raw. That is the whole error-reporting path for a missing
-    // container - there is no separate one, and there should not be one added.
-    let Some(stdout) = producer.stdout.take() else {
-        eprintln!("error: log producer stdout was not piped");
-        let _ = pager.kill();
-        let _ = producer.kill();
-        return ExitCode::FAILURE;
-    };
+    // This can fail for real (fd exhaustion, /tmp remounted read-only) and it
+    // happens with the pager already on screen, so a panic here would dump a
+    // Rust backtrace over a live `less` and skip the cleanup below.
     let writer = match sink.reopen() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to open temp file for writing: {e}");
-            let _ = pager.kill();
-            let _ = producer.kill();
+            kill_pager(pager);
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
-    match supervise_pager(
-        pager,
-        producer,
-        BufReader::new(stdout),
-        LineWriter::new(writer),
-    ) {
+
+    // Only the sources that actually started get a slot in the merger, so a
+    // source that was dropped above cannot block the merge waiting for lines
+    // that will never come.
+    let started: Vec<Source> = producers.iter().map(|(s, _)| *s).collect();
+    let session_start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let merger = Arc::new(Mutex::new(Merger::new(
+        started.clone(),
+        MERGE_WINDOW,
+        Instant::now(),
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut children: Vec<Child> = Vec::new();
+    let mut workers: Vec<thread::JoinHandle<io::Result<()>>> = Vec::new();
+    for (source, mut child) in producers {
+        // On the container path, a container that isn't running makes `docker
+        // logs` write an error to stderr and exit non-zero. Because
+        // `producer_argv` merged that stderr into this same stdout stream with
+        // `2>&1`, it arrives here as just another line, flows through
+        // `format_log_line` like any other, and is sanitized by the passthrough
+        // branch rather than reaching the terminal raw. That is the whole
+        // error-reporting path for a missing container - there is no separate
+        // one, and there should not be one added.
+        let Some(stdout) = child.stdout.take() else {
+            eprintln!("error: log producer stdout was not piped");
+            let _ = child.kill();
+            for c in children.iter_mut() {
+                let _ = c.kill();
+            }
+            kill_pager(pager);
+            return ExitCode::FAILURE;
+        };
+        children.push(child);
+
+        let merger = Arc::clone(&merger);
+        workers.push(thread::spawn(move || -> io::Result<()> {
+            let mut builder = RecordBuilder::new(source, session_start_ms);
+            // The read loop is wrapped so that EOF is recorded even when a line
+            // read fails. A source that never reaches EOF is never idle either,
+            // so the merger would hold the other source's records forever
+            // waiting on one that has already given up.
+            let result = (|| -> io::Result<()> {
+                for line in BufReader::new(stdout).lines() {
+                    let line = line?;
+                    if let Some(record) = builder.push_line(&line) {
+                        merger
+                            .lock()
+                            .expect("merger mutex poisoned")
+                            .push(record, Instant::now());
+                    }
+                }
+                Ok(())
+            })();
+
+            let mut m = merger.lock().expect("merger mutex poisoned");
+            if let Some(record) = builder.finish() {
+                m.push(record, Instant::now());
+            }
+            m.eof(source);
+            result
+        }));
+    }
+
+    workers.push({
+        let merger = Arc::clone(&merger);
+        let stop = Arc::clone(&stop);
+        let sources = started.clone();
+        thread::spawn(move || emit_loop(merger, stop, LineWriter::new(writer), sources))
+    });
+
+    match supervise_pager(pager, children, workers, stop) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error while streaming logs: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn kill_all(producers: &mut [(Source, Child)]) {
+    for (_, child) in producers.iter_mut() {
+        let _ = child.kill();
+    }
+}
+
+fn kill_pager(mut pager: Child) {
+    let _ = pager.kill();
 }
 
 /// Runs the streaming loop against `reader` while the pager owns process
@@ -474,123 +630,220 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
 /// and only once the pager has exited kill the producer. Killing it is what
 /// closes the pipe and gives the worker its EOF; joining before the kill
 /// deadlocks instead.
+/// Two producers rather than one changes none of that, but every one of them
+/// must be killed before any join, or a still-running producer holds its reader
+/// thread open and the join hangs exactly as it would have with one.
+///
+/// `stop` is set after the kills and before the joins, for the emitter: it
+/// polls the merger rather than blocking on a pipe, so nothing about closing
+/// the producers' stdout reaches it.
 fn supervise_pager(
     mut pager: Child,
-    mut tail: Child,
-    reader: impl BufRead + Send + 'static,
-    mut writer: impl Write + Send + 'static,
+    mut producers: Vec<Child>,
+    workers: Vec<thread::JoinHandle<io::Result<()>>>,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let streaming = thread::spawn(move || stream_logs(reader, &mut writer));
-
     let _ = pager.wait();
-    let _ = tail.kill();
-    let _ = tail.wait();
-
-    match streaming.join() {
-        Ok(result) => result,
-        // The pager has already exited by this point, so the terminal is the
-        // user's again and a plain error beats a propagated panic.
-        Err(_) => Err(io::Error::other("log streaming thread panicked")),
+    for p in producers.iter_mut() {
+        let _ = p.kill();
     }
+    for p in producers.iter_mut() {
+        let _ = p.wait();
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    // The first failure wins, but every worker is still joined: returning early
+    // would leave the rest detached, and their producers are already dead.
+    let mut result = Ok(());
+    for w in workers {
+        match w.join() {
+            Ok(Err(e)) if result.is_ok() => result = Err(e),
+            // The pager has already exited by this point, so the terminal is
+            // the user's again and a plain error beats a propagated panic.
+            Err(_) if result.is_ok() => {
+                result = Err(io::Error::other("log streaming thread panicked"))
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+
+    fn record(source: Source, ms: i64, lines: Vec<String>) -> Record {
+        Record {
+            source,
+            time: crate::logfmt::LogTime(ms),
+            lines,
+        }
+    }
+
+    fn json_line(level: &str, message: &str) -> String {
+        format!(
+            "{{\"@timestamp\":\"t\",\"level\":\"{level}\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"{message}\"}}"
+        )
+    }
+
+    /// Emits with the cap out of reach, for the tests that are about
+    /// formatting rather than the bound.
+    fn emit(records: Vec<Record>, sources: &[Source]) -> String {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        emit_records(&mut out, records, sources, &mut written, MAX_BUFFER_BYTES).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn bn_lines(count: i64) -> Vec<Record> {
+        (0..count)
+            .map(|i| record(Source::Bn, i, vec![json_line("INFO", &format!("line{i}"))]))
+            .collect()
+    }
 
     #[test]
-    fn streams_and_formats_each_line() {
-        let input = "{\"@timestamp\":\"t\",\"level\":\"INFO\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"one\"}\n\
-                      {\"@timestamp\":\"t\",\"level\":\"ERROR\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"two\"}\n";
-        let reader = Cursor::new(input);
-        let mut output = Vec::new();
-
-        stream_logs(reader, &mut output).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("INFO [t1] C - one"));
-        assert!(output.contains("ERROR [t1] C - two"));
-        assert_eq!(output.lines().count(), 2);
+    fn emits_and_formats_each_line() {
+        let out = emit(
+            vec![
+                record(Source::Bn, 0, vec![json_line("INFO", "one")]),
+                record(Source::Bn, 1, vec![json_line("ERROR", "two")]),
+            ],
+            &[Source::Bn],
+        );
+        assert!(out.contains("INFO [t1] C - one"));
+        assert!(out.contains("ERROR [t1] C - two"));
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]
     fn passes_through_malformed_lines() {
-        let reader = Cursor::new("garbage\n");
-        let mut output = Vec::new();
-
-        stream_logs(reader, &mut output).unwrap();
-
-        assert_eq!(String::from_utf8(output).unwrap().trim_end(), "garbage");
+        let out = emit(
+            vec![record(Source::Bn, 0, vec!["garbage".to_string()])],
+            &[Source::Bn],
+        );
+        assert_eq!(out.trim_end(), "garbage");
     }
 
-    fn log_line(message: &str) -> String {
-        format!(
-            "{{\"@timestamp\":\"t\",\"level\":\"INFO\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"{message}\"}}\n"
-        )
+    /// The regression that matters most in this feature: with one source, the
+    /// bytes are exactly what they were before any of it existed. No tag.
+    #[test]
+    fn a_single_source_session_emits_no_tag() {
+        let out = emit(
+            vec![record(Source::Bn, 0, vec![json_line("INFO", "hello")])],
+            &[Source::Bn],
+        );
+        assert!(out.contains("INFO [t1] C - hello"), "{out}");
+        assert!(!out.contains("[bn]"), "no tag on a single source: {out}");
+    }
+
+    /// With two sources every line says which it came from, continuation lines
+    /// included - a stack trace whose second line lost its tag would read as
+    /// the other process's output.
+    #[test]
+    fn two_sources_tag_every_line_including_continuations() {
+        let out = emit(
+            vec![
+                record(
+                    Source::Bn,
+                    0,
+                    vec![
+                        "2026-09-14 01:16:54.217 ERROR - boom".to_string(),
+                        "\tat Foo.java:42".to_string(),
+                    ],
+                ),
+                record(
+                    Source::Vc,
+                    1,
+                    vec!["2026-09-14 01:16:54.218 INFO  - fine".to_string()],
+                ),
+            ],
+            &[Source::Bn, Source::Vc],
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("[bn] "), "{:?}", lines[0]);
+        assert!(lines[1].starts_with("[bn] "), "{:?}", lines[1]);
+        assert!(lines[2].starts_with("[vc] "), "{:?}", lines[2]);
     }
 
     #[test]
-    fn stops_following_once_the_buffer_cap_is_reached() {
-        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
+    fn stops_emitting_once_the_buffer_cap_is_reached() {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        let hit = emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, 200).unwrap();
 
-        stream_logs_capped(Cursor::new(input), &mut output, 200).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
+        assert!(hit, "should report the cap was reached");
+        let out = String::from_utf8(out).unwrap();
         assert!(
-            output.contains("buffer limit reached"),
-            "no notice emitted: {output:?}"
+            out.contains("buffer limit reached"),
+            "no notice emitted: {out:?}"
         );
-        assert!(output.contains("Quit and rerun to resume"));
+        assert!(out.contains("Quit and rerun to resume"));
         assert!(
-            output.contains("line0"),
+            out.contains("line0"),
             "content before the cap should survive"
         );
         assert!(
-            !output.contains("line499"),
+            !out.contains("line499"),
             "content past the cap should be dropped"
         );
     }
 
     #[test]
     fn buffer_cap_bounds_what_is_written() {
-        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
+        let mut out = Vec::new();
+        let mut written = 0u64;
         let cap = 1024;
-
-        stream_logs_capped(Cursor::new(input), &mut output, cap).unwrap();
+        emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, cap).unwrap();
 
         // The log content itself stays under the cap; only the fixed-size
         // notice is allowed past it, so the bound stays meaningful.
         assert!(
-            (output.len() as u64) < cap + 200,
+            (out.len() as u64) < cap + 200,
             "wrote {} bytes for a {cap}-byte cap",
-            output.len()
+            out.len()
         );
     }
 
     #[test]
     fn a_stream_under_the_cap_is_untouched_and_has_no_notice() {
-        let input = log_line("only line");
-        let mut output = Vec::new();
-
-        stream_logs_capped(Cursor::new(input), &mut output, MAX_BUFFER_BYTES).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("only line"));
-        assert!(
-            !output.contains("buffer limit"),
-            "notice on an under-cap stream: {output:?}"
+        let out = emit(
+            vec![record(Source::Bn, 0, vec![json_line("INFO", "only line")])],
+            &[Source::Bn],
         );
-        assert_eq!(output.lines().count(), 1);
+        assert!(out.contains("only line"));
+        assert!(
+            !out.contains("buffer limit"),
+            "notice on an under-cap stream: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 1);
     }
 
+    /// Hitting the cap ends the session's writing but is not a failure - the
+    /// buffer still works as scrollback, which is why it says so in-band.
     #[test]
     fn hitting_the_cap_is_not_an_error() {
-        let input: String = (0..100).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
-        assert!(stream_logs_capped(Cursor::new(input), &mut output, 50).is_ok());
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        assert!(emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, 50).is_ok());
+    }
+
+    /// The cap bounds the whole session, not one batch, which is the property
+    /// that has to survive having two producers instead of one.
+    #[test]
+    fn the_cap_accumulates_across_calls() {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        let cap = 400;
+
+        let first = emit_records(&mut out, bn_lines(4), &[Source::Bn], &mut written, cap).unwrap();
+        assert!(!first, "four short lines should fit under {cap}");
+        assert!(written > 0, "the running total must carry forward");
+
+        let second =
+            emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, cap).unwrap();
+        assert!(second, "the second batch should cross the same cap");
     }
 
     #[test]
@@ -614,18 +867,35 @@ mod tests {
     /// the pager on a quiet log must still end the session. If the wait/kill
     /// ordering is inverted this test hangs rather than fails, so it runs on a
     /// worker thread with a hard deadline.
+    /// A reader thread shaped like `run_logs`'s: it blocks on the producer's
+    /// stdout and only ends when the pipe closes.
+    fn blocking_reader(stdout: std::process::ChildStdout) -> thread::JoinHandle<io::Result<()>> {
+        thread::spawn(move || -> io::Result<()> {
+            for line in BufReader::new(stdout).lines() {
+                let _ = line?;
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn supervise_pager_returns_once_the_pager_exits_even_if_the_log_is_silent() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut tail = never_ending_child();
             let stdout = tail.stdout.take().expect("piped");
+            let worker = blocking_reader(stdout);
             // A pager that exits promptly, as if the user pressed `q`.
             let pager = Command::new("sleep")
                 .arg("0.2")
                 .spawn()
                 .expect("spawn pager stand-in");
-            let result = supervise_pager(pager, tail, BufReader::new(stdout), io::sink());
+            let result = supervise_pager(
+                pager,
+                vec![tail],
+                vec![worker],
+                Arc::new(AtomicBool::new(false)),
+            );
             let _ = done_tx.send(result.is_ok());
         });
 
@@ -638,44 +908,50 @@ mod tests {
         }
     }
 
-    /// The tailer must not outlive the session; leaking it was the original
-    /// bug behind the process-group work.
+    /// Every producer, not just the first. A survivor holds its reader thread
+    /// open and the join below it hangs; leaking one was the original bug
+    /// behind the process-group work.
     #[test]
-    fn supervise_pager_reaps_the_tailer() {
-        let mut tail = never_ending_child();
-        let pid = tail.id();
-        let stdout = tail.stdout.take().expect("piped");
+    fn supervise_pager_reaps_every_producer() {
+        let mut a = never_ending_child();
+        let mut b = never_ending_child();
+        let (pid_a, pid_b) = (a.id(), b.id());
+        let workers = vec![
+            blocking_reader(a.stdout.take().expect("piped")),
+            blocking_reader(b.stdout.take().expect("piped")),
+        ];
         let pager = Command::new("sleep")
             .arg("0.2")
             .spawn()
             .expect("spawn pager stand-in");
 
-        supervise_pager(pager, tail, BufReader::new(stdout), io::sink()).unwrap();
+        supervise_pager(pager, vec![a, b], workers, Arc::new(AtomicBool::new(false))).unwrap();
 
-        // The child was killed and waited on, so it is fully reaped rather than
-        // left as a zombie or still running.
-        let still_alive = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .expect("kill -0")
-            .success();
-        assert!(!still_alive, "tailer pid {pid} survived the session");
+        for pid in [pid_a, pid_b] {
+            let still_alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill -0")
+                .success();
+            assert!(!still_alive, "producer pid {pid} survived the session");
+        }
     }
 
-    /// The colorized bytes must actually reach the sink the pager reads, not
-    /// just be produced and dropped.
+    /// The whole machine end to end: a producer, a reader feeding the merger,
+    /// and the emitter writing into the file `less` reads. The colorized bytes
+    /// must actually arrive there, not just be produced and dropped.
     #[test]
-    fn supervise_pager_streams_log_lines_into_the_sink() {
-        let mut source = Command::new("printf")
+    fn supervise_pager_streams_merged_lines_into_the_sink() {
+        let mut producer = Command::new("printf")
             .arg(
-                r#"{"@timestamp":"t","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#,
+                r#"{"@timestamp":"2026-09-14T01:16:54.217Z","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#,
             )
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn printf");
-        let stdout = source.stdout.take().expect("piped");
+        let stdout = producer.stdout.take().expect("piped");
         let pager = Command::new("sleep")
-            .arg("0.3")
+            .arg("0.5")
             .spawn()
             .expect("spawn pager stand-in");
 
@@ -684,10 +960,77 @@ mod tests {
             .tempfile()
             .unwrap();
         let writer = LineWriter::new(sink.reopen().unwrap());
-        supervise_pager(pager, source, BufReader::new(stdout), writer).unwrap();
+
+        let started = vec![Source::Bn];
+        let merger = Arc::new(Mutex::new(Merger::new(
+            started.clone(),
+            MERGE_WINDOW,
+            Instant::now(),
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let merger = Arc::clone(&merger);
+            thread::spawn(move || -> io::Result<()> {
+                let mut builder = RecordBuilder::new(Source::Bn, 0);
+                for line in BufReader::new(stdout).lines() {
+                    let line = line?;
+                    if let Some(r) = builder.push_line(&line) {
+                        merger.lock().unwrap().push(r, Instant::now());
+                    }
+                }
+                let mut m = merger.lock().unwrap();
+                if let Some(r) = builder.finish() {
+                    m.push(r, Instant::now());
+                }
+                m.eof(Source::Bn);
+                Ok(())
+            })
+        };
+        let emitter = {
+            let merger = Arc::clone(&merger);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || emit_loop(merger, stop, writer, started))
+        };
+
+        supervise_pager(pager, vec![producer], vec![reader, emitter], stop).unwrap();
 
         let written = std::fs::read_to_string(sink.path()).unwrap();
         assert!(written.contains("INFO [m] C - hello"), "got {written:?}");
+    }
+
+    /// The emitter polls the merger rather than blocking on a pipe, so closing
+    /// the producers' stdout says nothing to it. If `stop` is not set before
+    /// the join, this hangs rather than fails - hence the deadline.
+    #[test]
+    fn supervise_pager_stops_an_emitter_whose_source_never_reaches_eof() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let merger = Arc::new(Mutex::new(Merger::new(
+                vec![Source::Bn],
+                MERGE_WINDOW,
+                Instant::now(),
+            )));
+            // No `eof` is ever recorded, standing in for a reader thread that
+            // died before it could.
+            let emitter = {
+                let merger = Arc::clone(&merger);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || emit_loop(merger, stop, io::sink(), vec![Source::Bn]))
+            };
+            let pager = Command::new("sleep")
+                .arg("0.2")
+                .spawn()
+                .expect("spawn pager stand-in");
+            let result = supervise_pager(pager, vec![], vec![emitter], stop);
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(ok) => assert!(ok, "supervise_pager returned an error"),
+            Err(_) => panic!("the emitter never stopped - `stop` is not reaching it"),
+        }
     }
 
     #[test]
@@ -703,35 +1046,49 @@ mod tests {
     }
 
     #[test]
-    fn pick_target_prefers_bn_when_both_are_present() {
+    fn slot_target_reads_the_slot_it_is_asked_for() {
         let sources = LogSources {
-            bn: Some(LogTarget::Container("bn".into())),
-            vc: Some(LogTarget::Container("vc".into())),
+            bn: Some(LogTarget::Container("bn-c".into())),
+            vc: Some(LogTarget::Container("vc-c".into())),
         };
-        assert_eq!(pick_target(sources), LogTarget::Container("bn".into()));
+        assert_eq!(
+            slot_target(&sources, Source::Bn),
+            Some(&LogTarget::Container("bn-c".into()))
+        );
+        assert_eq!(
+            slot_target(&sources, Source::Vc),
+            Some(&LogTarget::Container("vc-c".into()))
+        );
     }
 
     /// The regression this pins: `tekops logs --vc-container x` resolves to
-    /// `{ bn: None, vc: Some(x) }`, and a picker that only read `.bn` would
+    /// `{ bn: None, vc: Some(x) }`, and a `run_logs` that only read `.bn` would
     /// silently fall through to the hardcoded default path instead - showing
-    /// the operator a stream they never asked for, or a "file not found" for
-    /// a path they never mentioned.
+    /// the operator a stream they never asked for, or a "file not found" for a
+    /// path they never mentioned. The same fault hit the no-flag case on a
+    /// validator-only host, which is the deployment this feature exists for.
     #[test]
-    fn pick_target_falls_back_to_vc_when_bn_is_absent() {
+    fn a_validator_only_deployment_is_an_active_source() {
         let sources = LogSources {
             bn: None,
-            vc: Some(LogTarget::Container("vc".into())),
+            vc: Some(LogTarget::Container("rocketpool_validator".into())),
         };
-        assert_eq!(pick_target(sources), LogTarget::Container("vc".into()));
+        assert_eq!(sources.active(), vec![Source::Vc]);
+        assert_eq!(
+            slot_target(&sources, Source::Vc),
+            Some(&LogTarget::Container("rocketpool_validator".into()))
+        );
     }
 
+    /// With no source at all there is nothing to tail, and saying so beats
+    /// opening a default path the operator never named. `resolve_log_sources`
+    /// makes this unreachable except via a selector, which `cli::check_selection`
+    /// rejects first with a message naming the slot.
     #[test]
-    fn pick_target_falls_back_to_the_default_path_when_both_are_absent() {
+    fn run_logs_fails_when_no_source_resolved() {
         let sources = LogSources { bn: None, vc: None };
-        assert_eq!(
-            pick_target(sources),
-            LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
-        );
+        let code = run_logs(sources, 500);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
     fn inputs() -> SourceInputs {
