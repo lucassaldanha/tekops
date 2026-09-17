@@ -179,6 +179,11 @@ pub struct SourceInputs {
     pub vc_logs_file_cfg: Option<PathBuf>,
     pub detected_bn: Option<String>,
     pub detected_vc: Option<String>,
+    /// Whether `DEFAULT_TEKU_LOG` exists on this host. Read by the caller
+    /// rather than here, like every other field, so the ladder stays pure.
+    /// This is the only evidence tekops has of a bare-metal beacon node: it
+    /// runs under no container, so detection cannot see it.
+    pub default_log_present: bool,
     /// `--bn` / `--vc`: filters what resolved, rather than naming anything.
     pub select: Option<Source>,
 }
@@ -204,9 +209,15 @@ pub struct SourceInputs {
 ///    *detected* validator now yields both streams: that is the separated
 ///    deployment this feature exists for, and the new behaviour is
 ///    intentional, not a regression of rule 1.
-/// 2. **The hardcoded default is a whole-command last resort**, not a
-///    per-slot one, so a pure Rocket Pool node is not handed a "file not
-///    found" for `/var/log/teku/teku.log`, a path it never had.
+/// 2. **The hardcoded default answers the bn slot when that file is actually
+///    there**, and otherwise only as a whole-command last resort. A bare-metal
+///    beacon node is invisible to detection - it runs under no container - so
+///    on a host running one beside a Rocket Pool validator, an operator with
+///    no config file has nothing that can fill the bn slot except the path
+///    itself existing. Keeping the existence gate is what stops a pure Rocket
+///    Pool node being handed a "file not found" for a path it never had, and
+///    the whole-command fallback is what keeps that message printing when
+///    nothing resolved at all.
 /// 3. **`select` filters afterwards.** It names nothing, so it cannot
 ///    interact with rule 1.
 ///
@@ -265,12 +276,26 @@ pub fn resolve_log_sources(inputs: SourceInputs) -> LogSources {
         (true, false) => (bn_stated, None),
         (false, true) => (None, vc_stated),
         _ => (
-            bn_stated.or_else(|| inputs.detected_bn.map(LogTarget::Container)),
+            bn_stated
+                .or_else(|| inputs.detected_bn.map(LogTarget::Container))
+                // Rule 2's per-slot half. A bare-metal beacon node runs under
+                // no container, so `detected_bn` cannot see it and an operator
+                // who never wrote a config file has nothing else to offer -
+                // the file being there is the evidence. Gated on the file
+                // existing so the validator-only host rule 2 protects still
+                // gets no default at all; gated inside this arm so rule 1
+                // keeps outranking it.
+                .or_else(|| {
+                    inputs
+                        .default_log_present
+                        .then(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+                }),
             vc_stated.or_else(|| inputs.detected_vc.map(LogTarget::Container)),
         ),
     };
 
-    // Rule 2: the hardcoded path answers for the whole command or not at all.
+    // Rule 2: with nothing resolved at all, the hardcoded path answers anyway,
+    // so the operator gets "log file not found: <path>" rather than silence.
     if bn.is_none() && vc.is_none() {
         bn = Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
     }
@@ -1107,8 +1132,69 @@ mod tests {
             vc_logs_file_cfg: None,
             detected_bn: None,
             detected_vc: None,
+            default_log_present: false,
             select: None,
         }
+    }
+
+    /// The reported bug. A bare-metal beacon node writing the default path,
+    /// a Rocket Pool validator container, and nothing in the config file:
+    /// `tekops logs` printed the validator alone, and `tekops logs --bn`
+    /// failed outright with "no bn log source found".
+    #[test]
+    fn a_present_default_path_answers_the_bn_slot_beside_a_detected_validator() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: true,
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))),
+            "an unconfigured bare-metal beacon node still has its default log"
+        );
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+
+        let bn_only = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: true,
+            select: Some(Source::Bn),
+            ..inputs()
+        });
+        assert_eq!(
+            bn_only.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+        );
+        assert_eq!(bn_only.vc, None);
+    }
+
+    /// The other half of the same rule: on a host where that path does not
+    /// exist, the validator-only deployment still gets no spurious default and
+    /// no "file not found" for a path it never had.
+    #[test]
+    fn an_absent_default_path_leaves_a_validator_only_host_alone() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: false,
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+    }
+
+    /// Rule 1 still outranks the present default: naming the validator side by
+    /// flag means that side only, whatever is sitting at the default path.
+    #[test]
+    fn a_present_default_path_does_not_defeat_rule_one() {
+        let got = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("vc-c".into()),
+            default_log_present: true,
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(got.vc, Some(LogTarget::Container("vc-c".into())));
     }
 
     /// The reported deployment: a Rocket Pool validator container detected

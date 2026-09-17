@@ -96,6 +96,15 @@ and describes the node. It is also what makes the common separated deployment
 work with no flags at all - a bare-metal beacon node with `logs_file`
 configured, beside a Rocket Pool validator container.
 
+**A bare-metal beacon node needs no config at all if it writes the default
+path.** `docker ps` cannot see a process that is not in a container, so
+`/var/log/teku/teku.log` being there is the only evidence tekops has of one:
+when it exists and nothing else named the beacon node, that is the `bn`
+source, detected validator container or not. On a host without that file -
+Rocket Pool's External Consensus Client mode, where the beacon node lives
+somewhere else entirely - nothing is assumed, and `tekops logs` shows the
+validator alone.
+
 `--bn` and `--vc` filter whatever resolved, rather than naming anything. They
 are mutually exclusive, and asking for a process that has no source is an
 error naming that process rather than an empty session.

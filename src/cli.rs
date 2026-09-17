@@ -380,6 +380,7 @@ pub fn run() -> ExitCode {
                 vc_logs_file_cfg: cfg.vc_logs_file.clone(),
                 detected_bn,
                 detected_vc,
+                default_log_present: default_teku_log_present(),
                 select,
             });
             if let Err(e) = check_selection(&sources, select) {
@@ -464,6 +465,7 @@ pub fn run() -> ExitCode {
                 vc_logs_file_cfg: cfg.vc_logs_file.clone(),
                 detected_bn: detected.as_ref().map(|(_, name)| name.clone()),
                 detected_vc: detected_vc.map(|(_, name)| name),
+                default_log_present: default_teku_log_present(),
                 select,
             });
             if let Err(e) = check_selection(&sources, select) {
@@ -1082,6 +1084,14 @@ fn selector(bn: bool, vc: bool) -> Option<Source> {
 /// `run_logs` falls back to would be true but unhelpful in that case: the
 /// operator named a process, so the message names it back and says what would
 /// fix it, rather than a blank session that looks like a quiet node.
+/// The one filesystem read behind `SourceInputs::default_log_present`.
+///
+/// Here rather than in `resolve_log_sources` so the precedence ladder stays a
+/// pure function of its inputs - the same split every other tier already has.
+fn default_teku_log_present() -> bool {
+    Path::new(crate::logs::DEFAULT_TEKU_LOG).exists()
+}
+
 fn check_selection(
     sources: &crate::logs::LogSources,
     select: Option<Source>,
@@ -2977,7 +2987,8 @@ mod tests {
 
     /// Rule 2 (mutual exclusion by flag/env) runs before rule 3 (`select`
     /// filtering), so `--bn` on a host where only a validator container is
-    /// detected resolves to `LogSources { bn: None, vc: None }` rather than an
+    /// detected and no log sits at the default path resolves to
+    /// `LogSources { bn: None, vc: None }` rather than an
     /// error at the resolver level: `select` only filters what already
     /// resolved, and nothing did. `check_selection` is what turns that into a
     /// clear error instead of a session that looks like a quiet, working node.
@@ -2998,6 +3009,10 @@ mod tests {
             vc_logs_file_cfg: None,
             detected_bn: None,
             detected_vc: Some("rocketpool_validator".into()),
+            // The validator-only host: no beacon node here, so nothing is at
+            // the default path either. With that file present this is instead
+            // the separated deployment, and the bn slot resolves to it.
+            default_log_present: false,
             select: Some(Source::Bn),
         });
         assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });
@@ -3029,6 +3044,7 @@ mod tests {
             vc_logs_file_cfg: None,
             detected_bn: None,
             detected_vc: None,
+            default_log_present: false,
             select: Some(Source::Vc),
         });
         assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });

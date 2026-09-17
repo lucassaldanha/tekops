@@ -598,9 +598,17 @@ Three rules sit on top, and each stops a specific wrong answer:
    bare-metal beacon node with `logs_file` configured, beside a Rocket Pool
    validator container - would silently show one stream and never the
    validator, with no flags set and nothing in the output to say so.
-2. **The hardcoded default is a whole-command last resort**, not a per-slot
-   one, so a pure Rocket Pool node is not handed a "file not found" for a path
-   it never had.
+2. **The hardcoded default answers the bn slot when that file is actually
+   there**, and otherwise only as a whole-command last resort. A bare-metal
+   beacon node runs under no container, so `detect_stack` cannot see it: on a
+   host running one beside a Rocket Pool validator, an operator with no config
+   file has nothing that can fill the bn slot except the path existing. The
+   existence gate is what still spares a pure Rocket Pool node a "file not
+   found" for a path it never had, and the whole-command fallback is what keeps
+   that message printing when nothing resolved at all. `cli.rs` does the read
+   (`default_teku_log_present`) and passes the answer in, like every other
+   input. Without the per-slot half, `tekops logs` on a separated deployment
+   printed the validator alone and `tekops logs --bn` failed outright.
 3. **`--bn`/`--vc` filter after both ladders run.** They name nothing, so they
    cannot interact with rule 1. Because rule 2 runs before rule 3, a selector
    can legitimately leave both slots empty; `cli::check_selection` catches that
