@@ -5,7 +5,7 @@
 //! testable with no environment races and no files on disk; `load` is the only
 //! function here that touches a filesystem.
 //!
-//! The file carries exactly the eight settings that already have `$TEKOPS_*`
+//! The file carries exactly the ten settings that already have `$TEKOPS_*`
 //! variables, and nothing else. Every key is a variable is a flag, which is
 //! the one sentence that makes the feature explainable. Per-command defaults
 //! (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -60,6 +60,15 @@ pub struct Config {
     pub metric_url: Option<String>,
     pub container: Option<String>,
     pub logs_file: Option<PathBuf>,
+    /// The validator client's log source, on a separated deployment.
+    ///
+    /// The unprefixed `container` and `logs_file` above are the beacon
+    /// node's. They keep their spelling with no deprecated alias, unlike
+    /// `metric_url`, because nothing about their meaning changed: they named
+    /// "the log source" and now name "the beacon node's log source", which on
+    /// an all-in-one node is the same container and the same file.
+    pub vc_container: Option<String>,
+    pub vc_logs_file: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
 }
 
@@ -196,6 +205,28 @@ data_dir = "/var/lib/teku"
         );
         assert_eq!(cfg.bn_metric_url, None);
         assert_eq!(cfg.vc_metric_url, None);
+    }
+
+    /// The validator client's log source, for a separated deployment. The
+    /// unprefixed `container`/`logs_file` keep their spelling and mean the beacon
+    /// node - unlike `metric_url`, which needed a deprecated alias because its
+    /// meaning changed. Nothing changes meaning here: on an all-in-one node the
+    /// beacon node's container is the only container.
+    #[test]
+    fn the_validator_log_source_keys_parse() {
+        let cfg = parse(
+            r#"
+                vc_container = "rocketpool_validator"
+                vc_logs_file = "/var/log/teku/validator.log"
+            "#,
+            Path::new("/x/config.toml"),
+        )
+        .unwrap();
+        assert_eq!(cfg.vc_container.as_deref(), Some("rocketpool_validator"));
+        assert_eq!(
+            cfg.vc_logs_file,
+            Some(PathBuf::from("/var/log/teku/validator.log"))
+        );
     }
 
     #[test]
@@ -407,6 +438,8 @@ data_dir = "/var/lib/teku"
             metric_url: Some("http://w".into()),
             container: Some("c".into()),
             logs_file: Some(PathBuf::from("/a")),
+            vc_container: Some("vc".into()),
+            vc_logs_file: Some(PathBuf::from("/vc")),
             data_dir: Some(PathBuf::from("/b")),
         };
         let rendered = toml::to_string(&populated).expect("Config must serialize");

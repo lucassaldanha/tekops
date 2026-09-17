@@ -49,6 +49,17 @@
 # `container` above is unset.  ($TEKOPS_LOGS_FILE)
 #logs_file = "/var/log/teku/teku.log"
 
+# Docker container the validator client logs to, when it is a different one
+# from the beacon node's. Set this on a separated deployment - Rocket Pool's
+# External Consensus Client mode, say, where the validator runs under Docker
+# against a beacon node Rocket Pool did not start. Leave it unset on an
+# all-in-one node, where one container logs both.  ($TEKOPS_VC_CONTAINER)
+#vc_container = "rocketpool_validator"
+
+# Log file the validator client writes, for a separated bare-metal node.
+# Only reached when `vc_container` above is unset.  ($TEKOPS_VC_LOGS_FILE)
+#vc_logs_file = "/var/log/teku/validator.log"
+
 # Filesystem `tekops doctor` checks for free space. On a Docker stack the
 # container's own mounts answer this, so set it only to override them.
 # ($TEKOPS_DATA_DIR)
