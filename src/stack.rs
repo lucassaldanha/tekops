@@ -51,13 +51,28 @@ impl Stack {
         }
     }
 
-    /// The Prometheus scrape URL to use when nothing more specific was given.
+    /// The beacon node's Prometheus scrape URL for this stack.
     ///
-    /// This points at the **validator client**, not the beacon node. `duties`
-    /// and `validators` read VC metric families, and `version` tries the beacon
-    /// family then falls back to the validator one, so the VC endpoint answers
-    /// all three while the beacon endpoint answers only one.
-    pub fn metric_url(&self) -> &'static str {
+    /// Teku's own `--metrics-port` default is 8008, which both Docker stacks
+    /// keep for the consensus client; Rocket Pool moves it to 9100
+    /// (`defaultBnMetricsPort` in its `rocket-pool-config.go`).
+    pub fn bn_metric_url(&self) -> &'static str {
+        match self {
+            Stack::BareMetal | Stack::EthDocker => "http://localhost:8008/metrics",
+            Stack::RocketPool => "http://localhost:9100/metrics",
+        }
+    }
+
+    /// The validator client's Prometheus scrape URL for this stack.
+    ///
+    /// This answers `duties` and `validators`, which read VC metric families
+    /// exclusively.
+    ///
+    /// Note that 8010 for bare-metal is a tekops convention, not a Teku
+    /// default: Teku defaults *both* processes to 8008, so a separated
+    /// bare-metal node has necessarily repointed one of them by hand and will
+    /// be configuring this anyway.
+    pub fn vc_metric_url(&self) -> &'static str {
         match self {
             Stack::BareMetal => "http://localhost:8010/metrics",
             Stack::EthDocker => "http://localhost:8009/metrics",
@@ -80,6 +95,43 @@ impl Stack {
             Stack::RocketPool => Some("_eth2"),
         }
     }
+
+    /// The trailing part of this stack's validator-client container name.
+    ///
+    /// The counterpart to `container_suffix`, and the reason a separated
+    /// deployment can be named at all: both stacks supervise the validator in
+    /// a container of its own, and either stack will happily run that
+    /// validator against a beacon node it did not start. Rocket Pool calls
+    /// that External Consensus Client mode; on such a node `_eth2` never
+    /// exists and only this suffix can tell tekops that Docker is involved.
+    pub fn validator_container_suffix(&self) -> Option<&'static str> {
+        match self {
+            Stack::BareMetal => None,
+            Stack::EthDocker => Some("-validator-1"),
+            Stack::RocketPool => Some("_validator"),
+        }
+    }
+}
+
+/// Which of a deployment's two processes a detection is looking for.
+///
+/// Carried by `DetectError` so a failure names the container the caller
+/// actually asked about, and so the escape hatch it suggests is one that
+/// exists: `--container` points `logs` at a consensus container and has never
+/// meant the validator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Consensus,
+    Validator,
+}
+
+impl Role {
+    fn noun(&self) -> &'static str {
+        match self {
+            Role::Consensus => "consensus container",
+            Role::Validator => "validator container",
+        }
+    }
 }
 
 /// Renders exactly the value a user types for `--stack`, so doctor's report
@@ -95,26 +147,34 @@ impl fmt::Display for Stack {
     }
 }
 
-/// Why `detect_stack` could not name exactly one container.
+/// Why a detection could not name exactly one container.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DetectError {
-    NotFound,
-    Ambiguous(Vec<String>),
+    NotFound(Role),
+    Ambiguous(Role, Vec<String>),
 }
 
 impl fmt::Display for DetectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DetectError::NotFound => write!(
+            DetectError::NotFound(role) => write!(
                 f,
-                "no Eth Docker or Rocket Pool consensus container found; \
-                 name one with --container or $TEKOPS_CONTAINER"
+                "no Eth Docker or Rocket Pool {} found; {}",
+                role.noun(),
+                match role {
+                    Role::Consensus => "name one with --container or $TEKOPS_CONTAINER",
+                    Role::Validator => "name the stack with --stack or $TEKOPS_STACK",
+                }
             ),
-            DetectError::Ambiguous(names) => write!(
+            DetectError::Ambiguous(role, names) => write!(
                 f,
-                "found more than one consensus container ({}); \
-                 pick one with --container or narrow with --stack",
-                names.join(", ")
+                "found more than one {} ({}); {}",
+                role.noun(),
+                names.join(", "),
+                match role {
+                    Role::Consensus => "pick one with --container or narrow with --stack",
+                    Role::Validator => "narrow with --stack",
+                }
             ),
         }
     }
@@ -124,7 +184,7 @@ impl fmt::Display for DetectError {
 ///
 /// Takes the output as a parameter rather than running `docker` itself, so the
 /// whole matching rule is unit-testable on a machine with no Docker installed -
-/// the same shape, and for the same reason, as `logs::resolve_log_target`.
+/// the same shape, and for the same reason, as `logs::resolve_log_sources`.
 ///
 /// `only` narrows the search to a single stack's naming, which is what
 /// `--stack` contributes to detection. Note it contributes a *filter*, never a
@@ -137,6 +197,31 @@ impl fmt::Display for DetectError {
 /// two is an error rather than a guess, because tailing the wrong node's logs
 /// looks exactly like tailing the right one until it matters.
 pub fn detect_stack(ps_output: &str, only: Option<Stack>) -> Result<(Stack, String), DetectError> {
+    detect_role(ps_output, only, Role::Consensus)
+}
+
+/// The same rule as `detect_stack`, applied to the validator container.
+///
+/// Separate from `detect_stack` rather than a mode of it, because the two
+/// answers are independent facts about one host: a Rocket Pool node in
+/// External Consensus Client mode matches here and nowhere in `detect_stack`,
+/// which is exactly the deployment that used to be reported as bare-metal.
+/// Callers that only want a log target (`logs`, `dump-logs`) keep asking the
+/// consensus question alone.
+pub fn detect_validator_stack(
+    ps_output: &str,
+    only: Option<Stack>,
+) -> Result<(Stack, String), DetectError> {
+    detect_role(ps_output, only, Role::Validator)
+}
+
+/// The matching rule both detections share, so the two cannot drift on
+/// whitespace handling, `only` narrowing, or the refusal to guess.
+fn detect_role(
+    ps_output: &str,
+    only: Option<Stack>,
+    role: Role,
+) -> Result<(Stack, String), DetectError> {
     let candidates = [Stack::EthDocker, Stack::RocketPool];
     let mut matches: Vec<(Stack, String)> = Vec::new();
 
@@ -149,7 +234,11 @@ pub fn detect_stack(ps_output: &str, only: Option<Stack>) -> Result<(Stack, Stri
             if only.is_some_and(|s| s != stack) {
                 continue;
             }
-            if let Some(suffix) = stack.container_suffix() {
+            let suffix = match role {
+                Role::Consensus => stack.container_suffix(),
+                Role::Validator => stack.validator_container_suffix(),
+            };
+            if let Some(suffix) = suffix {
                 if name.ends_with(suffix) {
                     matches.push((stack, name.to_string()));
                 }
@@ -159,11 +248,11 @@ pub fn detect_stack(ps_output: &str, only: Option<Stack>) -> Result<(Stack, Stri
 
     match matches.len() {
         1 => Ok(matches.remove(0)),
-        0 => Err(DetectError::NotFound),
+        0 => Err(DetectError::NotFound(role)),
         _ => {
             let mut names: Vec<String> = matches.into_iter().map(|(_, n)| n).collect();
             names.sort();
-            Err(DetectError::Ambiguous(names))
+            Err(DetectError::Ambiguous(role, names))
         }
     }
 }
@@ -215,7 +304,7 @@ mod tests {
     fn bare_metal_keeps_todays_defaults() {
         assert_eq!(Stack::BareMetal.api_url(), "http://localhost:5051");
         assert_eq!(
-            Stack::BareMetal.metric_url(),
+            Stack::BareMetal.vc_metric_url(),
             "http://localhost:8010/metrics"
         );
         assert_eq!(Stack::BareMetal.container_suffix(), None);
@@ -227,21 +316,60 @@ mod tests {
         assert_eq!(Stack::RocketPool.api_url(), "http://localhost:5052");
     }
 
-    /// `duties` and `validators` read validator-client metrics, and `version`
-    /// falls back across the beacon and validator metric families, so the
-    /// profile must point at the VC port. Pointing it at the beacon node's
-    /// port (8008 for Eth Docker, 9100 for Rocket Pool) would leave two of the
-    /// three metrics commands reporting a missing metric family.
+    /// The values `metric_url` used to return, kept byte-for-byte. Operators
+    /// already point at these ports; the rename must not move them.
     #[test]
-    fn metric_url_points_at_the_validator_client_not_the_beacon_node() {
+    fn vc_metric_urls_keep_todays_values() {
         assert_eq!(
-            Stack::EthDocker.metric_url(),
+            Stack::BareMetal.vc_metric_url(),
+            "http://localhost:8010/metrics"
+        );
+        assert_eq!(
+            Stack::EthDocker.vc_metric_url(),
             "http://localhost:8009/metrics"
         );
         assert_eq!(
-            Stack::RocketPool.metric_url(),
+            Stack::RocketPool.vc_metric_url(),
             "http://localhost:9101/metrics"
         );
+    }
+
+    /// Verified upstream: Teku's own `--metrics-port` default is 8008 for both
+    /// the main command and the `validator-client` subcommand; eth-docker's
+    /// `teku.yml` puts the CL on 8008; Rocket Pool's `rocket-pool-config.go`
+    /// declares `defaultBnMetricsPort = 9100`.
+    #[test]
+    fn bn_metric_urls_match_each_stacks_beacon_node_port() {
+        assert_eq!(
+            Stack::BareMetal.bn_metric_url(),
+            "http://localhost:8008/metrics"
+        );
+        assert_eq!(
+            Stack::EthDocker.bn_metric_url(),
+            "http://localhost:8008/metrics"
+        );
+        assert_eq!(
+            Stack::RocketPool.bn_metric_url(),
+            "http://localhost:9100/metrics"
+        );
+    }
+
+    /// The whole point of the split. If a stack ever returned one URL for both
+    /// processes, `doctor` would report the same endpoint twice under two
+    /// names and `version` would claim the same process is both.
+    ///
+    /// Driven off `value_variants()` so a stack added later is covered
+    /// automatically, the same shape as
+    /// `serde_matches_clap_values_for_every_variant`.
+    #[test]
+    fn bn_and_vc_metric_urls_differ_for_every_stack() {
+        for stack in Stack::value_variants() {
+            assert_ne!(
+                stack.bn_metric_url(),
+                stack.vc_metric_url(),
+                "{stack} points both processes at one endpoint"
+            );
+        }
     }
 
     #[test]
@@ -283,14 +411,14 @@ mod tests {
     #[test]
     fn reports_not_found_when_nothing_matches() {
         let err = detect_stack("postgres\nredis\n", None).unwrap_err();
-        assert!(matches!(err, DetectError::NotFound));
+        assert!(matches!(err, DetectError::NotFound(Role::Consensus)));
     }
 
     #[test]
     fn refuses_to_guess_between_two_matching_stacks() {
         let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
         let err = detect_stack(ps, None).unwrap_err();
-        let DetectError::Ambiguous(names) = err else {
+        let DetectError::Ambiguous(_, names) = err else {
             panic!("expected Ambiguous, got {err:?}");
         };
         assert_eq!(names, vec!["eth-docker-consensus-1", "rocketpool_eth2"]);
@@ -314,14 +442,15 @@ mod tests {
     /// `--stack bare-metal` is the escape hatch for a host that runs Docker
     /// alongside a bare-metal node: narrowing to a stack with no
     /// `container_suffix()` can never match anything, so detection turns off
-    /// and `resolve_log_target` falls through to the file-path behaviour. This
-    /// already worked - `container_suffix()` is `None` for `BareMetal` and the
-    /// loop skips a `None` suffix - but nothing pinned it before this test.
+    /// and `resolve_log_sources` falls through to its bn slot's file-path
+    /// default. This already worked - `container_suffix()` is `None` for
+    /// `BareMetal` and the loop skips a `None` suffix - but nothing pinned it
+    /// before this test.
     #[test]
     fn narrowing_to_bare_metal_matches_nothing() {
         let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";
         let err = detect_stack(ps, Some(Stack::BareMetal)).unwrap_err();
-        assert_eq!(err, DetectError::NotFound);
+        assert_eq!(err, DetectError::NotFound(Role::Consensus));
     }
 
     #[test]
@@ -345,6 +474,117 @@ mod tests {
     #[test]
     fn does_not_match_rocket_pools_execution_container() {
         let err = detect_stack("rocketpool_eth1\n", None).unwrap_err();
-        assert!(matches!(err, DetectError::NotFound));
+        assert!(matches!(err, DetectError::NotFound(Role::Consensus)));
+    }
+
+    // --- validator detection ---
+
+    /// The reported bug, at the layer it starts: Rocket Pool in External
+    /// Consensus Client mode supervises the validator and nothing else, so
+    /// there is no `_eth2` container, `detect_stack` finds nothing, and
+    /// doctor's ladder used to terminate in a confident "bare-metal" for a
+    /// node that is plainly running Rocket Pool under Docker.
+    #[test]
+    fn rocket_pool_running_only_a_validator_is_not_bare_metal() {
+        let ps = "rocketpool_api\nrocketpool_node\nrocketpool_watchtower\nrocketpool_validator\n";
+
+        assert!(matches!(
+            detect_stack(ps, None),
+            Err(DetectError::NotFound(Role::Consensus))
+        ));
+
+        let (stack, name) = detect_validator_stack(ps, None).unwrap();
+        assert_eq!(stack, Stack::RocketPool);
+        assert_eq!(name, "rocketpool_validator");
+    }
+
+    #[test]
+    fn detects_eth_dockers_validator_container() {
+        let ps = "eth-docker-execution-1\neth-docker-consensus-1\neth-docker-validator-1\n";
+        let (stack, name) = detect_validator_stack(ps, None).unwrap();
+        assert_eq!(stack, Stack::EthDocker);
+        assert_eq!(name, "eth-docker-validator-1");
+    }
+
+    /// Validator detection matches on a suffix for the same reason the
+    /// consensus one does: both stacks let the operator rename the prefix.
+    #[test]
+    fn detects_a_validator_under_a_non_default_project_name() {
+        let (stack, name) = detect_validator_stack("my-node-validator-1\n", None).unwrap();
+        assert_eq!(stack, Stack::EthDocker);
+        assert_eq!(name, "my-node-validator-1");
+
+        let (stack, name) = detect_validator_stack("hoodi_validator\n", None).unwrap();
+        assert_eq!(stack, Stack::RocketPool);
+        assert_eq!(name, "hoodi_validator");
+    }
+
+    /// Rocket Pool's supporting containers sit one underscore away from the
+    /// validator. Matching `rocketpool_node` would report a stack from a
+    /// container that has never run a validator.
+    #[test]
+    fn does_not_match_rocket_pools_supporting_containers() {
+        for ps in ["rocketpool_node\n", "rocketpool_api\n", "rocketpool_eth2\n"] {
+            assert!(
+                matches!(
+                    detect_validator_stack(ps, None),
+                    Err(DetectError::NotFound(Role::Validator))
+                ),
+                "matched a validator in: {ps}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_to_guess_between_two_matching_validators() {
+        let ps = "eth-docker-validator-1\nrocketpool_validator\n";
+        let err = detect_validator_stack(ps, None).unwrap_err();
+        let DetectError::Ambiguous(role, names) = err else {
+            panic!("expected Ambiguous, got {err:?}");
+        };
+        assert_eq!(role, Role::Validator);
+        assert_eq!(
+            names,
+            vec!["eth-docker-validator-1", "rocketpool_validator"]
+        );
+    }
+
+    /// `--container` names a log target and has never meant the validator, so
+    /// suggesting it here would send the operator after a flag that cannot fix
+    /// what they are looking at.
+    #[test]
+    fn validator_failures_suggest_only_flags_that_exist() {
+        let not_found = detect_validator_stack("postgres\n", None)
+            .unwrap_err()
+            .to_string();
+        assert!(not_found.contains("validator container"), "{not_found}");
+        assert!(!not_found.contains("--container"), "{not_found}");
+
+        let ambiguous = detect_validator_stack("a-validator-1\nb_validator\n", None)
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("--stack"), "{ambiguous}");
+        assert!(!ambiguous.contains("--container"), "{ambiguous}");
+    }
+
+    /// `--stack bare-metal` turns *both* detections off, not just the
+    /// consensus one - the escape hatch for a host that runs a bare-metal node
+    /// alongside unrelated Docker containers has to stay total.
+    #[test]
+    fn narrowing_to_bare_metal_matches_no_validator_either() {
+        let ps = "eth-docker-validator-1\nrocketpool_validator\n";
+        let err = detect_validator_stack(ps, Some(Stack::BareMetal)).unwrap_err();
+        assert_eq!(err, DetectError::NotFound(Role::Validator));
+    }
+
+    #[test]
+    fn every_stack_with_a_consensus_container_has_a_validator_one() {
+        for stack in Stack::value_variants() {
+            assert_eq!(
+                stack.container_suffix().is_some(),
+                stack.validator_container_suffix().is_some(),
+                "{stack} names one container but not the other"
+            );
+        }
     }
 }

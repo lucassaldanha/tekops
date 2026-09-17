@@ -6,7 +6,7 @@
 //! could not have worked out themselves.
 //!
 //! Everything here except `load` is a pure function over its arguments, the
-//! same split `logs::resolve_log_target` and `completions::plan` use: the
+//! same split `logs::resolve_log_sources` and `completions::plan` use: the
 //! argument handling, the URL rewriting and the body parsing are all testable
 //! with no network and no environment.
 

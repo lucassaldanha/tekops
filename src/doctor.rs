@@ -13,7 +13,7 @@ use crate::beaconapi::{BeaconClient, FinalityCheckpoints, HealthState, PeerInfo,
 use crate::docker::ContainerState;
 use crate::host::{Disk, Load, Memory};
 use crate::http::ApiError;
-use crate::metrics::{DutiesMetrics, MetricsClient, ValidatorMetrics, VersionInfo};
+use crate::metrics::{DutiesMetrics, EndpointFamilies, MetricsClient, ValidatorMetrics};
 use crate::output::plural;
 use crate::stack::Stack;
 use serde::Serialize;
@@ -65,6 +65,11 @@ const LOAD_FAIL_ABOVE_PER_CPU: f64 = 2.0;
 /// was asked and did not answer, and from a Docker stack's own
 /// `Probe::Ok(vec![])`, which means Docker was asked and matched nothing.
 const NO_CONTAINER: &str = "no container for this stack";
+
+/// No separate validator container was found. Not a failure: a combined
+/// deployment runs the validator inside the consensus container, so there is
+/// nothing of its own to inspect and nothing to report.
+const NO_VALIDATOR_CONTAINER: &str = "no separate validator container";
 
 /// The outcome of one piece of I/O.
 ///
@@ -137,8 +142,13 @@ impl Finding {
 #[derive(Debug, Serialize)]
 pub struct Facts {
     pub stack: Option<Stack>,
+    /// The validator client's stack. Equal to `stack` on an all-in-one node;
+    /// different on a separated one, which is the whole reason it is recorded
+    /// rather than assumed.
+    pub vc_stack: Option<Stack>,
     pub api_url: String,
-    pub metric_url: String,
+    pub bn_metric_url: String,
+    pub vc_metric_url: String,
     pub os: &'static str,
     pub arch: &'static str,
 
@@ -146,7 +156,8 @@ pub struct Facts {
     pub syncing: Probe<SyncingStatus>,
     pub finality: Probe<FinalityCheckpoints>,
     pub peers: Probe<Vec<PeerInfo>>,
-    pub version: Probe<VersionInfo>,
+    pub bn_families: Probe<EndpointFamilies>,
+    pub vc_families: Probe<EndpointFamilies>,
     pub duties: Probe<DutiesMetrics>,
     pub validators: Probe<ValidatorMetrics>,
 
@@ -157,6 +168,9 @@ pub struct Facts {
     /// `Probe::Failed` (Docker was asked about a named container and did not
     /// answer).
     pub containers: Probe<Vec<ContainerState>>,
+    /// The same three-way distinction as `containers`, for the validator
+    /// container, and gated on `vc_stack` rather than `stack`.
+    pub vc_containers: Probe<Vec<ContainerState>>,
     pub disk: Option<Disk>,
     pub memory: Option<Memory>,
     pub load: Option<Load>,
@@ -172,7 +186,9 @@ pub struct Facts {
 pub fn evaluate(f: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
     check_beacon_api(f, &mut out);
-    check_metrics_endpoint(f, &mut out);
+    check_bn_metrics(f, &mut out);
+    check_vc_metrics(f, &mut out);
+    check_metrics_layout(f, &mut out);
     check_syncing(f, &mut out);
     check_finality(f, &mut out);
     check_peers(f, &mut out);
@@ -212,21 +228,104 @@ fn check_beacon_api(f: &Facts, out: &mut Vec<Finding>) {
     }
 }
 
-fn check_metrics_endpoint(f: &Facts, out: &mut Vec<Finding>) {
-    match &f.version {
-        Probe::Ok(v) => push(
+fn check_bn_metrics(f: &Facts, out: &mut Vec<Finding>) {
+    check_one_metrics_endpoint(
+        "beacon node metrics",
+        &f.bn_families,
+        &f.bn_metric_url,
+        |e| &e.beacon_versions,
+        out,
+    );
+}
+
+fn check_vc_metrics(f: &Facts, out: &mut Vec<Finding>) {
+    check_one_metrics_endpoint(
+        "validator metrics",
+        &f.vc_families,
+        &f.vc_metric_url,
+        |e| &e.validator_versions,
+        out,
+    );
+}
+
+/// One endpoint's check. Reachable-but-wrong is a Warn rather than a Fail: the
+/// node may be perfectly healthy and only tekops pointed somewhere odd, and
+/// `check_metrics_layout` below often has a specific explanation for it.
+fn check_one_metrics_endpoint(
+    name: &'static str,
+    probe: &Probe<EndpointFamilies>,
+    url: &str,
+    pick: fn(&EndpointFamilies) -> &Vec<String>,
+    out: &mut Vec<Finding>,
+) {
+    match probe {
+        Probe::Ok(e) if !pick(e).is_empty() => push(
             out,
-            "metrics endpoint",
+            name,
             Status::Pass,
-            format!("{} at {}", v.versions.join(", "), f.metric_url),
+            format!("{} at {url}", pick(e).join(", ")),
         ),
-        Probe::Failed(e) if f.version.is_unreachable() => {
-            push(out, "metrics endpoint", Status::Fail, e)
-        }
-        // Reachable but exporting nothing we recognize: almost always the
-        // beacon node's port where the validator client's was meant.
-        Probe::Failed(e) => push(out, "metrics endpoint", Status::Warn, e),
-        Probe::Skipped(why) => push(out, "metrics endpoint", Status::Fail, *why),
+        Probe::Ok(_) => push(
+            out,
+            name,
+            Status::Warn,
+            format!("{url} responded but exports no matching Teku version metric"),
+        ),
+        Probe::Failed(e) => push(out, name, Status::Fail, e),
+        Probe::Skipped(why) => push(out, name, Status::Fail, *why),
+    }
+}
+
+/// The two ways a metrics endpoint pair can be wrong that tekops can name.
+///
+/// Both read which families each endpoint actually exports, and that is what
+/// tells them apart: a process serving both roles exports the beacon families
+/// *and* the validator ones, while a validator client exports only the
+/// validator ones. So the pair is mutually exclusive by construction, and
+/// `the_two_layout_diagnostics_are_mutually_exclusive` pins that.
+///
+/// Nothing is repointed automatically. A heuristic that silently moved an
+/// operator's endpoint would be the same class of mistake `require_metric`
+/// exists to prevent, so this only ever advises.
+fn check_metrics_layout(f: &Facts, out: &mut Vec<Finding>) {
+    let Probe::Ok(bn) = &f.bn_families else {
+        return;
+    };
+    // `has_validator_families` alone is too narrow a gate: a validator client
+    // with no keys loaded exports no children of `validator_local_validator_counts`
+    // at all - this repo's own absent-is-not-zero premise, already applied to
+    // the sibling balances family in `metrics.rs`. `validator_versions` is a
+    // second, independent signal of the same family that survives that case,
+    // so either one is enough to proceed.
+    if !bn.has_validator_families && bn.validator_versions.is_empty() {
+        return;
+    }
+
+    if bn.beacon_versions.is_empty() {
+        push(
+            out,
+            "metrics layout",
+            Status::Warn,
+            format!(
+                "{} is a validator client endpoint, not a beacon node one. \
+                 The unprefixed `metric_url` now means the beacon node; move \
+                 this value to `vc_metric_url` (or $TEKOPS_VC_METRIC_URL, or \
+                 --vc-metric-url).",
+                f.bn_metric_url
+            ),
+        );
+    } else if f.vc_families.is_unreachable() {
+        push(
+            out,
+            "metrics layout",
+            Status::Warn,
+            format!(
+                "{} exports both beacon and validator metrics and {} is \
+                 unreachable: this looks like an all-in-one deployment. Set \
+                 `vc_metric_url` to {}.",
+                f.bn_metric_url, f.vc_metric_url, f.bn_metric_url
+            ),
+        );
     }
 }
 
@@ -445,11 +544,25 @@ fn check_duties(f: &Facts, out: &mut Vec<Finding>) {
 }
 
 fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
+    check_consensus_container(f, out);
+    check_validator_container(f, out);
+    check_container_restarts(f, out);
+}
+
+/// Whether this stack has containers at all. Bare-metal has none, and a stack
+/// that is not known at all cannot be assumed to.
+fn stack_has_containers(stack: Option<Stack>) -> bool {
+    match stack {
+        Some(Stack::BareMetal) | None => false,
+        Some(Stack::EthDocker) | Some(Stack::RocketPool) => true,
+    }
+}
+
+fn check_consensus_container(f: &Facts, out: &mut Vec<Finding>) {
     // The question does not apply on bare-metal (or when the stack itself is
     // unknown): there is no container to inspect.
-    match f.stack {
-        Some(Stack::BareMetal) | None => return,
-        Some(Stack::EthDocker) | Some(Stack::RocketPool) => {}
+    if !stack_has_containers(f.stack) {
+        return;
     }
 
     // Unlike bare-metal, an empty listing on a Docker stack is itself the
@@ -475,6 +588,31 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
         Probe::Skipped(why) => return push(out, "consensus container", Status::Fail, *why),
     };
 
+    push_up_or_down(containers, "consensus container", out);
+}
+
+/// The validator container's own row, on a deployment that has one.
+///
+/// Where the consensus check reads "none found" as a failure, this one reads
+/// it as silence: `probe` hands back `Skipped` when no separate validator
+/// container was detected, which is the ordinary combined deployment rather
+/// than a fault. So this row appears exactly when there is a second container
+/// to judge, which is also the only case where it tells the operator something
+/// the consensus row did not.
+fn check_validator_container(f: &Facts, out: &mut Vec<Finding>) {
+    if !stack_has_containers(f.vc_stack) {
+        return;
+    }
+    match &f.vc_containers {
+        Probe::Ok(v) if v.is_empty() => {}
+        Probe::Ok(v) => push_up_or_down(v, "validator container", out),
+        Probe::Failed(e) => push(out, "validator container", Status::Fail, e),
+        Probe::Skipped(_) => {}
+    }
+}
+
+/// One container row: every container up, or the ones that are not.
+fn push_up_or_down(containers: &[ContainerState], name: &'static str, out: &mut Vec<Finding>) {
     let stopped: Vec<&str> = containers
         .iter()
         .filter(|c| !c.running)
@@ -482,22 +620,40 @@ fn check_containers(f: &Facts, out: &mut Vec<Finding>) {
         .collect();
     if stopped.is_empty() {
         let names: Vec<&str> = containers.iter().map(|c| c.name.as_str()).collect();
-        push(
-            out,
-            "consensus container",
-            Status::Pass,
-            format!("{} up", names.join(", ")),
-        );
+        push(out, name, Status::Pass, format!("{} up", names.join(", ")));
     } else {
         push(
             out,
-            "consensus container",
+            name,
             Status::Fail,
             format!("not running: {}", stopped.join(", ")),
         );
     }
+}
 
-    let worst = containers.iter().max_by_key(|c| c.restart_count);
+/// One restart row for the whole deployment, not one per container.
+///
+/// The detail names the container it is talking about, so a second row would
+/// repeat the label without adding a fact - and the question an operator is
+/// asking here is "is anything restart-looping", which has one answer however
+/// many containers were inspected.
+///
+/// Each side is gated on its own stack, not on its list being non-empty. A
+/// bare-metal operator has no restart count and must never be shown a row
+/// about one, however the list they arrive with got populated.
+fn check_container_restarts(f: &Facts, out: &mut Vec<Finding>) {
+    let bn = stack_has_containers(f.stack)
+        .then(|| f.containers.ok())
+        .flatten();
+    let vc = stack_has_containers(f.vc_stack)
+        .then(|| f.vc_containers.ok())
+        .flatten();
+
+    let worst = bn
+        .into_iter()
+        .chain(vc)
+        .flatten()
+        .max_by_key(|c| c.restart_count);
     if let Some(c) = worst {
         let status = if c.restart_count >= RESTARTS_FAIL_AT {
             Status::Fail
@@ -574,11 +730,20 @@ fn gib(bytes: u64) -> String {
 }
 
 pub struct ProbeConfig {
+    /// The beacon node's stack: what answers the Beacon API, the beacon-node
+    /// metrics endpoint and the disk target.
     pub stack: Option<Stack>,
+    /// The validator client's stack, which is not always the same one. A
+    /// Rocket Pool node in External Consensus Client mode is `RocketPool`
+    /// here and `BareMetal` above.
+    pub vc_stack: Option<Stack>,
     pub api_url: String,
-    pub metric_url: String,
+    pub bn_metric_url: String,
+    pub vc_metric_url: String,
     /// The consensus container to inspect, when there is one.
     pub container: Option<String>,
+    /// The validator container to inspect, when there is one.
+    pub vc_container: Option<String>,
     /// Bare-metal disk target. On a Docker stack the container's own mounts
     /// answer this, and a value here overrides them (flags beat detection).
     pub data_dir: Option<PathBuf>,
@@ -610,27 +775,43 @@ pub fn probe(cfg: &ProbeConfig) -> Facts {
         )
     };
 
-    let mc = MetricsClient::new(cfg.metric_url.clone());
-    let version = Probe::from_result(mc.version());
-    let (duties, validators) = if version.is_unreachable() {
+    let bn_families = Probe::from_result(MetricsClient::new(cfg.bn_metric_url.clone()).families());
+
+    // Equal URLs mean one process serving both families. Scrape once and hand
+    // the same answer to both slots rather than asking the same endpoint
+    // twice: `EndpointFamilies` is `Clone` precisely for this.
+    let vc_mc = MetricsClient::new(cfg.vc_metric_url.clone());
+    let vc_families = if cfg.bn_metric_url == cfg.vc_metric_url {
+        match &bn_families {
+            Probe::Ok(f) => Probe::Ok(f.clone()),
+            Probe::Failed(e) => Probe::Failed(e.clone()),
+            Probe::Skipped(s) => Probe::Skipped(s),
+        }
+    } else {
+        Probe::from_result(vc_mc.families())
+    };
+
+    let (duties, validators) = if vc_families.is_unreachable() {
         (Probe::Skipped(METRICS_DOWN), Probe::Skipped(METRICS_DOWN))
     } else {
         (
-            Probe::from_result(mc.duties()),
-            Probe::from_result(mc.validators()),
+            Probe::from_result(vc_mc.duties()),
+            Probe::from_result(vc_mc.validators()),
         )
     };
 
-    // `Probe`, not a bare Vec: an empty list on a Docker stack means "docker
-    // was asked and matched nothing", which is a reportable failure, and it
-    // must stay distinguishable from bare-metal's "there was never anything
-    // to list" - the two are told apart by `cfg.stack`, not by
-    // `cfg.container` alone, since a Docker stack whose detection found
-    // nothing also arrives with `cfg.container: None`.
-    let containers: Probe<Vec<ContainerState>> = match (cfg.stack, cfg.container.as_deref()) {
-        (Some(Stack::BareMetal), _) | (None, _) => Probe::Skipped(NO_CONTAINER),
-        (_, None) => Probe::Ok(vec![]),
-        (_, Some(name)) => match inspect_container(name) {
+    let containers = inspect_for_stack(cfg.stack, cfg.container.as_deref());
+
+    // Not `inspect_for_stack`: absent means something different here. Every
+    // Docker deployment has a consensus container, so none found is a
+    // reportable failure - but the ordinary combined deployment runs the
+    // validator inside that same container and has no second one to find.
+    // Reporting that as missing would be a false alarm on the commonest
+    // layout there is, so an unfound validator container is a question that
+    // does not apply rather than an answer of no. Absent is not zero.
+    let vc_containers = match cfg.vc_container.as_deref() {
+        None => Probe::Skipped(NO_VALIDATOR_CONTAINER),
+        Some(name) => match inspect_container(name) {
             Some(c) => Probe::Ok(vec![c]),
             None => Probe::Failed(crate::term::sanitize(&format!(
                 "docker inspect {name} failed or returned nothing"
@@ -651,22 +832,49 @@ pub fn probe(cfg: &ProbeConfig) -> Facts {
 
     Facts {
         stack: cfg.stack,
+        vc_stack: cfg.vc_stack,
         api_url: cfg.api_url.clone(),
-        metric_url: cfg.metric_url.clone(),
+        bn_metric_url: cfg.bn_metric_url.clone(),
+        vc_metric_url: cfg.vc_metric_url.clone(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         health,
         syncing,
         finality,
         peers,
-        version,
+        bn_families,
+        vc_families,
         duties,
         validators,
         containers,
+        vc_containers,
         disk: host.disk,
         memory: host.memory,
         load: host.load,
         cpus: host.cpus,
+    }
+}
+
+/// One stack's container, inspected if there is one to inspect.
+///
+/// `Probe`, not a bare Vec: an empty list on a Docker stack means "docker was
+/// asked and matched nothing", which is a reportable failure, and it must stay
+/// distinguishable from bare-metal's "there was never anything to list" - the
+/// two are told apart by the stack, not by the name alone, since a Docker
+/// stack whose detection found nothing also arrives with `None`.
+///
+/// Takes its stack as a parameter rather than reading `cfg.stack`, because the
+/// beacon node and the validator client are not always on the same one.
+fn inspect_for_stack(stack: Option<Stack>, name: Option<&str>) -> Probe<Vec<ContainerState>> {
+    match (stack, name) {
+        (Some(Stack::BareMetal), _) | (None, _) => Probe::Skipped(NO_CONTAINER),
+        (_, None) => Probe::Ok(vec![]),
+        (_, Some(name)) => match inspect_container(name) {
+            Some(c) => Probe::Ok(vec![c]),
+            None => Probe::Failed(crate::term::sanitize(&format!(
+                "docker inspect {name} failed or returned nothing"
+            ))),
+        },
     }
 }
 
@@ -682,7 +890,6 @@ fn inspect_container(name: &str) -> Option<ContainerState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::VersionInfo;
     use std::collections::BTreeMap;
 
     fn syncing(is_syncing: bool, distance: &str) -> SyncingStatus {
@@ -699,8 +906,10 @@ mod tests {
     fn healthy() -> Facts {
         Facts {
             stack: Some(Stack::BareMetal),
+            vc_stack: Some(Stack::BareMetal),
             api_url: "http://localhost:5051".to_string(),
-            metric_url: "http://localhost:8010/metrics".to_string(),
+            bn_metric_url: "http://localhost:8008/metrics".to_string(),
+            vc_metric_url: "http://localhost:8010/metrics".to_string(),
             os: "linux",
             arch: "x86_64",
             health: Probe::Ok(HealthState::Ready),
@@ -711,8 +920,15 @@ mod tests {
                 finalized_epoch: "98".to_string(),
             }),
             peers: Probe::Ok(peers(30)),
-            version: Probe::Ok(VersionInfo {
-                versions: vec!["teku/v25.1.0".to_string()],
+            bn_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec!["teku/v25.1.0".to_string()],
+                validator_versions: vec![],
+                has_validator_families: false,
+            }),
+            vc_families: Probe::Ok(EndpointFamilies {
+                beacon_versions: vec![],
+                validator_versions: vec!["teku/v25.1.0".to_string()],
+                has_validator_families: true,
             }),
             duties: Probe::Ok(DutiesMetrics {
                 published_blocks: 1,
@@ -725,6 +941,7 @@ mod tests {
                 total_eth: Some(4544.0),
             }),
             containers: Probe::Skipped(NO_CONTAINER),
+            vc_containers: Probe::Skipped(NO_VALIDATOR_CONTAINER),
             disk: Some(Disk {
                 available_bytes: 400 * GIB,
                 mount_point: "/var/lib/teku".to_string(),
@@ -744,6 +961,14 @@ mod tests {
 
     fn status_of(fs: &[Finding], name: &str) -> Option<Status> {
         fs.iter().find(|f| f.name == name).map(|f| f.status)
+    }
+
+    fn detail_of<'a>(fs: &'a [Finding], name: &str) -> &'a str {
+        fs.iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no finding named {name}"))
+            .detail
+            .as_str()
     }
 
     fn peers(n: usize) -> Vec<PeerInfo> {
@@ -1132,9 +1357,105 @@ mod tests {
     fn bare_metal_omits_both_container_checks() {
         let mut f = healthy();
         f.containers = Probe::Ok(vec![container("some-unrelated-container", true, 0)]);
+        f.vc_containers = Probe::Ok(vec![container("another-unrelated-one", true, 3)]);
         let got = evaluate(&f);
         assert!(status_of(&got, "consensus container").is_none());
+        assert!(status_of(&got, "validator container").is_none());
         assert!(status_of(&got, "container restarts").is_none());
+    }
+
+    // --- separated deployments ---
+
+    /// A Rocket Pool validator against a beacon node Rocket Pool did not
+    /// start. The validator container is the only one on the host, and used
+    /// to go unchecked entirely: the whole report was gated on a single
+    /// stack, which resolved to bare-metal.
+    #[test]
+    fn a_validator_container_is_checked_even_when_the_beacon_node_is_bare_metal() {
+        let mut f = healthy();
+        f.stack = Some(Stack::BareMetal);
+        f.vc_stack = Some(Stack::RocketPool);
+        f.vc_containers = Probe::Ok(vec![container("rocketpool_validator", true, 0)]);
+
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "validator container"), Some(Status::Pass));
+        assert!(detail_of(&got, "validator container").contains("rocketpool_validator"));
+        // The beacon node is bare-metal and still has no container to check.
+        assert!(status_of(&got, "consensus container").is_none());
+    }
+
+    #[test]
+    fn a_stopped_validator_container_fails() {
+        let mut f = healthy();
+        f.stack = Some(Stack::BareMetal);
+        f.vc_stack = Some(Stack::RocketPool);
+        f.vc_containers = Probe::Ok(vec![container("rocketpool_validator", false, 0)]);
+
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "validator container"), Some(Status::Fail));
+        assert!(detail_of(&got, "validator container").contains("not running"));
+    }
+
+    /// The commonest layout there is: one container running both processes.
+    /// `probe` reports no *separate* validator container, and a row saying so
+    /// would be a false alarm on a node with nothing wrong with it.
+    #[test]
+    fn a_combined_deployment_gets_no_validator_container_row() {
+        let mut f = healthy();
+        f.stack = Some(Stack::EthDocker);
+        f.vc_stack = Some(Stack::EthDocker);
+        f.containers = Probe::Ok(vec![container("eth-docker-consensus-1", true, 0)]);
+        f.vc_containers = Probe::Skipped(NO_VALIDATOR_CONTAINER);
+
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "consensus container"), Some(Status::Pass));
+        assert!(status_of(&got, "validator container").is_none());
+    }
+
+    /// One restart row, whichever container is the one looping - including
+    /// when the only container on the host is the validator.
+    #[test]
+    fn the_restart_row_reports_the_worst_container_of_either_process() {
+        let mut f = healthy();
+        f.stack = Some(Stack::EthDocker);
+        f.vc_stack = Some(Stack::EthDocker);
+        f.containers = Probe::Ok(vec![container("eth-docker-consensus-1", true, 1)]);
+        f.vc_containers = Probe::Ok(vec![container("eth-docker-validator-1", true, 9)]);
+
+        let got = evaluate(&f);
+        assert_eq!(
+            got.iter()
+                .filter(|x| x.name == "container restarts")
+                .count(),
+            1,
+            "one row for the deployment, not one per container"
+        );
+        assert!(detail_of(&got, "container restarts").contains("eth-docker-validator-1"));
+    }
+
+    #[test]
+    fn a_bare_metal_beacon_node_still_reports_its_validator_containers_restarts() {
+        let mut f = healthy();
+        f.stack = Some(Stack::BareMetal);
+        f.vc_stack = Some(Stack::RocketPool);
+        f.vc_containers = Probe::Ok(vec![container("rocketpool_validator", true, 2)]);
+
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "container restarts"), Some(Status::Warn));
+        assert!(detail_of(&got, "container restarts").contains("rocketpool_validator"));
+    }
+
+    /// Docker answering about a named validator container with nothing is a
+    /// failure, not the silence a combined deployment produces.
+    #[test]
+    fn a_validator_container_docker_will_not_describe_fails() {
+        let mut f = healthy();
+        f.stack = Some(Stack::BareMetal);
+        f.vc_stack = Some(Stack::RocketPool);
+        f.vc_containers = Probe::Failed("docker inspect rocketpool_validator failed".to_string());
+
+        let got = evaluate(&f);
+        assert_eq!(status_of(&got, "validator container"), Some(Status::Fail));
     }
 
     #[test]
@@ -1295,54 +1616,196 @@ mod tests {
         assert_eq!(status_of(&evaluate(&f), "peer count"), Some(Status::Warn));
     }
 
-    // --- metrics endpoint ---
+    // --- bn/vc metrics ---
     //
     // The only genuinely non-obvious status logic in the module: unreachable
     // is Fail, but reachable-and-erroring is Warn, since that almost always
-    // means the scrape is pointed at the beacon node's port rather than the
-    // validator client's - a misconfiguration, not an outage.
+    // means the scrape is pointed at the wrong process - a misconfiguration,
+    // not an outage. `check_metrics_layout` below often names the reason.
+
+    fn families(beacon: &[&str], validator: &[&str], has_vc: bool) -> EndpointFamilies {
+        EndpointFamilies {
+            beacon_versions: beacon.iter().map(|s| s.to_string()).collect(),
+            validator_versions: validator.iter().map(|s| s.to_string()).collect(),
+            has_validator_families: has_vc,
+        }
+    }
+
+    fn finding<'a>(findings: &'a [Finding], name: &str) -> Option<&'a Finding> {
+        findings.iter().find(|f| f.name == name)
+    }
 
     #[test]
-    fn metrics_endpoint_passes_when_a_version_is_reported() {
+    fn bn_metrics_passes_when_a_version_is_reported() {
         let f = healthy();
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Pass)
         );
     }
 
     #[test]
-    fn metrics_endpoint_fails_when_unreachable() {
+    fn bn_metrics_fails_when_unreachable() {
         let mut f = healthy();
-        f.version = Probe::Failed("could not reach endpoint: refused".to_string());
+        f.bn_families = Probe::Failed("could not reach endpoint: refused".to_string());
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Fail)
         );
     }
 
     #[test]
-    fn metrics_endpoint_warns_when_reachable_but_missing_the_metric() {
+    fn bn_metrics_warns_when_reachable_but_missing_the_metric() {
         let mut f = healthy();
-        f.version = Probe::Failed(
-            "metric beacon_teku_version_total not found at http://localhost:8010/metrics \
-             - the endpoint responded but exports no such metric"
-                .to_string(),
-        );
+        f.bn_families = Probe::Ok(families(&[], &[], false));
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Warn)
         );
     }
 
     #[test]
-    fn metrics_endpoint_fails_when_skipped() {
+    fn bn_metrics_fails_when_skipped() {
         let mut f = healthy();
-        f.version = Probe::Skipped("beacon api unreachable");
+        f.bn_families = Probe::Skipped("beacon api unreachable");
         assert_eq!(
-            status_of(&evaluate(&f), "metrics endpoint"),
+            status_of(&evaluate(&f), "beacon node metrics"),
             Some(Status::Fail)
         );
+    }
+
+    #[test]
+    fn both_metrics_endpoints_are_checked_separately() {
+        let findings = evaluate(&healthy());
+        assert!(finding(&findings, "beacon node metrics").is_some());
+        assert!(finding(&findings, "validator metrics").is_some());
+    }
+
+    #[test]
+    fn a_dead_validator_endpoint_does_not_fail_the_beacon_one() {
+        let mut f = healthy();
+        f.vc_families = Probe::Failed("could not reach endpoint".to_string());
+        let findings = evaluate(&f);
+        assert_eq!(
+            finding(&findings, "beacon node metrics").unwrap().status,
+            Status::Pass
+        );
+        assert_eq!(
+            finding(&findings, "validator metrics").unwrap().status,
+            Status::Fail
+        );
+    }
+
+    /// One process exporting both families, with nothing on the validator
+    /// port. eth-docker's `teku-allin1.yml` produces exactly this, and its
+    /// defaults (8008 and 8009) are not equal, so nothing else catches it.
+    #[test]
+    fn an_all_in_one_deployment_is_recognised_and_named() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&["teku/v25.4.1"], &["teku/v25.4.1"], true));
+        f.vc_families = Probe::Failed("could not reach endpoint".to_string());
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(layout.detail.contains("all-in-one"), "{}", layout.detail);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+    }
+
+    /// A validator endpoint sitting in the beacon node's slot. No correct
+    /// configuration produces this, so it is almost always a config written
+    /// when `metric_url` still meant the validator client.
+    #[test]
+    fn a_validator_endpoint_in_the_beacon_slot_is_recognised_and_named() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], true));
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+        assert!(
+            !layout.detail.contains("all-in-one"),
+            "must not be confused with an all-in-one deployment: {}",
+            layout.detail
+        );
+    }
+
+    /// A validator client with no keys loaded exports none of
+    /// `validator_local_validator_counts`'s children, so `has_validator_families`
+    /// is false even though the process is unmistakably a validator client:
+    /// `beacon_versions` is empty and `validator_versions` is populated. The
+    /// old `!bn.has_validator_families` gate returned before looking at
+    /// either, which is exactly the absent-is-not-zero bug this repo already
+    /// avoids for the sibling balances family.
+    #[test]
+    fn a_keyless_validator_endpoint_in_the_beacon_slot_is_still_recognised() {
+        let mut f = healthy();
+        f.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], false));
+        let findings = evaluate(&f);
+        let layout = finding(&findings, "metrics layout").expect("expected a layout finding");
+        assert_eq!(layout.status, Status::Warn);
+        assert!(
+            layout.detail.contains("vc_metric_url"),
+            "must name the fix: {}",
+            layout.detail
+        );
+    }
+
+    /// The property that makes two diagnostics worth having rather than one:
+    /// an all-in-one process exports the beacon families too, and a validator
+    /// client does not.
+    #[test]
+    fn the_two_layout_diagnostics_are_mutually_exclusive() {
+        let mut all_in_one = healthy();
+        all_in_one.bn_families = Probe::Ok(families(&["teku/v25.4.1"], &["teku/v25.4.1"], true));
+        all_in_one.vc_families = Probe::Failed("could not reach endpoint".to_string());
+
+        let mut misdirected = healthy();
+        misdirected.bn_families = Probe::Ok(families(&[], &["teku/v25.4.1"], true));
+
+        let all_in_one_findings = evaluate(&all_in_one);
+        let misdirected_findings = evaluate(&misdirected);
+
+        // `finding()` returns the first match by name, so on its own it can't
+        // tell "exactly one fired" from "both fired and this is the first" -
+        // asserting the count closes that gap.
+        assert_eq!(
+            all_in_one_findings
+                .iter()
+                .filter(|f| f.name == "metrics layout")
+                .count(),
+            1
+        );
+        assert_eq!(
+            misdirected_findings
+                .iter()
+                .filter(|f| f.name == "metrics layout")
+                .count(),
+            1
+        );
+
+        let a = finding(&all_in_one_findings, "metrics layout")
+            .unwrap()
+            .detail
+            .clone();
+        let b = finding(&misdirected_findings, "metrics layout")
+            .unwrap()
+            .detail
+            .clone();
+        assert_ne!(a, b, "the two shapes must produce different advice");
+    }
+
+    /// A correctly configured separated deployment says nothing about layout.
+    #[test]
+    fn a_healthy_separated_deployment_produces_no_layout_finding() {
+        assert!(finding(&evaluate(&healthy()), "metrics layout").is_none());
     }
 
     // --- probe ---
@@ -1363,8 +1826,11 @@ mod tests {
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_stack: Some(Stack::BareMetal),
             container: None,
+            vc_container: None,
             data_dir: None,
         };
 
@@ -1380,7 +1846,7 @@ mod tests {
         assert!(matches!(f.syncing, Probe::Skipped(_)));
         assert!(matches!(f.finality, Probe::Skipped(_)));
         assert!(matches!(f.peers, Probe::Skipped(_)));
-        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(matches!(f.bn_families, Probe::Failed(_)));
         assert!(matches!(f.duties, Probe::Skipped(_)));
         assert!(matches!(f.validators, Probe::Skipped(_)));
     }
@@ -1389,9 +1855,12 @@ mod tests {
     fn probe_records_the_urls_it_used_so_findings_can_name_them() {
         let cfg = ProbeConfig {
             stack: Some(Stack::EthDocker),
+            vc_stack: Some(Stack::EthDocker),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
             container: None,
+            vc_container: None,
             data_dir: None,
         };
         let f = probe(&cfg);
@@ -1407,9 +1876,12 @@ mod tests {
         for stack in [Stack::EthDocker, Stack::RocketPool] {
             let cfg = ProbeConfig {
                 stack: Some(stack),
+                vc_stack: Some(stack),
                 api_url: "http://127.0.0.1:1".to_string(),
-                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
                 container: None,
+                vc_container: None,
                 data_dir: None,
             };
             let f = probe(&cfg);
@@ -1429,9 +1901,12 @@ mod tests {
         for stack in [Some(Stack::BareMetal), None] {
             let cfg = ProbeConfig {
                 stack,
+                vc_stack: stack,
                 api_url: "http://127.0.0.1:1".to_string(),
-                metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+                vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
                 container: None,
+                vc_container: None,
                 data_dir: None,
             };
             let f = probe(&cfg);
@@ -1482,9 +1957,12 @@ mod tests {
 
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
+            vc_stack: Some(Stack::BareMetal),
             api_url: server.url(),
-            metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_metric_url: "http://127.0.0.1:1/metrics".to_string(),
             container: None,
+            vc_container: None,
             data_dir: None,
         };
         let f = probe(&cfg);
@@ -1508,14 +1986,17 @@ mod tests {
     }
 
     /// Same reasoning as `a_beacon_api_error_that_is_not_unreachable_does_not_skip_the_rest`,
-    /// for the metrics side. A scrape that responds 200 but exports none of
-    /// the version metric families is `ApiError::Malformed` (via
-    /// `require_metric`/`version`'s own check), not `Unreachable`, and must
-    /// not skip `duties`/`validators` - the body below deliberately includes
-    /// the metrics those two calls need, so a skip would be visible as a
-    /// missing `Probe::Ok`.
+    /// for the metrics side, adapted to `families`: unlike the old `version`,
+    /// a reachable scrape exporting none of the families tekops looks for is
+    /// `Probe::Ok` with empty vecs rather than a failure (that is the point of
+    /// `families` reporting emptiness instead of erroring - see
+    /// `families_reports_emptiness_rather_than_failing_on_a_foreign_endpoint`
+    /// in `metrics.rs`). So the short-circuit here only has real unreachability
+    /// to key off, and the body below deliberately includes the metrics
+    /// `duties`/`validators` need, so a wrongly-skipped call would be visible
+    /// as a missing `Probe::Ok`.
     #[test]
-    fn a_metrics_error_that_is_not_unreachable_does_not_skip_the_rest() {
+    fn a_reachable_but_unrecognised_metrics_endpoint_does_not_skip_the_rest() {
         let mut server = mockito::Server::new();
         let body = r#"
 validator_beacon_node_requests_total{method="publish_block",outcome="success"} 1
@@ -1531,21 +2012,24 @@ validator_local_validator_balances{pubkey="0x1"} 32000000000
         let cfg = ProbeConfig {
             stack: Some(Stack::BareMetal),
             api_url: "http://127.0.0.1:1".to_string(),
-            metric_url: format!("{}/metrics", server.url()),
+            bn_metric_url: "http://127.0.0.1:1/metrics".to_string(),
+            vc_stack: Some(Stack::BareMetal),
+            vc_metric_url: format!("{}/metrics", server.url()),
             container: None,
+            vc_container: None,
             data_dir: None,
         };
         let f = probe(&cfg);
 
-        assert!(matches!(f.version, Probe::Failed(_)));
+        assert!(matches!(f.vc_families, Probe::Ok(_)));
         assert!(
             !matches!(f.duties, Probe::Skipped(_)),
-            "duties was skipped on a non-unreachable version failure: {:?}",
+            "duties was skipped on a reachable, merely unrecognised, endpoint: {:?}",
             f.duties
         );
         assert!(
             !matches!(f.validators, Probe::Skipped(_)),
-            "validators was skipped on a non-unreachable version failure: {:?}",
+            "validators was skipped on a reachable, merely unrecognised, endpoint: {:?}",
             f.validators
         );
     }

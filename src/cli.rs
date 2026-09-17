@@ -8,6 +8,7 @@ use crate::loglevel::{
     self, resolve_log_level_target, LogLevelError, LogLevelSpec, LogLevelTarget,
 };
 use crate::logs::run_logs;
+use crate::merge::Source;
 use crate::metrics::MetricsClient;
 use crate::output::{
     format_about, format_doctor_report, format_duties_table, format_head_table,
@@ -15,7 +16,7 @@ use crate::output::{
     format_validator_metrics_table, format_version_table, PeerRow,
 };
 use crate::protocol::classify_protocol;
-use crate::stack::{detect_stack, DetectError, Stack};
+use crate::stack::{detect_stack, detect_validator_stack, DetectError, Stack};
 use crate::term::sanitize;
 use crate::update::{self, resolve_update_target, UpdateError, UpdateTarget};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -64,12 +65,52 @@ struct ApiArgs {
     json: bool,
 }
 
-/// The Prometheus scrape flags, shared by every command that reads metrics.
+/// The Prometheus scrape flags for `version`, the one command that reads
+/// both processes.
+///
+/// `Duties` and `Validators` flatten `VcMetricArgs` instead: the beacon-node
+/// spellings here (`--bn-metric-url` and the legacy `--metric-url`) name an
+/// endpoint those two commands never read, so accepting them would mean
+/// parsing successfully and doing nothing - clap rejects them there rather
+/// than silently discarding them.
 #[derive(clap::Args)]
 struct MetricArgs {
-    /// Prometheus metrics URL (default: http://localhost:8010/metrics, or $TEKOPS_METRIC_URL)
+    /// Beacon node Prometheus metrics URL (or $TEKOPS_BN_METRIC_URL)
     #[arg(long)]
+    bn_metric_url: Option<String>,
+    /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+    #[arg(long)]
+    vc_metric_url: Option<String>,
+    /// Deprecated alias for --bn-metric-url (or $TEKOPS_METRIC_URL)
+    //
+    // Hidden rather than removed: existing scripts and rc files still say it.
+    // `conflicts_with` because the two name one endpoint, so accepting both
+    // would mean silently honouring one and dropping the other.
+    #[arg(long, hide = true, conflicts_with = "bn_metric_url")]
     metric_url: Option<String>,
+    /// Deployment to take port defaults from (or $TEKOPS_STACK)
+    #[arg(long)]
+    stack: Option<Stack>,
+    /// Print a JSON-serialized summary instead of a formatted table
+    #[arg(long)]
+    json: bool,
+}
+
+/// The Prometheus scrape flags for `duties` and `validators`, which read only
+/// the validator client and have no use for a beacon node URL.
+///
+/// This is deliberately not `MetricArgs`: that struct also accepts
+/// `--bn-metric-url` and the legacy `--metric-url`, and before this branch
+/// the legacy spelling was *the* way to steer these two commands. Now that it
+/// means the beacon node (matching `--api-url`), silently reading it here
+/// would scrape the wrong process while exiting zero. Rejecting it is the
+/// better failure: clap's error names `--vc-metric-url`, which is exactly the
+/// migration an old script or rc file needs.
+#[derive(clap::Args)]
+struct VcMetricArgs {
+    /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+    #[arg(long)]
+    vc_metric_url: Option<String>,
     /// Deployment to take port defaults from (or $TEKOPS_STACK)
     #[arg(long)]
     stack: Option<Stack>,
@@ -94,6 +135,22 @@ enum Commands {
         /// Docker container to read logs from (or $TEKOPS_CONTAINER)
         #[arg(long)]
         container: Option<String>,
+        /// Docker container the validator client logs to (or $TEKOPS_VC_CONTAINER)
+        //
+        // Naming a container fully determines that slot, so a file for the
+        // same slot is meaningless - the same reasoning behind `path`
+        // conflicting with `--container`.
+        #[arg(long, conflicts_with = "vc_logs_file")]
+        vc_container: Option<String>,
+        /// Log file the validator client writes (or $TEKOPS_VC_LOGS_FILE)
+        #[arg(long)]
+        vc_logs_file: Option<PathBuf>,
+        /// Show only the beacon node's log
+        #[arg(long, conflicts_with = "vc")]
+        bn: bool,
+        /// Show only the validator client's log
+        #[arg(long)]
+        vc: bool,
         /// Deployment to narrow container detection to (or $TEKOPS_STACK)
         #[arg(long)]
         stack: Option<Stack>,
@@ -124,6 +181,18 @@ enum Commands {
         /// Docker container to read logs from (or $TEKOPS_CONTAINER)
         #[arg(long)]
         container: Option<String>,
+        /// Docker container the validator client logs to (or $TEKOPS_VC_CONTAINER)
+        #[arg(long, conflicts_with = "vc_logs_file")]
+        vc_container: Option<String>,
+        /// Log file the validator client writes (or $TEKOPS_VC_LOGS_FILE)
+        #[arg(long)]
+        vc_logs_file: Option<PathBuf>,
+        /// Dump only the beacon node's log
+        #[arg(long, conflicts_with = "vc")]
+        bn: bool,
+        /// Dump only the validator client's log
+        #[arg(long)]
+        vc: bool,
         /// Deployment to narrow container detection to (or $TEKOPS_STACK)
         #[arg(long)]
         stack: Option<Stack>,
@@ -146,15 +215,15 @@ enum Commands {
     /// Published blocks, attestations, sync committee messages, and aggregates
     Duties {
         #[command(flatten)]
-        metrics: MetricArgs,
+        metrics: VcMetricArgs,
     },
     /// Validator key counts by status, and total locally-stated ETH balance
     Validators {
         #[command(flatten)]
-        metrics: MetricArgs,
+        metrics: VcMetricArgs,
     },
-    /// Running Teku version, read from the beacon node or validator client
-    /// metrics (whichever is present on the scrape)
+    /// Running Teku version, read from both the beacon node and the
+    /// validator client metrics, reported as two independent rows
     Version {
         #[command(flatten)]
         metrics: MetricArgs,
@@ -203,12 +272,18 @@ enum Commands {
     Doctor {
         #[command(flatten)]
         api: ApiArgs,
-        /// Prometheus metrics URL (or $TEKOPS_METRIC_URL)
+        /// Beacon node Prometheus metrics URL (or $TEKOPS_BN_METRIC_URL)
         //
         // Declared here rather than by flattening `MetricArgs`: that struct
         // also declares `stack` and `json`, and flattening both is a duplicate
         // arg id, which clap turns into a panic at startup.
         #[arg(long)]
+        bn_metric_url: Option<String>,
+        /// Validator client Prometheus metrics URL (or $TEKOPS_VC_METRIC_URL)
+        #[arg(long)]
+        vc_metric_url: Option<String>,
+        /// Deprecated alias for --bn-metric-url (or $TEKOPS_METRIC_URL)
+        #[arg(long, hide = true, conflicts_with = "bn_metric_url")]
         metric_url: Option<String>,
         /// Filesystem to check for free space (or $TEKOPS_DATA_DIR)
         //
@@ -250,33 +325,69 @@ pub fn run() -> ExitCode {
             path,
             lines,
             container,
+            vc_container,
+            vc_logs_file,
+            bn,
+            vc,
             stack,
         } => {
             // Detection only runs when nothing else has answered - see
             // `needs_detection`.
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
-            let detected = if needs_detection(
+            let vc_container_env = env::var("TEKOPS_VC_CONTAINER").ok();
+            let vc_logs_file_env = env::var("TEKOPS_VC_LOGS_FILE").ok();
+            let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
+            // One `docker ps`, read for both roles - the same shape
+            // `doctor_probe_config` uses. `logs` reads both slots, so it
+            // passes `true` - see `needs_detection`'s `consumes_vc`.
+            let ps = needs_detection(
                 path.as_ref(),
                 container.as_ref(),
+                vc_container.as_ref(),
+                vc_logs_file.as_ref(),
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
+                vc_container_env.as_ref(),
+                vc_logs_file_env.as_ref(),
+                true,
                 &cfg,
-            ) {
-                let only = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-                docker_ps_names(should_report_unaskable_docker(only))
-                    .and_then(|ps| detect_or_note(&ps, only).map(|(_, name)| name))
-            } else {
-                None
-            };
-            run_logs(
-                path,
-                lines,
-                container,
-                cfg.container.clone(),
-                cfg.logs_file.clone(),
-                detected,
             )
+            .then(|| docker_ps_names(should_report_unaskable_docker(only)))
+            .flatten();
+            let detected_bn = ps
+                .as_deref()
+                .and_then(|ps| detect_or_note(ps, only))
+                .map(|(_, name)| name);
+            let detected_vc = ps
+                .as_deref()
+                .and_then(|ps| detect_validator_or_note(ps, only))
+                .map(|(_, name)| name);
+
+            let select = selector(bn, vc);
+            let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+                path,
+                container_flag: container,
+                vc_container_flag: vc_container,
+                vc_logs_file_flag: vc_logs_file,
+                container_env,
+                logs_file_env,
+                vc_container_env,
+                vc_logs_file_env,
+                container_cfg: cfg.container.clone(),
+                logs_file_cfg: cfg.logs_file.clone(),
+                vc_container_cfg: cfg.vc_container.clone(),
+                vc_logs_file_cfg: cfg.vc_logs_file.clone(),
+                detected_bn,
+                detected_vc,
+                default_log_present: default_teku_log_present(),
+                select,
+            });
+            if let Err(e) = check_selection(&sources, select) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            run_logs(sources, lines)
         }
         Commands::DumpLogs {
             path,
@@ -287,51 +398,93 @@ pub fn run() -> ExitCode {
             header,
             doctor,
             container,
+            vc_container,
+            vc_logs_file,
+            bn,
+            vc,
             stack,
         } => {
             // The same detection gate `logs` uses - see `needs_detection`.
             let logs_file_env = env::var("TEKOPS_LOGS_FILE").ok();
             let container_env = env::var("TEKOPS_CONTAINER").ok();
             let given_stack = resolve_stack(stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let detected: Option<(Stack, String)> = if needs_detection(
+            // `dump-logs` now fills both slots, so `consumes_vc` is true and
+            // the gate is the same per-slot one `logs` uses. It was false
+            // while this command had no vc slot to answer, because a `true`
+            // there would have spawned `docker ps` for every operator who had
+            // configured only their beacon node - a command that used to skip
+            // detection entirely.
+            let vc_container_env = env::var("TEKOPS_VC_CONTAINER").ok();
+            let vc_logs_file_env = env::var("TEKOPS_VC_LOGS_FILE").ok();
+            let ps = needs_detection(
                 path.as_ref(),
                 container.as_ref(),
+                vc_container.as_ref(),
+                vc_logs_file.as_ref(),
                 container_env.as_ref(),
                 logs_file_env.as_ref(),
+                vc_container_env.as_ref(),
+                vc_logs_file_env.as_ref(),
+                true,
                 &cfg,
-            ) {
-                docker_ps_names(should_report_unaskable_docker(given_stack))
-                    .and_then(|ps| detect_or_note(&ps, given_stack))
-            } else {
-                None
-            };
+            )
+            .then(|| docker_ps_names(should_report_unaskable_docker(given_stack)))
+            .flatten();
+            let detected: Option<(Stack, String)> =
+                ps.as_deref().and_then(|ps| detect_or_note(ps, given_stack));
+            let detected_vc = ps
+                .as_deref()
+                .and_then(|ps| detect_validator_or_note(ps, given_stack));
             // Unlike `logs`, which only ever wants the container name, the
             // header reports which stack this came from. Detection already
             // knows, so a detected stack beats "unknown" - the same
             // flag > env > config > detection ladder the rest of the command
             // uses.
-            let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
-            let target = crate::logs::resolve_log_target(
+            //
+            // The validator detection answers this too, and has to: on a
+            // Rocket Pool node in External Consensus Client mode there is no
+            // consensus container to find, so reading only `detected` would
+            // stamp "unknown" on a dump from a node whose stack tekops just
+            // identified from its validator container.
+            let resolved_stack = given_stack
+                .or(detected.as_ref().map(|(s, _)| *s))
+                .or(detected_vc.as_ref().map(|(s, _)| *s));
+            let select = selector(bn, vc);
+            let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
                 path,
-                container,
+                container_flag: container,
+                vc_container_flag: vc_container,
+                vc_logs_file_flag: vc_logs_file,
                 container_env,
                 logs_file_env,
-                cfg.container.clone(),
-                cfg.logs_file.clone(),
-                detected.map(|(_, name)| name),
-            );
+                vc_container_env,
+                vc_logs_file_env,
+                container_cfg: cfg.container.clone(),
+                logs_file_cfg: cfg.logs_file.clone(),
+                vc_container_cfg: cfg.vc_container.clone(),
+                vc_logs_file_cfg: cfg.vc_logs_file.clone(),
+                detected_bn: detected.as_ref().map(|(_, name)| name.clone()),
+                detected_vc: detected_vc.map(|(_, name)| name),
+                default_log_present: default_teku_log_present(),
+                select,
+            });
+            if let Err(e) = check_selection(&sources, select) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
             // `--doctor` runs its own `docker ps` through `doctor_probe_config`
             // rather than reusing the detection above: doctor's ladder also
             // needs the container name and the two URLs, and duplicating that
             // here would be a second approximation of the config `doctor`
             // itself builds. The extra spawn is paid only with `--doctor`.
-            let probe = doctor.then(|| doctor_probe_config(stack, None, None, None, &cfg));
+            let probe = doctor
+                .then(|| doctor_probe_config(stack, None, MetricUrlFlags::default(), None, &cfg));
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             exit_for(crate::dump::run_dump(crate::dump::DumpConfig {
-                target,
+                sources,
                 lines,
                 output,
                 gist,
@@ -374,33 +527,42 @@ pub fn run() -> ExitCode {
         }
         Commands::Duties { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
-                metrics.metric_url,
-                env::var("TEKOPS_METRIC_URL").ok(),
-                cfg.metric_url.clone(),
+            let client = MetricsClient::new(resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
                 stack,
             ));
             exit_for_api(metrics_duties(&client, metrics.json), stack)
         }
         Commands::Validators { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
-                metrics.metric_url,
-                env::var("TEKOPS_METRIC_URL").ok(),
-                cfg.metric_url.clone(),
+            let client = MetricsClient::new(resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
                 stack,
             ));
             exit_for_api(metrics_validators(&client, metrics.json), stack)
         }
         Commands::Version { metrics } => {
             let stack = resolve_stack(metrics.stack, env::var("TEKOPS_STACK").ok(), cfg_stack);
-            let client = MetricsClient::new(resolve_metric_url(
+            let bn_url = resolve_bn_metric_url(
+                metrics.bn_metric_url,
                 metrics.metric_url,
+                env::var("TEKOPS_BN_METRIC_URL").ok(),
                 env::var("TEKOPS_METRIC_URL").ok(),
+                cfg.bn_metric_url.clone(),
                 cfg.metric_url.clone(),
                 stack,
-            ));
-            exit_for_api(metrics_version(&client, metrics.json), stack)
+            );
+            let vc_url = resolve_vc_metric_url(
+                metrics.vc_metric_url,
+                env::var("TEKOPS_VC_METRIC_URL").ok(),
+                cfg.vc_metric_url.clone(),
+                stack,
+            );
+            exit_for_api(metrics_version(&bn_url, &vc_url, metrics.json), stack)
         }
         Commands::LogLevel {
             target,
@@ -420,9 +582,20 @@ pub fn run() -> ExitCode {
         }
         Commands::Doctor {
             api,
+            bn_metric_url,
+            vc_metric_url,
             metric_url,
             data_dir,
-        } => run_doctor(api, metric_url, data_dir, &cfg),
+        } => run_doctor(
+            api,
+            MetricUrlFlags {
+                bn: bn_metric_url,
+                vc: vc_metric_url,
+                legacy: metric_url,
+            },
+            data_dir,
+            &cfg,
+        ),
     }
 }
 
@@ -437,19 +610,42 @@ pub fn run() -> ExitCode {
 /// hint; there would be nothing left for it to suggest.
 ///
 /// The ladder terminates in `Stack::BareMetal` rather than `None`:
-/// `resolve_base_url`/`resolve_metric_url` already default to bare-metal
+/// `resolve_base_url`/`resolve_vc_metric_url` already default to bare-metal
 /// independently when handed `None`, so leaving this rung off let the report
 /// header say "unknown stack" directly above two confidently bare-metal URLs -
 /// two different facts that must not disagree.
-fn resolve_doctor_stack(
-    flag: Option<Stack>,
-    env: Option<String>,
-    detected: Option<Stack>,
-    cfg: Option<Stack>,
+///
+/// Called once per process, with that process's own detection. A stated stack
+/// applies to both: an operator who says `--stack rocketpool` has described
+/// their deployment, and detection is the rung below, not above.
+fn resolve_doctor_stack(stated: Option<Stack>, detected: Option<Stack>) -> Option<Stack> {
+    stated.or(detected).or(Some(Stack::BareMetal))
+}
+
+/// The validator client's stack ladder: the beacon node's, plus one rung.
+///
+/// The extra rung is a consensus container found under some stack, and the
+/// asymmetry with `resolve_doctor_stack` is the point, because the two
+/// absences mean opposite things.
+///
+/// A validator container with no consensus container beside it is a beacon
+/// node running somewhere else - Rocket Pool's External Consensus Client mode,
+/// and Eth Docker's equivalent - so the beacon node's own ladder is right to
+/// terminate in bare-metal. A consensus container with no validator beside it
+/// is the ordinary combined deployment, where Teku runs both processes in the
+/// one container: that container's stack is the validator's stack too, and
+/// terminating in bare-metal here would hand an eth-docker node the bare-metal
+/// validator metrics port instead of its own.
+///
+/// Extracted rather than inlined at the one call site for the same reason as
+/// `doctor_needs_docker_ps`: it is a precedence rule guarding a silent wrong
+/// answer, and `doctor_probe_config` cannot be tested without Docker.
+fn resolve_doctor_vc_stack(
+    stated: Option<Stack>,
+    detected_vc: Option<Stack>,
+    detected_bn: Option<Stack>,
 ) -> Option<Stack> {
-    resolve_stack(flag, env, cfg)
-        .or(detected)
-        .or(Some(Stack::BareMetal))
+    resolve_doctor_stack(stated, detected_vc.or(detected_bn))
 }
 
 /// Teku's conventional bare-metal data directory. `--data-dir` (or
@@ -488,21 +684,31 @@ fn exit_for_findings(findings: &[crate::doctor::Finding]) -> ExitCode {
     }
 }
 
-/// Whether `doctor_probe_config` has to run `docker ps` to learn the stack.
+/// Whether `doctor_probe_config` has anything to gain from running `docker ps`.
 ///
-/// True exactly when no stack has been stated by flag, environment, or config
-/// file - the same `resolve_stack` ladder every other command reads. A
-/// configured stack makes the spawn pointless: its answer would only be
-/// overridden by `resolve_doctor_stack`, which already prefers a stated stack
-/// over a detected one. Extracted, the same shape `logs::needs_detection`
-/// uses for the identical failure mode, so a configured operator's spawn-skip
-/// is directly testable without mocking `docker ps`.
-fn doctor_needs_stack_detection(
-    flag: Option<Stack>,
-    env: Option<String>,
-    cfg: Option<Stack>,
-) -> bool {
-    resolve_stack(flag, env, cfg).is_none()
+/// False for exactly one answer: bare-metal, stated outright by flag,
+/// environment or config file. That operator has said there are no containers,
+/// so there is neither a stack left to detect nor a container left to name.
+///
+/// Every other case spawns, a stated Docker stack included - stating
+/// `--stack rocketpool` fixes the ports but not the container names, which are
+/// only knowable from `docker ps` because both stacks let the operator rename
+/// the project prefix. Extracted, the same shape `logs::needs_detection` uses
+/// for the identical failure mode, so the bare-metal spawn-skip is directly
+/// testable without mocking Docker.
+fn doctor_needs_docker_ps(stated: Option<Stack>) -> bool {
+    stated != Some(Stack::BareMetal)
+}
+
+/// The three spellings of the metrics endpoints, as given on the command line.
+///
+/// A struct rather than three more positional parameters: `doctor_probe_config`
+/// already takes five, and `dump-logs --doctor` passes nothing for any of them.
+#[derive(Default)]
+struct MetricUrlFlags {
+    bn: Option<String>,
+    vc: Option<String>,
+    legacy: Option<String>,
 }
 
 /// Doctor's full probe configuration, `docker ps` detection included.
@@ -516,66 +722,80 @@ fn doctor_needs_stack_detection(
 fn doctor_probe_config(
     stack_flag: Option<Stack>,
     api_url: Option<String>,
-    metric_url: Option<String>,
+    metrics: MetricUrlFlags,
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> crate::doctor::ProbeConfig {
-    // Read once, used for both `doctor_needs_stack_detection` (below) and
-    // `resolve_doctor_stack`.
+    // Read once, used for both `doctor_needs_docker_ps` (below) and the two
+    // stack ladders.
     let stack_env = env::var("TEKOPS_STACK").ok();
+    let stated = resolve_stack(stack_flag, stack_env, cfg.stack);
 
-    // `docker ps` runs only when nothing else has answered - see
-    // `doctor_needs_stack_detection` - matching the `needs_detection` gate in
-    // `logs`, so a configured or bare-metal operator never pays for the spawn.
+    // One `docker ps`, read for both roles. Detection is the rung beneath a
+    // stated stack, so on the face of it a stated stack should skip the spawn
+    // entirely - but the container names are only knowable from `docker ps`,
+    // and doctor inspects both containers. The gate is therefore "is there
+    // anything left to find", not "is the stack still unknown": bare-metal,
+    // stated outright, is the one answer that makes the spawn pointless.
     //
-    // This rung is speculative by construction - it is reached only when no
-    // stack has been named - so a `docker ps` that cannot answer is reported
-    // by neither `false` here nor the lookup below, whose gate has since
-    // resolved to bare-metal. That is issue #16: the two together are what
-    // keep a node with no containers from hearing about Docker.
-    let detected: Option<(Stack, String)> =
-        if doctor_needs_stack_detection(stack_flag, stack_env.clone(), cfg.stack) {
-            docker_ps_names(false).and_then(|ps| detect_or_note(&ps, None))
-        } else {
-            None
-        };
-    // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
-    // consuming it would leave nothing for the container lookup below.
-    let stack = resolve_doctor_stack(
-        stack_flag,
-        stack_env,
-        detected.as_ref().map(|(s, _)| *s),
-        cfg.stack,
-    );
-
-    // The container name: from detection when it ran, otherwise from a fresh
-    // `docker ps` narrowed to the named stack.
-    let container = match &detected {
-        Some((_, name)) => Some(name.clone()),
-        None => stack
-            .filter(|s| s.container_suffix().is_some())
-            .and_then(|s| {
-                docker_ps_names(should_report_unaskable_docker(Some(s)))
-                    .and_then(|ps| detect_or_note(&ps, Some(s)))
-            })
-            .map(|(_, name)| name),
+    // When nothing is stated this rung is speculative by construction, which
+    // is why `should_report_unaskable_docker(None)` is false: a `docker ps`
+    // that cannot answer is not news to a host whose ladder is about to
+    // terminate in bare-metal. That is issue #16.
+    let ps: Option<String> = if doctor_needs_docker_ps(stated) {
+        docker_ps_names(should_report_unaskable_docker(stated))
+    } else {
+        None
     };
+    let detected = ps.as_deref().and_then(|ps| detect_or_note(ps, stated));
+    let detected_vc = ps
+        .as_deref()
+        .and_then(|ps| detect_validator_or_note(ps, stated));
+
+    // Two ladders, not one. The beacon node's stack answers the Beacon API,
+    // its own metrics endpoint and the disk target; the validator client's
+    // answers its metrics endpoint. On an all-in-one node they resolve to the
+    // same value and nothing downstream can tell the difference.
+    //
+    // The validator's ladder has one rung the beacon node's does not - see
+    // `resolve_doctor_vc_stack` for why the asymmetry is the correct one.
+    //
+    // `as_ref` here, not `map`: the tuple carries a String and is not Copy, so
+    // consuming it would leave nothing for the container names below.
+    let detected_stack = detected.as_ref().map(|(s, _)| *s);
+    let stack = resolve_doctor_stack(stated, detected_stack);
+    let vc_stack = resolve_doctor_vc_stack(
+        stated,
+        detected_vc.as_ref().map(|(s, _)| *s),
+        detected_stack,
+    );
 
     crate::doctor::ProbeConfig {
         stack,
+        vc_stack,
         api_url: resolve_base_url(
             api_url,
             env::var("TEKOPS_API_URL").ok(),
             cfg.api_url.clone(),
             stack,
         ),
-        metric_url: resolve_metric_url(
-            metric_url,
+        bn_metric_url: resolve_bn_metric_url(
+            metrics.bn,
+            metrics.legacy,
+            env::var("TEKOPS_BN_METRIC_URL").ok(),
             env::var("TEKOPS_METRIC_URL").ok(),
+            cfg.bn_metric_url.clone(),
             cfg.metric_url.clone(),
             stack,
         ),
-        container,
+        vc_metric_url: resolve_vc_metric_url(
+            metrics.vc,
+            env::var("TEKOPS_VC_METRIC_URL").ok(),
+            cfg.vc_metric_url.clone(),
+            vc_stack,
+        ),
+        container: detected.map(|(_, name)| name),
+        vc_container: detected_vc.map(|(_, name)| name),
         data_dir: resolve_doctor_data_dir(
             data_dir,
             env::var("TEKOPS_DATA_DIR").ok(),
@@ -587,11 +807,11 @@ fn doctor_probe_config(
 
 fn run_doctor(
     api: ApiArgs,
-    metric_url: Option<String>,
+    metrics: MetricUrlFlags,
     data_dir: Option<PathBuf>,
     cfg: &crate::config::Config,
 ) -> ExitCode {
-    let probe_cfg = doctor_probe_config(api.stack, api.api_url, metric_url, data_dir, cfg);
+    let probe_cfg = doctor_probe_config(api.stack, api.api_url, metrics, data_dir, cfg);
 
     let facts = crate::doctor::probe(&probe_cfg);
     let findings = crate::doctor::evaluate(&facts);
@@ -648,16 +868,59 @@ fn resolve_base_url(
         .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).api_url().to_string())
 }
 
-/// The Prometheus scrape URL, on the same ladder as `resolve_base_url`.
-fn resolve_metric_url(
+/// The beacon node's Prometheus scrape URL.
+///
+/// The deprecated `--metric-url` / `$TEKOPS_METRIC_URL` / `metric_url` trio
+/// feeds this ladder rather than the validator client's. The unprefixed
+/// spelling means the beacon node because `--api-url` is likewise unprefixed
+/// and likewise the beacon node's: the tool's primary subject gets the plain
+/// name, and the validator client is the one that has to say so.
+///
+/// New spellings beat legacy ones *within* a tier and never across one, which
+/// keeps the repo's flag > environment > config > default discipline intact.
+///
+/// This is a change of meaning for the deprecated trio, which used to resolve
+/// to the validator client. `doctor`'s "metrics layout" check recognises a
+/// config written under the old meaning and names the fix.
+fn resolve_bn_metric_url(
+    flag: Option<String>,
+    legacy_flag: Option<String>,
+    env: Option<String>,
+    legacy_env: Option<String>,
+    cfg: Option<String>,
+    legacy_cfg: Option<String>,
+    stack: Option<Stack>,
+) -> String {
+    flag.or(legacy_flag)
+        .or(env)
+        .or(legacy_env)
+        .or(cfg)
+        .or(legacy_cfg)
+        .unwrap_or_else(|| {
+            stack
+                .unwrap_or(Stack::BareMetal)
+                .bn_metric_url()
+                .to_string()
+        })
+}
+
+/// The validator client's Prometheus scrape URL.
+///
+/// No legacy rung: nothing reaches this but its own spellings and the stack
+/// default. An operator migrating from the old `metric_url` has to say
+/// `vc_metric_url` explicitly, which is the point.
+fn resolve_vc_metric_url(
     flag: Option<String>,
     env: Option<String>,
     cfg: Option<String>,
     stack: Option<Stack>,
 ) -> String {
-    flag.or(env)
-        .or(cfg)
-        .unwrap_or_else(|| stack.unwrap_or(Stack::BareMetal).metric_url().to_string())
+    flag.or(env).or(cfg).unwrap_or_else(|| {
+        stack
+            .unwrap_or(Stack::BareMetal)
+            .vc_metric_url()
+            .to_string()
+    })
 }
 
 /// The names of running containers, or `None` if Docker cannot be asked.
@@ -717,12 +980,27 @@ fn should_report_unaskable_docker(stack: Option<Stack>) -> bool {
 /// they're sanitized before they reach the terminal - see term.rs's entry in
 /// CLAUDE.md.
 fn detect_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
-    match detect_stack(ps, only) {
+    note_ambiguity(detect_stack(ps, only))
+}
+
+/// `detect_validator_stack`, with an ambiguous result reported rather than
+/// swallowed - the validator counterpart to `detect_or_note`, and the rung
+/// that lets doctor name a stack on a host whose only container is a
+/// validator.
+fn detect_validator_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
+    note_ambiguity(detect_validator_stack(ps, only))
+}
+
+/// Folds a detection down to an `Option`, reporting only the failure the
+/// operator can act on. `DetectError` already words itself for the role it was
+/// given, so one body serves both.
+fn note_ambiguity(found: Result<(Stack, String), DetectError>) -> Option<(Stack, String)> {
+    match found {
         Ok(found) => Some(found),
         // A bare-metal host that never wanted Docker must not be nagged
         // about detection finding nothing.
-        Err(DetectError::NotFound) => None,
-        Err(e @ DetectError::Ambiguous(_)) => {
+        Err(DetectError::NotFound(_)) => None,
+        Err(e @ DetectError::Ambiguous(..)) => {
             eprintln!("note: {}", sanitize(&e.to_string()));
             None
         }
@@ -731,22 +1009,113 @@ fn detect_or_note(ps: &str, only: Option<Stack>) -> Option<(Stack, String)> {
 
 /// Whether `docker ps` has anything left to answer.
 ///
-/// The logical negation of every rung in `logs::resolve_log_target` above
-/// `detected`. Extracted so the two call sites cannot drift apart and so the
-/// condition is testable without spawning Docker.
+/// The logical negation of every rung in `logs::resolve_log_sources`'s
+/// precedence ladder above `detected_bn`/`detected_vc`. Every environment
+/// variable and config rung arrives as a parameter, the same shape
+/// `resolve_stack`/`resolve_base_url` use, so the whole gate is testable
+/// without spawning Docker or racing the real environment.
+///
+/// `consumes_vc` is false for a caller with no vc slot to fill yet -
+/// `dump-logs`, until Task 7 gives it `--vc-container`/`--vc-logs-file` and
+/// wires `DumpConfig.sources` - and true for `tekops logs`, which already
+/// reads both `detected_bn` and `detected_vc`. A caller that does not consume
+/// the vc slot must not be told to keep spawning `docker ps` just because
+/// that slot looks unanswered: it was never going to read the answer, and
+/// doing so anyway reintroduces the wasted spawn for every operator who
+/// used to skip it by naming only their beacon node - exactly the regression
+/// this parameter exists to prevent. When `consumes_vc` is true, detection is
+/// worth its spawn while *either* slot is still unanswered, because one
+/// `docker ps` now feeds both.
+///
+/// Note the interaction with `resolve_log_sources`'s rule 1: stating one side
+/// only means the other is suppressed, so detection's answer for it goes
+/// unused. Skipping the spawn in that case would be correct but is
+/// deliberately not done - the condition is already the hardest thing in this
+/// file to keep in step with the ladder, and the cost of getting it wrong (a
+/// stream that silently stops appearing) is far worse than one wasted spawn.
+#[allow(clippy::too_many_arguments)]
 fn needs_detection(
     path: Option<&PathBuf>,
     container_flag: Option<&String>,
+    vc_container_flag: Option<&String>,
+    vc_logs_file_flag: Option<&PathBuf>,
     container_env: Option<&String>,
     logs_file_env: Option<&String>,
+    vc_container_env: Option<&String>,
+    vc_logs_file_env: Option<&String>,
+    consumes_vc: bool,
     cfg: &crate::config::Config,
 ) -> bool {
-    path.is_none()
-        && container_flag.is_none()
-        && container_env.is_none()
-        && logs_file_env.is_none()
-        && cfg.container.is_none()
-        && cfg.logs_file.is_none()
+    let bn_answered = path.is_some()
+        || container_flag.is_some()
+        || container_env.is_some()
+        || logs_file_env.is_some()
+        || cfg.container.is_some()
+        || cfg.logs_file.is_some();
+    if !consumes_vc {
+        return !bn_answered;
+    }
+    let vc_answered = vc_container_flag.is_some()
+        || vc_logs_file_flag.is_some()
+        || vc_container_env.is_some()
+        || vc_logs_file_env.is_some()
+        || cfg.vc_container.is_some()
+        || cfg.vc_logs_file.is_some();
+    !(bn_answered && vc_answered)
+}
+
+/// `--bn` / `--vc` as a selector. Clap has already rejected both at once.
+fn selector(bn: bool, vc: bool) -> Option<Source> {
+    match (bn, vc) {
+        (true, _) => Some(Source::Bn),
+        (_, true) => Some(Source::Vc),
+        _ => None,
+    }
+}
+
+/// Asking for a process that has no log source is a question tekops should
+/// answer, not a blank screen.
+///
+/// `resolve_log_sources` runs rule 1 (mutual exclusion by flag/env) before
+/// rule 3 (`select` filtering), so a selector naming a slot that rule 1 or
+/// detection never filled in resolves quietly to `None` rather than an error -
+/// `--bn` on a host where only a validator container is running, or
+/// `--container X --vc`, both land here. The generic "no log source" that
+/// `run_logs` falls back to would be true but unhelpful in that case: the
+/// operator named a process, so the message names it back and says what would
+/// fix it, rather than a blank session that looks like a quiet node.
+/// The one filesystem read behind `SourceInputs::default_log_present`.
+///
+/// Here rather than in `resolve_log_sources` so the precedence ladder stays a
+/// pure function of its inputs - the same split every other tier already has.
+fn default_teku_log_present() -> bool {
+    Path::new(crate::logs::DEFAULT_TEKU_LOG).exists()
+}
+
+fn check_selection(
+    sources: &crate::logs::LogSources,
+    select: Option<Source>,
+) -> Result<(), String> {
+    let missing = match select {
+        Some(Source::Bn) => sources.bn.is_none(),
+        Some(Source::Vc) => sources.vc.is_none(),
+        None => false,
+    };
+    if missing {
+        let tag = select
+            .expect("missing is only set when a slot was selected")
+            .tag();
+        // Interpolating `--{tag}-container` would print `--bn-container`,
+        // which does not exist: the beacon node's flags are the unprefixed
+        // `--container` and the positional path, not a `bn`-prefixed pair.
+        let hint = match select {
+            Some(Source::Bn) => "name one with --container or a path argument",
+            Some(Source::Vc) => "name one with --vc-container or --vc-logs-file",
+            None => unreachable!("missing is only set when a slot was selected"),
+        };
+        return Err(format!("no {tag} log source found; {hint}"));
+    }
+    Ok(())
 }
 
 /// Generic over the error type so `UpdateError` shares the exit path with
@@ -911,15 +1280,73 @@ fn metrics_validators(client: &MetricsClient, json: bool) -> Result<(), ApiError
     Ok(())
 }
 
-fn metrics_version(client: &MetricsClient, json: bool) -> Result<(), ApiError> {
-    let info = client.version()?;
+/// One row of the version report, from a scrape result and the family to read.
+///
+/// An endpoint that answered but exports no version metric is reported
+/// distinctly from one that could not be reached: the first is "this is not a
+/// Teku process", the second is "this process is not running".
+fn process_version(
+    url: &str,
+    families: &Result<crate::metrics::EndpointFamilies, ApiError>,
+    pick: fn(&crate::metrics::EndpointFamilies) -> &Vec<String>,
+) -> crate::output::ProcessVersion {
+    let (versions, error) = match families {
+        Ok(f) if !pick(f).is_empty() => (pick(f).clone(), None),
+        Ok(_) => (
+            Vec::new(),
+            Some("responded, but exports no Teku version metric".to_string()),
+        ),
+        Err(e) => (Vec::new(), Some(sanitize(&e.to_string()))),
+    };
+    crate::output::ProcessVersion {
+        url: url.to_string(),
+        versions,
+        error,
+    }
+}
+
+/// Scrapes both processes and builds the report.
+///
+/// Equal URLs mean one process serving both families, so the endpoint is
+/// scraped once and both rows are read off that single result rather than
+/// asking the same URL twice.
+fn build_version_report(bn_url: &str, vc_url: &str) -> crate::output::VersionReport {
+    let bn_families = MetricsClient::new(bn_url.to_string()).families();
+    let vc_families = (bn_url != vc_url).then(|| MetricsClient::new(vc_url.to_string()).families());
+    let vc_source = vc_families.as_ref().unwrap_or(&bn_families);
+
+    crate::output::VersionReport {
+        beacon_node: process_version(bn_url, &bn_families, |f| &f.beacon_versions),
+        validator_client: process_version(vc_url, vc_source, |f| &f.validator_versions),
+    }
+}
+
+fn metrics_version(bn_url: &str, vc_url: &str, json: bool) -> Result<(), ApiError> {
+    let report = build_version_report(bn_url, vc_url);
+
+    // Neither process answered, which is a failed command rather than a report
+    // of two absences. One answering is a useful result and exits zero.
+    if report.beacon_node.versions.is_empty() && report.validator_client.versions.is_empty() {
+        // Equal URLs mean one scrape covers both rows (see
+        // `build_version_report`), so naming the endpoint twice would read as
+        // two different, both-wrong URLs rather than one.
+        let endpoints = if bn_url == vc_url {
+            format!("at {bn_url}")
+        } else {
+            format!("at {bn_url} or {vc_url}")
+        };
+        return Err(ApiError::Malformed(format!(
+            "no Teku version metric found {endpoints}; are these Teku metrics endpoints?"
+        )));
+    }
+
     if json {
         println!(
             "{}",
-            serde_json::to_string(&info).expect("serialize version json")
+            serde_json::to_string(&report).expect("serialize version json")
         );
     } else {
-        println!("{}", format_version_table(&info));
+        println!("{}", format_version_table(&report));
     }
     Ok(())
 }
@@ -1318,7 +1745,7 @@ mod tests {
         let cfg = doctor_probe_config(
             Some(Stack::BareMetal),
             None,
-            None,
+            MetricUrlFlags::default(),
             None,
             &crate::config::Config::default(),
         );
@@ -1328,9 +1755,34 @@ mod tests {
             resolve_base_url(None, None, None, Some(Stack::BareMetal))
         );
         assert_eq!(
-            cfg.metric_url,
-            resolve_metric_url(None, None, None, Some(Stack::BareMetal))
+            cfg.bn_metric_url,
+            resolve_bn_metric_url(None, None, None, None, None, None, Some(Stack::BareMetal))
         );
+        assert_eq!(
+            cfg.vc_metric_url,
+            resolve_vc_metric_url(None, None, None, Some(Stack::BareMetal))
+        );
+    }
+
+    /// The legacy trio (`--metric-url` / `$TEKOPS_METRIC_URL` / `metric_url`)
+    /// used to mean the validator client; `doctor` now reads it as the beacon
+    /// node's URL. An operator who set it to steer `doctor` specifically must
+    /// still have it reach *some* field of `ProbeConfig`, not be silently
+    /// dropped - see `resolve_bn_metric_url`'s doc comment.
+    #[test]
+    fn doctor_probe_config_still_honours_the_legacy_metric_url_flag() {
+        let cfg = doctor_probe_config(
+            Some(Stack::BareMetal),
+            None,
+            MetricUrlFlags {
+                bn: None,
+                vc: None,
+                legacy: Some("http://legacy.invalid:9000".to_string()),
+            },
+            None,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(cfg.bn_metric_url, "http://legacy.invalid:9000");
     }
 
     #[test]
@@ -1338,7 +1790,7 @@ mod tests {
         let cfg = doctor_probe_config(
             Some(Stack::BareMetal),
             Some("http://example.invalid:1234".to_string()),
-            None,
+            MetricUrlFlags::default(),
             None,
             &crate::config::Config::default(),
         );
@@ -1439,8 +1891,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Duties {
-                metrics: MetricArgs {
-                    metric_url: None,
+                metrics: VcMetricArgs {
+                    vc_metric_url: None,
                     stack: None,
                     json: false
                 }
@@ -1454,8 +1906,8 @@ mod tests {
         assert!(matches!(
             cli.command,
             Commands::Validators {
-                metrics: MetricArgs {
-                    metric_url: None,
+                metrics: VcMetricArgs {
+                    vc_metric_url: None,
                     stack: None,
                     json: false
                 }
@@ -1470,6 +1922,8 @@ mod tests {
             cli.command,
             Commands::Version {
                 metrics: MetricArgs {
+                    bn_metric_url: None,
+                    vc_metric_url: None,
                     metric_url: None,
                     stack: None,
                     json: false
@@ -1616,15 +2070,46 @@ mod tests {
         }
     }
 
+    /// `duties` and `validators` read only the validator client, and the
+    /// legacy `--metric-url` now names the beacon node - so it must be
+    /// rejected here rather than silently steering nothing, same as
+    /// `--bn-metric-url`. Rejection is the correct outcome: clap's error
+    /// names `--vc-metric-url`, which is the flag an old script needs to
+    /// switch to.
     #[test]
-    fn metric_url_flag_still_reaches_each_metrics_command() {
+    fn duties_and_validators_reject_the_beacon_node_metric_flags() {
+        for cmd in ["duties", "validators"] {
+            // `Cli` derives no `Debug`, so `.err()` rather than `.expect_err()`.
+            let err = Cli::try_parse_from(["tekops", cmd, "--metric-url", "http://x:2/m"])
+                .err()
+                .unwrap_or_else(|| panic!("{cmd} must reject the legacy beacon-node flag"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+            let err = Cli::try_parse_from(["tekops", cmd, "--bn-metric-url", "http://x:2/m"])
+                .err()
+                .unwrap_or_else(|| panic!("{cmd} must reject --bn-metric-url"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn duties_and_validators_still_accept_the_vc_metric_flag() {
         let cli =
-            Cli::try_parse_from(["tekops", "duties", "--metric-url", "http://x:2/m"]).unwrap();
+            Cli::try_parse_from(["tekops", "duties", "--vc-metric-url", "http://x:2/m"]).unwrap();
         match cli.command {
             Commands::Duties { metrics } => {
-                assert_eq!(metrics.metric_url.as_deref(), Some("http://x:2/m"))
+                assert_eq!(metrics.vc_metric_url.as_deref(), Some("http://x:2/m"))
             }
             _ => panic!("expected Duties command"),
+        }
+
+        let cli = Cli::try_parse_from(["tekops", "validators", "--vc-metric-url", "http://x:2/m"])
+            .unwrap();
+        match cli.command {
+            Commands::Validators { metrics } => {
+                assert_eq!(metrics.vc_metric_url.as_deref(), Some("http://x:2/m"))
+            }
+            _ => panic!("expected Validators command"),
         }
     }
 
@@ -1752,17 +2237,6 @@ mod tests {
     }
 
     #[test]
-    fn version_json_output_is_valid_json() {
-        use crate::metrics::VersionInfo;
-        let info = VersionInfo {
-            versions: vec!["teku/v24.9.0".to_string()],
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["versions"][0], "teku/v24.9.0");
-    }
-
-    #[test]
     fn log_level_json_output_includes_filter_when_scoped() {
         let payload = LogLevelJson {
             level: "DEBUG",
@@ -1859,27 +2333,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn metric_url_precedence_matches_the_api_url_ladder() {
-        assert_eq!(
-            resolve_metric_url(
-                Some("http://x:2/m".into()),
-                None,
-                None,
-                Some(Stack::EthDocker)
-            ),
-            "http://x:2/m"
-        );
-        assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::EthDocker)),
-            "http://localhost:8009/metrics"
-        );
-        assert_eq!(
-            resolve_metric_url(None, None, None, None),
-            "http://localhost:8010/metrics"
-        );
-    }
-
     /// Mixing is explicitly supported: a profile is one layer in the chain, not
     /// a mode that locks the other values.
     #[test]
@@ -1894,7 +2347,7 @@ mod tests {
             "http://custom:5099"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
+            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
             "http://localhost:9101/metrics"
         );
     }
@@ -1938,34 +2391,187 @@ mod tests {
         assert_eq!(got, Stack::EthDocker.api_url());
     }
 
+    /// The beacon node's ladder, one tier at a time. New spellings beat legacy
+    /// ones *within* a tier and never across one, so a legacy flag still beats
+    /// a new environment variable.
     #[test]
-    fn the_metric_url_follows_the_same_ladder() {
+    fn bn_metric_url_ladder_prefers_each_tier_in_order() {
+        let all = || {
+            (
+                Some("http://flag".to_string()),
+                Some("http://legacy-flag".to_string()),
+                Some("http://env".to_string()),
+                Some("http://legacy-env".to_string()),
+                Some("http://cfg".to_string()),
+                Some("http://legacy-cfg".to_string()),
+            )
+        };
+
+        let (f, lf, e, le, c, lc) = all();
         assert_eq!(
-            resolve_metric_url(
-                Some("http://flag:1".into()),
-                Some("http://env:2".into()),
-                Some("http://cfg:3".into()),
-                Some(Stack::RocketPool)
-            ),
-            "http://flag:1"
+            resolve_bn_metric_url(f, lf, e, le, c, lc, None),
+            "http://flag"
+        );
+
+        let (_, lf, e, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, lf, e, le, c, lc, None),
+            "http://legacy-flag"
+        );
+
+        let (_, _, e, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, e, le, c, lc, None),
+            "http://env"
+        );
+
+        let (_, _, _, le, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, le, c, lc, None),
+            "http://legacy-env"
+        );
+
+        let (_, _, _, _, c, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, c, lc, None),
+            "http://cfg"
+        );
+
+        let (_, _, _, _, _, lc) = all();
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, None, lc, None),
+            "http://legacy-cfg"
+        );
+    }
+
+    #[test]
+    fn bn_metric_url_falls_back_to_the_stacks_beacon_port() {
+        assert_eq!(
+            resolve_bn_metric_url(None, None, None, None, None, None, Some(Stack::RocketPool)),
+            "http://localhost:9100/metrics"
         );
         assert_eq!(
-            resolve_metric_url(
+            resolve_bn_metric_url(None, None, None, None, None, None, None),
+            "http://localhost:8008/metrics"
+        );
+    }
+
+    /// The meaning change, pinned. The deprecated spelling used to resolve to
+    /// the validator client; it now resolves to the beacon node, agreeing with
+    /// the unprefixed `--api-url`. If someone later "fixes" the alias back,
+    /// this test is the thing that objects.
+    #[test]
+    fn the_deprecated_spelling_feeds_the_beacon_node_not_the_validator() {
+        let legacy = "http://legacy".to_string();
+
+        assert_eq!(
+            resolve_bn_metric_url(
                 None,
-                Some("http://env:2".into()),
-                Some("http://cfg:3".into()),
+                None,
+                None,
+                None,
+                None,
+                Some(legacy.clone()),
+                Some(Stack::EthDocker)
+            ),
+            "http://legacy"
+        );
+
+        // The same value must not reach the validator client's ladder at all.
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, Some(Stack::EthDocker)),
+            "http://localhost:8009/metrics"
+        );
+    }
+
+    #[test]
+    fn vc_metric_url_ladder_prefers_each_tier_in_order() {
+        assert_eq!(
+            resolve_vc_metric_url(
+                Some("http://flag".into()),
+                Some("http://env".into()),
+                Some("http://cfg".into()),
                 None
             ),
-            "http://env:2"
+            "http://flag"
         );
         assert_eq!(
-            resolve_metric_url(None, None, Some("http://cfg:3".into()), None),
-            "http://cfg:3"
+            resolve_vc_metric_url(
+                None,
+                Some("http://env".into()),
+                Some("http://cfg".into()),
+                None
+            ),
+            "http://env"
         );
         assert_eq!(
-            resolve_metric_url(None, None, None, Some(Stack::RocketPool)),
-            Stack::RocketPool.metric_url()
+            resolve_vc_metric_url(None, None, Some("http://cfg".into()), None),
+            "http://cfg"
         );
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, Some(Stack::RocketPool)),
+            "http://localhost:9101/metrics"
+        );
+        assert_eq!(
+            resolve_vc_metric_url(None, None, None, None),
+            "http://localhost:8010/metrics"
+        );
+    }
+
+    /// The deprecated flag and its replacement name the same endpoint, so
+    /// allowing both would mean silently honouring one and dropping the other.
+    #[test]
+    fn metric_url_and_bn_metric_url_cannot_both_be_given() {
+        let err = command().try_get_matches_from([
+            "tekops",
+            "version",
+            "--metric-url",
+            "http://a",
+            "--bn-metric-url",
+            "http://b",
+        ]);
+        assert!(err.is_err(), "clap must reject both spellings at once");
+    }
+
+    /// The deprecated flag is accepted but not advertised.
+    #[test]
+    fn the_deprecated_metric_url_flag_is_hidden_but_still_parses() {
+        assert!(command()
+            .try_get_matches_from(["tekops", "version", "--metric-url", "http://a"])
+            .is_ok());
+
+        // A separate binding: `find_subcommand_mut` borrows mutably, so it
+        // cannot be called on the temporary `command()` returns.
+        let mut cmd = command();
+        let help = cmd
+            .find_subcommand_mut("version")
+            .expect("version subcommand")
+            .render_help()
+            .to_string();
+        assert!(
+            !help.contains("--metric-url"),
+            "the deprecated flag must not appear in help: {help}"
+        );
+        assert!(help.contains("--bn-metric-url"), "{help}");
+        assert!(help.contains("--vc-metric-url"), "{help}");
+    }
+
+    /// Completions are generated from `command()`, so the new flags arrive
+    /// automatically. Nothing proved that, though, and `hide = true` sitting
+    /// on a neighbouring flag is exactly the kind of thing that could quietly
+    /// take the others with it.
+    #[test]
+    fn generated_completions_offer_both_metric_flags() {
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::shells::Bash,
+            &mut command(),
+            "tekops",
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("clap_complete emits UTF-8");
+        assert!(script.contains("bn-metric-url"), "{script}");
+        assert!(script.contains("vc-metric-url"), "{script}");
     }
 
     #[test]
@@ -2021,39 +2627,276 @@ mod tests {
     #[test]
     fn nothing_stated_anywhere_still_needs_detection() {
         let cfg = crate::config::Config::default();
-        assert!(needs_detection(None, None, None, None, &cfg));
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
     }
 
-    /// The regression this guards: a configured operator paying for a spawn whose
-    /// answer cannot be used. It is silent when it breaks - the symptom is a
-    /// `docker ps`, not an error.
+    /// A bn config rung alone is *not* enough since R12 - the vc slot must
+    /// also answer, because the same `docker ps` also answers `detected_vc`.
+    /// Renamed from `a_config_container_removes_the_need_to_detect`, whose
+    /// old name claimed exactly what `only_the_beacon_node_configured_...`
+    /// below disproves; pairing the bn container rung with the vc file rung
+    /// (rather than repeating the same rung on both sides) means this test
+    /// and the one after it between them cover all four rungs.
     #[test]
-    fn a_config_container_removes_the_need_to_detect() {
+    fn a_config_container_paired_with_a_vc_rung_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            container: Some("c".into()),
+            vc_logs_file: Some(PathBuf::from("/vc.log")),
+            ..Default::default()
+        };
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
+    }
+
+    #[test]
+    fn a_config_logs_file_paired_with_a_vc_rung_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            logs_file: Some(PathBuf::from("/x.log")),
+            vc_container: Some("vc-c".into()),
+            ..Default::default()
+        };
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
+    }
+
+    /// Since R12, the bn rungs alone are no longer enough: the vc slot has to
+    /// be answered too, because the same `docker ps` also answers
+    /// `detected_vc`.
+    #[test]
+    fn any_stated_bn_source_alone_still_needs_detection() {
+        let cfg = crate::config::Config::default();
+        let p = PathBuf::from("/x.log");
+        let s = "c".to_string();
+        assert!(needs_detection(
+            Some(&p),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            true,
+            &cfg
+        ));
+    }
+
+    /// The other half of the same rule: each of the four bn rungs, paired
+    /// with a stated vc rung, is enough to skip the spawn.
+    #[test]
+    fn any_stated_bn_source_paired_with_a_stated_vc_source_removes_the_need_to_detect() {
+        let cfg = crate::config::Config::default();
+        let p = PathBuf::from("/x.log");
+        let s = "c".to_string();
+        let vc = "vc-c".to_string();
+        assert!(!needs_detection(
+            Some(&p),
+            None,
+            Some(&vc),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            Some(&s),
+            Some(&vc),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            None,
+            Some(&vc),
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(!needs_detection(
+            None,
+            None,
+            Some(&vc),
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            true,
+            &cfg
+        ));
+    }
+
+    /// The vc rungs, symmetric with `any_stated_bn_source_alone_still_needs_detection`
+    /// above: a vc-only answer is likewise not enough alone, and this is the
+    /// exact case the shared unit tests were missing before this fix - a bn
+    /// side answered only by its env vars, read the same way the vc side's
+    /// now are, rather than double-reading `env::var` behind the function's
+    /// back.
+    #[test]
+    fn any_stated_vc_source_alone_still_needs_detection() {
+        let cfg = crate::config::Config::default();
+        let s = "vc-c".to_string();
+        let f = PathBuf::from("/vc.log");
+        assert!(needs_detection(
+            None,
+            None,
+            Some(&s),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            Some(&f),
+            None,
+            None,
+            None,
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            None,
+            true,
+            &cfg
+        ));
+        assert!(needs_detection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&s),
+            true,
+            &cfg
+        ));
+    }
+
+    /// The gate must learn the VC rungs. Without this a fully configured
+    /// separated operator pays for a `docker ps` spawn whose answer cannot be
+    /// used - the exact failure `needs_detection` exists to prevent.
+    #[test]
+    fn a_configured_validator_source_removes_the_need_to_detect() {
+        let cfg = crate::config::Config {
+            container: Some("bn-c".into()),
+            vc_container: Some("vc-c".into()),
+            ..Default::default()
+        };
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
+    }
+
+    /// Only one side configured still needs detection for the other.
+    #[test]
+    fn only_the_beacon_node_configured_still_needs_detection() {
+        let cfg = crate::config::Config {
+            container: Some("bn-c".into()),
+            ..Default::default()
+        };
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, true, &cfg
+        ));
+    }
+
+    /// `dump-logs` has no vc slot to consume yet, so it must keep its
+    /// pre-task, bn-only gate: a bn config rung alone still skips the spawn,
+    /// unlike `tekops logs`'s `consumes_vc: true` case just above. This pins
+    /// the regression the review caught - `consumes_vc: true` here would
+    /// reintroduce a `docker ps` spawn for every `dump-logs` invocation on a
+    /// host with only `container` configured, which used to skip it entirely.
+    #[test]
+    fn a_caller_not_consuming_the_vc_slot_only_needs_the_bn_rungs_answered() {
         let cfg = crate::config::Config {
             container: Some("c".into()),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, &cfg));
+        assert!(!needs_detection(
+            None, None, None, None, None, None, None, None, false, &cfg
+        ));
     }
 
+    /// The other side of the same pin: with the vc slot unconsumed, a stated
+    /// vc rung must not be read as an answer at all - it should have no
+    /// effect either way, since a caller that never reads `detected_vc` gets
+    /// nothing from spawning `docker ps` to learn it.
     #[test]
-    fn a_config_logs_file_removes_the_need_to_detect() {
+    fn a_caller_not_consuming_the_vc_slot_ignores_vc_rungs_entirely() {
         let cfg = crate::config::Config {
-            logs_file: Some(PathBuf::from("/x.log")),
+            vc_container: Some("vc-c".into()),
             ..Default::default()
         };
-        assert!(!needs_detection(None, None, None, None, &cfg));
-    }
-
-    #[test]
-    fn any_stated_source_removes_the_need_to_detect() {
-        let cfg = crate::config::Config::default();
-        let p = PathBuf::from("/x.log");
-        let s = "c".to_string();
-        assert!(!needs_detection(Some(&p), None, None, None, &cfg));
-        assert!(!needs_detection(None, Some(&s), None, None, &cfg));
-        assert!(!needs_detection(None, None, Some(&s), None, &cfg));
-        assert!(!needs_detection(None, None, None, Some(&s), &cfg));
+        assert!(needs_detection(
+            None, None, None, None, None, None, None, None, false, &cfg
+        ));
     }
 
     #[test]
@@ -2072,6 +2915,143 @@ mod tests {
     #[test]
     fn a_path_and_a_container_cannot_both_be_given() {
         assert!(Cli::try_parse_from(["tekops", "logs", "/a.log", "--container", "c"]).is_err());
+    }
+
+    /// The selectors are mutually exclusive: asking for both is a contradiction
+    /// clap should reject at parse time rather than something the resolver has
+    /// to arbitrate.
+    #[test]
+    fn bn_and_vc_selectors_cannot_be_combined() {
+        assert!(Cli::try_parse_from(["tekops", "logs", "--bn", "--vc"]).is_err());
+    }
+
+    #[test]
+    fn logs_accepts_the_validator_source_flags() {
+        let cli = Cli::try_parse_from(["tekops", "logs", "--vc-container", "rocketpool_validator"])
+            .unwrap();
+        match cli.command {
+            Commands::Logs { vc_container, .. } => {
+                assert_eq!(vc_container.as_deref(), Some("rocketpool_validator"))
+            }
+            _ => panic!("expected a Logs command"),
+        }
+    }
+
+    /// Naming a container fully determines that slot, so a file for the same
+    /// slot is meaningless - the same reasoning that makes `path` conflict
+    /// with `--container`.
+    #[test]
+    fn the_validator_container_and_file_flags_conflict() {
+        assert!(Cli::try_parse_from([
+            "tekops",
+            "logs",
+            "--vc-container",
+            "c",
+            "--vc-logs-file",
+            "/x.log"
+        ])
+        .is_err());
+    }
+
+    /// Asking for a process that has no log source must say so, naming the
+    /// process and the flags that would fix it. A blank session would look
+    /// like a quiet node rather than a misconfiguration.
+    #[test]
+    fn selecting_a_slot_with_no_source_is_an_error_that_names_it() {
+        let bn_only = crate::logs::LogSources {
+            bn: Some(crate::logs::LogTarget::Container("c".into())),
+            vc: None,
+        };
+        let err = check_selection(&bn_only, Some(Source::Vc)).unwrap_err();
+        assert!(err.contains("vc"), "{err}");
+        assert!(err.contains("--vc-container"), "{err}");
+
+        assert!(check_selection(&bn_only, Some(Source::Bn)).is_ok());
+        assert!(check_selection(&bn_only, None).is_ok());
+    }
+
+    /// The bn-slot error must not accidentally suggest a flag that does not
+    /// exist (`--bn-container`) - the beacon node's flags are the unprefixed
+    /// `--container` and the positional path.
+    #[test]
+    fn selecting_the_bn_slot_with_no_source_names_the_flags_that_actually_exist() {
+        let vc_only = crate::logs::LogSources {
+            bn: None,
+            vc: Some(crate::logs::LogTarget::Container("v".into())),
+        };
+        let err = check_selection(&vc_only, Some(Source::Bn)).unwrap_err();
+        assert!(err.contains("bn"), "{err}");
+        assert!(err.contains("--container"), "{err}");
+        assert!(!err.contains("--bn-container"), "{err}");
+    }
+
+    /// Rule 2 (mutual exclusion by flag/env) runs before rule 3 (`select`
+    /// filtering), so `--bn` on a host where only a validator container is
+    /// detected and no log sits at the default path resolves to
+    /// `LogSources { bn: None, vc: None }` rather than an
+    /// error at the resolver level: `select` only filters what already
+    /// resolved, and nothing did. `check_selection` is what turns that into a
+    /// clear error instead of a session that looks like a quiet, working node.
+    #[test]
+    fn bn_selector_on_a_host_with_only_a_detected_validator_is_a_named_error() {
+        let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+            path: None,
+            container_flag: None,
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: Some("rocketpool_validator".into()),
+            // The validator-only host: no beacon node here, so nothing is at
+            // the default path either. With that file present this is instead
+            // the separated deployment, and the bn slot resolves to it.
+            default_log_present: false,
+            select: Some(Source::Bn),
+        });
+        assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });
+
+        let err = check_selection(&sources, Some(Source::Bn)).unwrap_err();
+        assert!(err.contains("bn"), "{err}");
+        assert!(err.contains("--container"), "{err}");
+    }
+
+    /// The other real invocation the same gap allows: `--container X --vc`.
+    /// Rule 1 grants the whole answer to the stated bn side (`X`) and
+    /// suppresses vc, so rule 3 then drops the bn side too, again landing on
+    /// `LogSources { bn: None, vc: None }` - a silent empty session unless
+    /// `check_selection` names what happened.
+    #[test]
+    fn container_flag_with_vc_selector_is_a_named_error() {
+        let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
+            path: None,
+            container_flag: Some("X".into()),
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: None,
+            default_log_present: false,
+            select: Some(Source::Vc),
+        });
+        assert_eq!(sources, crate::logs::LogSources { bn: None, vc: None });
+
+        let err = check_selection(&sources, Some(Source::Vc)).unwrap_err();
+        assert!(err.contains("vc"), "{err}");
+        assert!(err.contains("--vc-container"), "{err}");
     }
 
     #[test]
@@ -2169,7 +3149,7 @@ mod tests {
     /// report that prints is one the note would have contradicted.
     #[test]
     fn failed_detection_leaves_doctor_on_a_stack_that_reports_no_docker() {
-        let stack = resolve_doctor_stack(None, None, None, None);
+        let stack = resolve_doctor_stack(None, None);
         assert_eq!(stack, Some(Stack::BareMetal));
         assert!(!should_report_unaskable_docker(stack));
     }
@@ -2210,7 +3190,9 @@ mod tests {
             "doctor",
             "--api-url",
             "http://a:5052",
-            "--metric-url",
+            "--bn-metric-url",
+            "http://a:8008/metrics",
+            "--vc-metric-url",
             "http://a:8009/metrics",
             "--stack",
             "rocketpool",
@@ -2222,11 +3204,15 @@ mod tests {
         match cli.command {
             Commands::Doctor {
                 api,
+                bn_metric_url,
+                vc_metric_url,
                 metric_url,
                 data_dir,
             } => {
                 assert_eq!(api.api_url.as_deref(), Some("http://a:5052"));
-                assert_eq!(metric_url.as_deref(), Some("http://a:8009/metrics"));
+                assert_eq!(bn_metric_url.as_deref(), Some("http://a:8008/metrics"));
+                assert_eq!(vc_metric_url.as_deref(), Some("http://a:8009/metrics"));
+                assert_eq!(metric_url, None);
                 assert_eq!(data_dir.as_deref(), Some(Path::new("/data")));
                 assert_eq!(api.stack, Some(Stack::RocketPool));
                 assert!(api.json);
@@ -2264,29 +3250,75 @@ mod tests {
     /// Doctor is the one API command that applies detection to the URL, not
     /// just to a container name, because it runs `docker ps` anyway.
     #[test]
-    fn doctor_stack_ladder_prefers_flag_then_env_then_detection() {
+    fn doctor_stack_ladder_prefers_a_stated_stack_then_detection() {
+        // Flag, env and config are already folded into `stated` by
+        // `resolve_stack`, whose own precedence is tested above.
         assert_eq!(
-            resolve_doctor_stack(Some(Stack::BareMetal), None, Some(Stack::EthDocker), None),
+            resolve_doctor_stack(
+                resolve_stack(Some(Stack::BareMetal), None, None),
+                Some(Stack::EthDocker)
+            ),
             Some(Stack::BareMetal)
         );
         assert_eq!(
             resolve_doctor_stack(
-                None,
-                Some("rocketpool".to_string()),
-                Some(Stack::EthDocker),
-                None
+                resolve_stack(None, Some("rocketpool".to_string()), None),
+                Some(Stack::EthDocker)
             ),
             Some(Stack::RocketPool)
         );
         assert_eq!(
-            resolve_doctor_stack(None, None, Some(Stack::EthDocker), None),
+            resolve_doctor_stack(None, Some(Stack::EthDocker)),
             Some(Stack::EthDocker)
         );
         // The ladder terminates in bare-metal, not None: the report header
         // and the (bare-metal-defaulted) URLs it prints alongside it must
         // never disagree about what "nothing was given" means.
+        assert_eq!(resolve_doctor_stack(None, None), Some(Stack::BareMetal));
+    }
+
+    /// The combined deployment: a consensus container and no validator
+    /// container beside it means the validator is inside that container, so
+    /// its stack answers for both. Terminating in bare-metal instead would
+    /// hand an eth-docker node running Teku in combined mode the bare-metal
+    /// validator metrics port.
+    #[test]
+    fn an_undetected_validator_inherits_the_consensus_containers_stack() {
         assert_eq!(
-            resolve_doctor_stack(None, None, None, None),
+            resolve_doctor_vc_stack(None, None, Some(Stack::EthDocker)),
+            Some(Stack::EthDocker)
+        );
+    }
+
+    /// The reported bug, at the rung that decides it: Rocket Pool supervising
+    /// only a validator, against a beacon node it did not start. The validator
+    /// is on rocketpool and the beacon node is not - the whole report used to
+    /// say "bare-metal" and mean it about both.
+    #[test]
+    fn a_validator_only_stack_does_not_drag_the_beacon_node_with_it() {
+        let detected_bn = None;
+        let detected_vc = Some(Stack::RocketPool);
+
+        assert_eq!(
+            resolve_doctor_stack(None, detected_bn),
+            Some(Stack::BareMetal)
+        );
+        assert_eq!(
+            resolve_doctor_vc_stack(None, detected_vc, detected_bn),
+            Some(Stack::RocketPool)
+        );
+    }
+
+    /// A stated stack describes the whole deployment and outranks both
+    /// detections, the same way it does on every other command.
+    #[test]
+    fn a_stated_stack_beats_validator_detection_too() {
+        assert_eq!(
+            resolve_doctor_vc_stack(
+                Some(Stack::BareMetal),
+                Some(Stack::RocketPool),
+                Some(Stack::EthDocker)
+            ),
             Some(Stack::BareMetal)
         );
     }
@@ -2392,57 +3424,164 @@ mod tests {
 
     /// Carried over from Task 1's review: `resolve_doctor_stack` must prefer a
     /// configured stack over one `docker ps` detected, consistent with
-    /// `flag > env > config > detection`. `resolve_stack` (which this
-    /// delegates to) already folds the config rung in ahead of the `.or(detected)`
-    /// fallback, so a config value wins even when detection found something else.
+    /// `flag > env > config > detection`. `resolve_stack` folds the config
+    /// rung into `stated`, which this prefers over the detected value.
     #[test]
     fn resolve_doctor_stack_prefers_the_config_over_detection() {
+        let stated = resolve_stack(None, None, Some(Stack::RocketPool));
         assert_eq!(
-            resolve_doctor_stack(None, None, Some(Stack::EthDocker), Some(Stack::RocketPool)),
+            resolve_doctor_stack(stated, Some(Stack::EthDocker)),
             Some(Stack::RocketPool)
         );
     }
 
-    /// Carried over from Task 1's review: a configured stack must suppress the
-    /// `docker ps` detection spawn in `doctor_probe_config`, the same way a
-    /// flag or env var already does. The four tests below are pinned directly
-    /// on the extracted gate, `doctor_needs_stack_detection`, rather than on
-    /// `doctor_probe_config`'s output - asserting on the final `stack` would
-    /// still pass even if the `cfg` clause were dropped from the gate
-    /// entirely, since `resolve_doctor_stack` independently prefers a
-    /// configured stack over a detected one.
+    /// Bare-metal, stated by flag, environment or config file, is the one
+    /// answer that leaves `docker ps` nothing to contribute: no stack to
+    /// detect and no container to name. Pinned on the extracted gate rather
+    /// than on `doctor_probe_config`'s output, which cannot be tested without
+    /// Docker.
     #[test]
-    fn doctor_needs_stack_detection_when_nothing_is_stated() {
-        assert!(doctor_needs_stack_detection(None, None, None));
+    fn a_stated_bare_metal_stack_skips_the_docker_ps_spawn() {
+        for stated in [
+            resolve_stack(Some(Stack::BareMetal), None, None),
+            resolve_stack(None, Some("bare-metal".into()), None),
+            resolve_stack(None, None, Some(Stack::BareMetal)),
+        ] {
+            assert!(!doctor_needs_docker_ps(stated));
+        }
+    }
+
+    /// The regression this guards against: a stated Docker stack used to skip
+    /// the spawn, because the gate asked "is the stack still unknown". Doctor
+    /// now inspects two containers, and neither name is knowable without
+    /// asking Docker - both stacks let the operator rename the project prefix.
+    #[test]
+    fn a_stated_docker_stack_still_needs_docker_ps_for_the_container_names() {
+        assert!(doctor_needs_docker_ps(Some(Stack::EthDocker)));
+        assert!(doctor_needs_docker_ps(Some(Stack::RocketPool)));
     }
 
     #[test]
-    fn a_stack_flag_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            Some(Stack::BareMetal),
-            None,
-            None
-        ));
+    fn doctor_needs_docker_ps_when_nothing_is_stated() {
+        assert!(doctor_needs_docker_ps(None));
     }
 
+    /// Two different endpoints, both answering.
     #[test]
-    fn a_stack_env_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            None,
-            Some("rocketpool".into()),
-            None
-        ));
+    fn version_reports_a_separated_deployment_from_two_endpoints() {
+        let mut bn_server = mockito::Server::new();
+        let _bn = bn_server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#)
+            .create();
+        let mut vc_server = mockito::Server::new();
+        let _vc = vc_server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"validator_teku_version_total{version="teku/v25.3.0"} 1"#)
+            .create();
+
+        let report = build_version_report(
+            &format!("{}/metrics", bn_server.url()),
+            &format!("{}/metrics", vc_server.url()),
+        );
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert_eq!(
+            report.validator_client.versions,
+            vec!["teku/v25.3.0".to_string()]
+        );
     }
 
-    /// The clause that matters here: with only `cfg` set, removing it from
-    /// `doctor_needs_stack_detection`'s body is exactly what would make this
-    /// test fail - confirmed by testing the change directly and reverting it.
+    /// Equal URLs mean one process serving both families. The endpoint is
+    /// scraped once, and mockito's default expectation of exactly one hit per
+    /// mock is what proves it.
     #[test]
-    fn a_configured_stack_removes_the_need_for_doctor_to_detect() {
-        assert!(!doctor_needs_stack_detection(
-            None,
-            None,
-            Some(Stack::RocketPool)
-        ));
+    fn version_scrapes_once_when_both_urls_are_the_same() {
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(
+                "beacon_teku_version_total{version=\"teku/v25.4.1\"} 1\n\
+                 validator_teku_version_total{version=\"teku/v25.4.1\"} 1",
+            )
+            .expect(1)
+            .create();
+
+        let url = format!("{}/metrics", server.url());
+        let report = build_version_report(&url, &url);
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert_eq!(
+            report.validator_client.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        m.assert();
+    }
+
+    /// One side down is still a useful answer, so the row carries the reason
+    /// and the command succeeds.
+    #[test]
+    fn version_reports_the_reachable_process_when_the_other_is_down() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/metrics")
+            .with_status(200)
+            .with_body(r#"beacon_teku_version_total{version="teku/v25.4.1"} 1"#)
+            .create();
+
+        let report = build_version_report(
+            &format!("{}/metrics", server.url()),
+            "http://127.0.0.1:1/metrics",
+        );
+        assert_eq!(
+            report.beacon_node.versions,
+            vec!["teku/v25.4.1".to_string()]
+        );
+        assert!(report.validator_client.versions.is_empty());
+        assert!(report.validator_client.error.is_some());
+    }
+
+    /// The spec's exit contract for `version`: two absences is a failed
+    /// command, not a report with two empty rows. Both endpoints here are
+    /// unreachable, so this proves the non-zero exit path rather than the
+    /// "reachable but no version metric" one covered elsewhere.
+    #[test]
+    fn version_fails_when_neither_endpoint_answers() {
+        let err = metrics_version(
+            "http://127.0.0.1:1/metrics",
+            "http://127.0.0.1:1/metrics",
+            false,
+        )
+        .expect_err("neither endpoint answered, so this must fail");
+        assert!(
+            err.to_string().contains("no Teku version metric found"),
+            "{err}"
+        );
+    }
+
+    /// Equal URLs collapse to one scrape (see `build_version_report`), so the
+    /// failure message must name the single endpoint once rather than
+    /// printing the same URL twice joined by "or".
+    #[test]
+    fn version_failure_message_names_the_endpoint_once_when_urls_are_equal() {
+        let err = metrics_version(
+            "http://127.0.0.1:1/metrics",
+            "http://127.0.0.1:1/metrics",
+            false,
+        )
+        .expect_err("neither endpoint answered, so this must fail");
+        let message = err.to_string();
+        assert_eq!(
+            message.matches("127.0.0.1:1/metrics").count(),
+            1,
+            "endpoint named more than once: {message}"
+        );
     }
 }

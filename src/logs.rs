@@ -1,10 +1,14 @@
 use crate::logfmt::format_log_line;
-use std::env;
+use crate::merge::{Merger, Record, Source, MERGE_WINDOW};
+use crate::term::sanitize;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// How much colorized output one session may buffer before it stops following.
 ///
@@ -16,47 +20,126 @@ use std::thread;
 /// truncating a file `less` is holding offsets into corrupts what it displays.
 pub const MAX_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
 
-pub fn stream_logs<R: BufRead, W: Write>(reader: R, writer: &mut W) -> io::Result<()> {
-    stream_logs_capped(reader, writer, MAX_BUFFER_BYTES)
+/// How often the emitter asks the merger what is ready.
+///
+/// Short enough that the merge window dominates the latency an operator can
+/// perceive, long enough that a quiet node is not a spin loop.
+const EMIT_TICK: Duration = Duration::from_millis(50);
+
+/// Writes merged records out, formatted and tagged.
+///
+/// **The tag appears only when there is more than one source**, so a
+/// single-source session's bytes are exactly what they were before this
+/// feature existed. Continuation lines are tagged too: a stack trace whose
+/// second line lost its tag would read as the other process's output.
+///
+/// `written` carries the running byte count across calls because the cap
+/// bounds the whole session rather than one batch, and `max_bytes` is a
+/// parameter so the cap's behaviour is testable without writing 256 MiB.
+/// Returns `true` when the cap was reached, which ends the session's writing.
+/// Hitting it is a normal end, not an error: the session keeps working as
+/// scrollback, so it says so in-band and returns `Ok`.
+fn emit_records<W: Write>(
+    writer: &mut W,
+    records: Vec<Record>,
+    sources: &[Source],
+    written: &mut u64,
+    max_bytes: u64,
+) -> io::Result<bool> {
+    let tagged = sources.len() > 1;
+    for record in records {
+        for line in &record.lines {
+            let formatted = format_log_line(line);
+            let text = if tagged {
+                format!("[{}] {formatted}", record.source.tag())
+            } else {
+                formatted
+            };
+            // +1 for the newline `writeln!` adds.
+            let next = written.saturating_add(text.len() as u64 + 1);
+            if next > max_bytes {
+                writeln!(writer)?;
+                writeln!(
+                    writer,
+                    "*** tekops: {} MiB buffer limit reached, stopped following.",
+                    max_bytes / (1024 * 1024)
+                )?;
+                writeln!(
+                    writer,
+                    "*** Scrollback and search still work. Quit and rerun to resume."
+                )?;
+                writer.flush()?;
+                return Ok(true);
+            }
+            writeln!(writer, "{text}")?;
+            *written = next;
+        }
+    }
+    Ok(false)
 }
 
-/// Formats each line into `writer` until the reader ends or `max_bytes` have
-/// been written, whichever comes first. Hitting the cap is a normal end to the
-/// stream, not an error: the session keeps working as scrollback, so it says so
-/// in-band and returns `Ok`.
-pub fn stream_logs_capped<R: BufRead, W: Write>(
-    reader: R,
-    writer: &mut W,
-    max_bytes: u64,
+/// Drains the merger into the pager's file until every source is finished or
+/// the session is torn down.
+///
+/// **The sole writer**, which is what keeps `MAX_BUFFER_BYTES` bounding the
+/// session as a whole. Letting each producer write its own would split the cap
+/// between them and quietly halve it - the failure `producer_argv`'s doc
+/// comment was already worried about when it chose to merge stderr in the
+/// shell rather than add a second writing thread.
+///
+/// `stop` exists because `is_done` is not reachable from every ending. A
+/// reader thread that dies on an IO error still marks its source EOF (see
+/// `run_logs`), but one that panics does not, and this loop polls rather than
+/// blocking on a pipe, so closing the producers' stdout says nothing to it.
+/// Without an external signal it would spin after the pager exited and
+/// `supervise_pager`'s join would hang on a thread that never returns.
+fn emit_loop(
+    merger: Arc<Mutex<Merger>>,
+    stop: Arc<AtomicBool>,
+    mut writer: impl Write,
+    sources: Vec<Source>,
 ) -> io::Result<()> {
     let mut written: u64 = 0;
-    for line in reader.lines() {
-        let line = line?;
-        let formatted = format_log_line(&line);
-        // +1 for the newline `writeln!` adds.
-        let next = written.saturating_add(formatted.len() as u64 + 1);
-        if next > max_bytes {
-            writeln!(writer)?;
-            writeln!(
-                writer,
-                "*** tekops: {} MiB buffer limit reached, stopped following.",
-                max_bytes / (1024 * 1024)
-            )?;
-            writeln!(
-                writer,
-                "*** Scrollback and search still work. Quit and rerun to resume."
-            )?;
-            writer.flush()?;
+
+    loop {
+        let stopping = stop.load(Ordering::Relaxed);
+        let (ready, done, skew) = {
+            let mut m = merger.lock().expect("merger mutex poisoned");
+            // Once stopping, the window can produce nothing new: take
+            // everything rather than leaving the session's tail unwritten.
+            let ready = if stopping {
+                m.drain_all()
+            } else {
+                // This tick is the only thing that releases the newest record
+                // of a source that has gone quiet. Neither producer ever
+                // reaches EOF, so without it the last line the node wrote
+                // would wait for the next one - a whole slot on a quiet
+                // beacon node, and forever on one that has stopped.
+                let now = Instant::now();
+                m.flush_stale(now);
+                m.drain_ready(now)
+            };
+            (ready, m.is_done(), m.take_skew_note())
+        };
+
+        // Written before the records it explains. An interleaving of two
+        // clocks that disagree looks like a broken merge, and the operator
+        // cannot act on it without being told which knob to turn.
+        if let Some(note) = skew {
+            writeln!(writer, "*** tekops: {}", sanitize(&note))?;
+        }
+        if emit_records(&mut writer, ready, &sources, &mut written, MAX_BUFFER_BYTES)? {
             return Ok(());
         }
-        writeln!(writer, "{formatted}")?;
-        written = next;
+        if done || stopping {
+            return Ok(());
+        }
+        thread::sleep(EMIT_TICK);
     }
-    Ok(())
 }
 
 /// The path the old bashrc function tailed.
-const DEFAULT_TEKU_LOG: &str = "/var/log/teku/teku.log";
+pub(crate) const DEFAULT_TEKU_LOG: &str = "/var/log/teku/teku.log";
 
 /// Where one `tekops logs` session reads from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,65 +148,190 @@ pub enum LogTarget {
     Container(String),
 }
 
-/// Resolves what `tekops logs` should read, given everything that can say so.
+/// What one `tekops logs` session reads, per process.
 ///
-/// Precedence, highest first: the `--container` flag or positional path (clap
-/// keeps those mutually exclusive, so there is no ordering question between
-/// them), then `$TEKOPS_CONTAINER`, then `$TEKOPS_LOGS_FILE`, then the config
-/// file's `container`, then its `logs_file`, then `docker ps` detection, then
-/// the hardcoded default.
+/// `None` in a slot means that process has no log source, which is the normal
+/// state of an all-in-one node's `vc` slot - not an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSources {
+    pub bn: Option<LogTarget>,
+    pub vc: Option<LogTarget>,
+}
+
+impl LogSources {
+    /// The sources that resolved, in a stable order. Feeds `Merger::new`, so
+    /// the order here is also the tie-break order for equal timestamps.
+    pub fn active(&self) -> Vec<Source> {
+        let mut out = Vec::new();
+        if self.bn.is_some() {
+            out.push(Source::Bn);
+        }
+        if self.vc.is_some() {
+            out.push(Source::Vc);
+        }
+        out
+    }
+}
+
+/// Everything that can say where the logs are.
 ///
-/// The principle is: flags beat environment beats config beats detection beats
-/// hardcoded default. Config sits below the environment because a variable is
-/// the more specific act - it was typed for this session - and above detection
-/// because a value the operator wrote down beats one tekops guessed. Within
-/// each tier, naming a container beats naming a file, for the same reason in
-/// both: it is the more specific statement.
-///
-/// Detection sits below everything the operator stated and above the hardcoded
-/// path, which is the only placement that behaves. Above the positional path,
-/// `tekops logs /var/log/teku/teku.log` would tail a container on any host
-/// that also runs Docker; below the hardcoded default, a Docker host would
-/// always fail on a path that does not exist there.
-///
-/// Every input arrives as a parameter rather than being read here, so the whole
+/// A struct rather than fifteen positional parameters, and every field
+/// arrives as a value rather than being read here, so the whole precedence
 /// ladder is testable with no environment races and no Docker installed.
+pub struct SourceInputs {
+    pub path: Option<PathBuf>,
+    pub container_flag: Option<String>,
+    pub vc_container_flag: Option<String>,
+    pub vc_logs_file_flag: Option<PathBuf>,
+    pub container_env: Option<String>,
+    pub logs_file_env: Option<String>,
+    pub vc_container_env: Option<String>,
+    pub vc_logs_file_env: Option<String>,
+    pub container_cfg: Option<String>,
+    pub logs_file_cfg: Option<PathBuf>,
+    pub vc_container_cfg: Option<String>,
+    pub vc_logs_file_cfg: Option<PathBuf>,
+    pub detected_bn: Option<String>,
+    pub detected_vc: Option<String>,
+    /// Whether `DEFAULT_TEKU_LOG` exists on this host. Read by the caller
+    /// rather than here, like every other field, so the ladder stays pure.
+    /// This is the only evidence tekops has of a bare-metal beacon node: it
+    /// runs under no container, so detection cannot see it.
+    pub default_log_present: bool,
+    /// `--bn` / `--vc`: filters what resolved, rather than naming anything.
+    pub select: Option<Source>,
+}
+
+/// Resolves both processes' log sources.
+///
+/// Each slot runs the same ladder the single source used to:
+/// flag > environment > config file > detection. Within a tier, naming a
+/// container beats naming a file, because it is the more specific statement.
+///
+/// Three rules sit on top, and each exists to stop a specific wrong answer:
+///
+/// 1. **Stating one side by flag or environment variable yields that side
+///    only.** The config file does not count, and neither does detection -
+///    only the flag and environment tiers gate this. A flag or a variable is
+///    typed for this invocation; config is ambient, describing the node
+///    rather than expressing an intent for this run, so it free-mixes with
+///    the other side exactly as detection does. This is what keeps `tekops
+///    logs --container rocketpool_validator` printing exactly the one stream
+///    it prints today, on a host where detection also finds a consensus
+///    container - an invocation that works today must keep working
+///    unchanged. It also means a *configured* `container` alongside a
+///    *detected* validator now yields both streams: that is the separated
+///    deployment this feature exists for, and the new behaviour is
+///    intentional, not a regression of rule 1.
+/// 2. **The hardcoded default answers the bn slot when that file is actually
+///    there**, and otherwise only as a whole-command last resort. A bare-metal
+///    beacon node is invisible to detection - it runs under no container - so
+///    on a host running one beside a Rocket Pool validator, an operator with
+///    no config file has nothing that can fill the bn slot except the path
+///    itself existing. Keeping the existence gate is what stops a pure Rocket
+///    Pool node being handed a "file not found" for a path it never had, and
+///    the whole-command fallback is what keeps that message printing when
+///    nothing resolved at all.
+/// 3. **`select` filters afterwards.** It names nothing, so it cannot
+///    interact with rule 1.
 ///
 /// `cli.rs::needs_detection` is this function's precedence list negated by
-/// hand. Adding a rung above `detected` means adding a clause there, or a
-/// configured operator pays for a `docker ps` spawn whose answer cannot be
-/// used.
-pub fn resolve_log_target(
-    path: Option<PathBuf>,
-    container_flag: Option<String>,
-    container_env: Option<String>,
-    teku_logs_file_env: Option<String>,
-    container_cfg: Option<String>,
-    logs_file_cfg: Option<PathBuf>,
-    detected: Option<String>,
-) -> LogTarget {
-    if let Some(c) = container_flag {
-        return LogTarget::Container(c);
+/// hand, and since R12 the negation is per-slot: detection is skippable only
+/// when *both* slots are already answered. The bn rungs alone no longer
+/// suppress the spawn, because `docker ps` now also answers `detected_vc` -
+/// a host with `logs_file` configured and a Rocket Pool validator container
+/// running needs that spawn to find its second stream at all. So a rung
+/// added above `detected_bn`/`detected_vc` means a clause added there, and a
+/// rung that only answers one slot must not gate the whole condition. Get
+/// the first wrong and a configured operator pays for a `docker ps` spawn
+/// whose answer cannot be used; get the second wrong and a separated
+/// deployment silently keeps printing one stream.
+pub fn resolve_log_sources(inputs: SourceInputs) -> LogSources {
+    let bn_flags = [
+        inputs.container_flag.map(LogTarget::Container),
+        inputs.path.map(LogTarget::File),
+    ];
+    let bn_env = [
+        inputs.container_env.map(LogTarget::Container),
+        inputs
+            .logs_file_env
+            .map(|p| LogTarget::File(PathBuf::from(p))),
+    ];
+    let bn_cfg = [
+        inputs.container_cfg.map(LogTarget::Container),
+        inputs.logs_file_cfg.map(LogTarget::File),
+    ];
+    // Rule 1's gate: flag or environment variable only, never config.
+    let bn_explicit = first_target(bn_flags.clone(), bn_env.clone(), [None, None]);
+    let bn_stated = first_target(bn_flags, bn_env, bn_cfg);
+
+    let vc_flags = [
+        inputs.vc_container_flag.map(LogTarget::Container),
+        inputs.vc_logs_file_flag.map(LogTarget::File),
+    ];
+    let vc_env = [
+        inputs.vc_container_env.map(LogTarget::Container),
+        inputs
+            .vc_logs_file_env
+            .map(|p| LogTarget::File(PathBuf::from(p))),
+    ];
+    let vc_cfg = [
+        inputs.vc_container_cfg.map(LogTarget::Container),
+        inputs.vc_logs_file_cfg.map(LogTarget::File),
+    ];
+    let vc_explicit = first_target(vc_flags.clone(), vc_env.clone(), [None, None]);
+    let vc_stated = first_target(vc_flags, vc_env, vc_cfg);
+
+    // Rule 1: an unstated side stays silent when the other was stated by
+    // flag or environment variable. Config and detection free-mix on both
+    // sides otherwise, which is why the fallthrough arm below still resolves
+    // both independently through the full ladder.
+    let (mut bn, mut vc) = match (bn_explicit.is_some(), vc_explicit.is_some()) {
+        (true, false) => (bn_stated, None),
+        (false, true) => (None, vc_stated),
+        _ => (
+            bn_stated
+                .or_else(|| inputs.detected_bn.map(LogTarget::Container))
+                // Rule 2's per-slot half. A bare-metal beacon node runs under
+                // no container, so `detected_bn` cannot see it and an operator
+                // who never wrote a config file has nothing else to offer -
+                // the file being there is the evidence. Gated on the file
+                // existing so the validator-only host rule 2 protects still
+                // gets no default at all; gated inside this arm so rule 1
+                // keeps outranking it.
+                .or_else(|| {
+                    inputs
+                        .default_log_present
+                        .then(|| LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+                }),
+            vc_stated.or_else(|| inputs.detected_vc.map(LogTarget::Container)),
+        ),
+    };
+
+    // Rule 2: with nothing resolved at all, the hardcoded path answers anyway,
+    // so the operator gets "log file not found: <path>" rather than silence.
+    if bn.is_none() && vc.is_none() {
+        bn = Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)));
     }
-    if let Some(p) = path {
-        return LogTarget::File(p);
+
+    // Rule 3.
+    match inputs.select {
+        Some(Source::Bn) => vc = None,
+        Some(Source::Vc) => bn = None,
+        None => {}
     }
-    if let Some(c) = container_env {
-        return LogTarget::Container(c);
-    }
-    if let Some(p) = teku_logs_file_env {
-        return LogTarget::File(PathBuf::from(p));
-    }
-    if let Some(c) = container_cfg {
-        return LogTarget::Container(c);
-    }
-    if let Some(p) = logs_file_cfg {
-        return LogTarget::File(p);
-    }
-    if let Some(c) = detected {
-        return LogTarget::Container(c);
-    }
-    LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
+
+    LogSources { bn, vc }
+}
+
+/// The first target present, tier by tier, container before file within a
+/// tier.
+fn first_target(
+    flags: [Option<LogTarget>; 2],
+    env: [Option<LogTarget>; 2],
+    cfg: [Option<LogTarget>; 2],
+) -> Option<LogTarget> {
+    flags.into_iter().chain(env).chain(cfg).flatten().next()
 }
 
 /// Whether a producer follows the log forever or stops at the end of it.
@@ -201,32 +409,99 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
     }
 }
 
-pub fn run_logs(
-    path: Option<PathBuf>,
-    lines: u32,
-    container: Option<String>,
-    container_cfg: Option<String>,
-    logs_file_cfg: Option<PathBuf>,
-    detected: Option<String>,
-) -> ExitCode {
-    let target = resolve_log_target(
-        path,
-        container,
-        env::var("TEKOPS_CONTAINER").ok(),
-        env::var("TEKOPS_LOGS_FILE").ok(),
-        container_cfg,
-        logs_file_cfg,
-        detected,
-    );
+/// The single stream this interim `run_logs` shows, from an already-resolved
+/// `LogSources`.
+///
+/// Task 5 widened `resolve_log_sources` to fill the `vc` slot on its own -
+/// `tekops logs --vc-container x` resolves to `{ bn: None, vc: Some(x) }` -
+/// so a target picker that only ever looked at `.bn` would tail the
+/// hardcoded default path (or report it missing) for an operator who never
+/// mentioned it and explicitly asked for the validator's log instead. Falling
+/// back to `.vc` when `.bn` is empty fixes that; preferring `.bn` when both
+/// are present keeps today's single-source behaviour unchanged on every
+/// combined deployment, where `.bn` is what used to print. The hardcoded
+/// default is the true last resort, reached only when neither slot resolved
+/// at all - `resolve_log_sources`'s rule 2 already makes that the "nothing
+/// stated, nothing detected" case exclusively.
+/// The target for one slot, if that slot resolved to anything.
+pub(crate) fn slot_target(sources: &LogSources, source: Source) -> Option<&LogTarget> {
+    match source {
+        Source::Bn => sources.bn.as_ref(),
+        Source::Vc => sources.vc.as_ref(),
+    }
+}
 
-    // Only a file can be checked for existence up front. A container's absence
-    // surfaces as `docker logs` exiting non-zero, which reaches the operator
-    // through the pager's own teardown.
-    if let LogTarget::File(ref p) = target {
-        if !p.exists() {
-            eprintln!("error: log file not found: {}", p.display());
-            return ExitCode::FAILURE;
+/// Why a file target cannot be read, if it cannot be.
+///
+/// An `exists()` check is not enough, and the gap is not theoretical: a
+/// bare-metal Teku writes `/var/log/teku/teku.log` owned by its own service
+/// user, so the path is plainly there and unreadable to the operator running
+/// tekops. Existence alone let that slot spawn a `tail` that died instantly,
+/// and because a file producer's stderr is the terminal `less` is about to
+/// paint over, the session then showed the *other* process's lines under a
+/// `[vc]` tag and said nothing at all about the missing half. Opening the file
+/// is what distinguishes the two, so the reason can be named before the pager
+/// starts.
+fn file_failure(path: &Path) -> Option<String> {
+    match std::fs::File::open(path) {
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Some(format!("log file not found: {}", path.display()))
         }
+        Err(e) => Some(format!("cannot read log file {}: {e}", path.display())),
+    }
+}
+
+/// This host's clock, in milliseconds since the epoch.
+///
+/// Paired with each line's arrival so `Merger` can estimate how far that
+/// source's own stamps sit from this clock - the correction that lets a
+/// bare-metal beacon node logging local time merge with a container logging
+/// UTC. `Instant` cannot serve: it is only comparable to itself, and the
+/// comparison needed here is against the times a process writes into its log.
+///
+/// Before the epoch is not a time any of this has to handle, so the failure
+/// is 0 rather than an error - which makes every offset look like the full
+/// age of the log, and the merge fall back to the printed stamps.
+pub(crate) fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Says so when a file target is empty, because the session cannot.
+///
+/// An empty file is not a failure - `tail -F` will follow it and a log that
+/// has just been rotated is briefly empty - so the source still starts. But
+/// `tail -n 500` on an empty file prints nothing and follows forever, which
+/// on screen is indistinguishable from a healthy process that has not spoken
+/// yet. The likely cause is a stale placeholder at a path the process no
+/// longer writes to, and a node logging to journald or to a rotated filename
+/// leaves exactly that behind, so the note names the path and the process
+/// rather than leaving an empty pager to be interpreted.
+fn empty_file_note(path: &Path, source: Source) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    (len == 0).then(|| {
+        format!(
+            "{} log file is empty: {} - is that where this process writes?",
+            source.tag(),
+            path.display()
+        )
+    })
+}
+
+/// Tails every resolved source at once, merged into one timeline.
+///
+/// One producer per source, one reader thread each feeding a shared `Merger`,
+/// and a single emitter thread writing the merged result into the file `less`
+/// reads. The merge rule itself lives in `merge.rs` and is pure; everything
+/// here is the IO around it.
+pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
+    let active = sources.active();
+    if active.is_empty() {
+        eprintln!("error: no log source to read");
+        return ExitCode::FAILURE;
     }
 
     // The terminal delivers Ctrl+C to the whole foreground process group. `less`
@@ -259,22 +534,64 @@ pub fn run_logs(
         return ExitCode::FAILURE;
     }
 
-    let (prog, args) = producer_argv(&target, lines, Mode::Follow);
-    let mut producer = match Command::new(&prog)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .process_group(0)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("error: failed to spawn {prog}: {e}");
-            if let LogTarget::Container(_) = target {
-                eprintln!("reading container logs needs the docker CLI on $PATH");
+    // One producer per resolved source. A source that cannot start is recorded
+    // rather than fatal: on a separated node the commonest failure is a beacon
+    // node whose default log path does not exist, and killing the session over
+    // it would take the working half down too. The reasons are only promoted to
+    // `error:` if NO source starts, which keeps a single-source session's
+    // output byte-identical to what it was before this feature existed.
+    let mut producers: Vec<(Source, Child)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    // Not failures: the source starts, and may yet produce something. They
+    // exist because the buffer they are written into cannot distinguish an
+    // empty file from a quiet node, and the operator cannot either.
+    let mut notes: Vec<String> = Vec::new();
+    for source in &active {
+        let Some(target) = slot_target(&sources, *source) else {
+            continue;
+        };
+
+        // Only a file can be checked up front. A container's absence surfaces
+        // as `docker logs` exiting non-zero, which reaches the operator
+        // through the pager's own teardown.
+        if let LogTarget::File(p) = target {
+            if let Some(why) = file_failure(p) {
+                failures.push(why);
+                continue;
             }
-            return ExitCode::FAILURE;
+            if let Some(note) = empty_file_note(p, *source) {
+                notes.push(note);
+            }
         }
-    };
+
+        let (prog, args) = producer_argv(target, lines, Mode::Follow);
+        match Command::new(&prog)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+        {
+            Ok(child) => producers.push((*source, child)),
+            Err(e) => {
+                let mut why = format!("failed to spawn {prog}: {e}");
+                if let LogTarget::Container(_) = target {
+                    why.push_str("\nreading container logs needs the docker CLI on $PATH");
+                }
+                failures.push(why);
+            }
+        }
+    }
+    if producers.is_empty() {
+        for why in &failures {
+            eprintln!("error: {why}");
+        }
+        return ExitCode::FAILURE;
+    }
+    // The surviving sources' failures are NOT reported on stderr. `less` is
+    // about to take the alternate screen and paint over anything written here,
+    // so a note printed now is a note the operator never sees - which is how a
+    // beacon node that failed to start managed to look like a beacon node with
+    // nothing to say. They go into the buffer instead, below.
 
     // `less` is fed through a real temp file rather than piped directly into its
     // stdin. A pipe has no knowable end short of reading more of it, so a search
@@ -287,12 +604,12 @@ pub fn run_logs(
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to create temp file for log output: {e}");
-            let _ = producer.kill();
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
 
-    let mut pager = match Command::new("less")
+    let pager = match Command::new("less")
         .args(["-R", "+F"])
         .arg(sink.path())
         .spawn()
@@ -300,49 +617,126 @@ pub fn run_logs(
         Ok(child) => child,
         Err(e) => {
             eprintln!("error: failed to spawn less: {e}");
-            let _ = producer.kill();
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
 
-    // Both of these can fail for real (fd exhaustion, /tmp remounted read-only)
-    // and both happen with the pager already on screen, so a panic here would
-    // dump a Rust backtrace over a live `less` and skip the cleanup below.
-    //
-    // On the container path, a container that isn't running makes `docker logs`
-    // write an error to stderr and exit non-zero. Because `producer_argv` merged
-    // that stderr into this same stdout stream with `2>&1`, it arrives here as
-    // just another line, flows through `stream_logs` and `format_log_line` like
-    // any other, and is sanitized by the passthrough branch rather than reaching
-    // the terminal raw. That is the whole error-reporting path for a missing
-    // container - there is no separate one, and there should not be one added.
-    let Some(stdout) = producer.stdout.take() else {
-        eprintln!("error: log producer stdout was not piped");
-        let _ = pager.kill();
-        let _ = producer.kill();
-        return ExitCode::FAILURE;
-    };
-    let writer = match sink.reopen() {
+    // This can fail for real (fd exhaustion, /tmp remounted read-only) and it
+    // happens with the pager already on screen, so a panic here would dump a
+    // Rust backtrace over a live `less` and skip the cleanup below.
+    let mut writer = match sink.reopen() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to open temp file for writing: {e}");
-            let _ = pager.kill();
-            let _ = producer.kill();
+            kill_pager(pager);
+            kill_all(&mut producers);
             return ExitCode::FAILURE;
         }
     };
-    match supervise_pager(
-        pager,
-        producer,
-        BufReader::new(stdout),
-        LineWriter::new(writer),
-    ) {
+
+    // A source that did not start is named at the head of the buffer, where
+    // the pager will show it. Failing to write the notes is not worth ending a
+    // session over - the logs themselves are what the operator came for.
+    let mut said_something = false;
+    for why in failures.iter().chain(notes.iter()) {
+        let _ = writeln!(writer, "*** tekops: {}", sanitize(why));
+        said_something = true;
+    }
+    if said_something {
+        let _ = writeln!(writer);
+    }
+
+    // Only the sources that actually started get a slot in the merger, so a
+    // source that was dropped above cannot block the merge waiting for lines
+    // that will never come.
+    let started: Vec<Source> = producers.iter().map(|(s, _)| *s).collect();
+    let session_start_ms = wall_clock_ms();
+    let merger = Arc::new(Mutex::new(Merger::new(
+        started.clone(),
+        MERGE_WINDOW,
+        Instant::now(),
+        session_start_ms,
+    )));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut children: Vec<Child> = Vec::new();
+    let mut workers: Vec<thread::JoinHandle<io::Result<()>>> = Vec::new();
+    for (source, mut child) in producers {
+        // On the container path, a container that isn't running makes `docker
+        // logs` write an error to stderr and exit non-zero. Because
+        // `producer_argv` merged that stderr into this same stdout stream with
+        // `2>&1`, it arrives here as just another line, flows through
+        // `format_log_line` like any other, and is sanitized by the passthrough
+        // branch rather than reaching the terminal raw. That is the whole
+        // error-reporting path for a missing container - there is no separate
+        // one, and there should not be one added.
+        let Some(stdout) = child.stdout.take() else {
+            eprintln!("error: log producer stdout was not piped");
+            let _ = child.kill();
+            for c in children.iter_mut() {
+                let _ = c.kill();
+            }
+            kill_pager(pager);
+            return ExitCode::FAILURE;
+        };
+        children.push(child);
+
+        let merger = Arc::clone(&merger);
+        workers.push(thread::spawn(move || -> io::Result<()> {
+            // Lines go straight into the merger, which owns this source's
+            // `RecordBuilder`. This thread blocks on `read_line` between lines,
+            // so it is the wrong place to decide that a record has waited long
+            // enough - the emitter's tick does that, through
+            // `Merger::flush_stale`.
+            //
+            // The read loop is wrapped so that EOF is recorded even when a line
+            // read fails. A source that never reaches EOF is never idle either,
+            // so the merger would hold the other source's records forever
+            // waiting on one that has already given up.
+            let result = (|| -> io::Result<()> {
+                for line in BufReader::new(stdout).lines() {
+                    let line = line?;
+                    merger.lock().expect("merger mutex poisoned").push_line(
+                        source,
+                        &line,
+                        Instant::now(),
+                        wall_clock_ms(),
+                    );
+                }
+                Ok(())
+            })();
+
+            // `eof` finishes whatever record this source was still holding.
+            merger.lock().expect("merger mutex poisoned").eof(source);
+            result
+        }));
+    }
+
+    workers.push({
+        let merger = Arc::clone(&merger);
+        let stop = Arc::clone(&stop);
+        let sources = started.clone();
+        thread::spawn(move || emit_loop(merger, stop, LineWriter::new(writer), sources))
+    });
+
+    match supervise_pager(pager, children, workers, stop) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error while streaming logs: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn kill_all(producers: &mut [(Source, Child)]) {
+    for (_, child) in producers.iter_mut() {
+        let _ = child.kill();
+    }
+}
+
+fn kill_pager(mut pager: Child) {
+    let _ = pager.kill();
 }
 
 /// Runs the streaming loop against `reader` while the pager owns process
@@ -356,123 +750,220 @@ pub fn run_logs(
 /// and only once the pager has exited kill the producer. Killing it is what
 /// closes the pipe and gives the worker its EOF; joining before the kill
 /// deadlocks instead.
+/// Two producers rather than one changes none of that, but every one of them
+/// must be killed before any join, or a still-running producer holds its reader
+/// thread open and the join hangs exactly as it would have with one.
+///
+/// `stop` is set after the kills and before the joins, for the emitter: it
+/// polls the merger rather than blocking on a pipe, so nothing about closing
+/// the producers' stdout reaches it.
 fn supervise_pager(
     mut pager: Child,
-    mut tail: Child,
-    reader: impl BufRead + Send + 'static,
-    mut writer: impl Write + Send + 'static,
+    mut producers: Vec<Child>,
+    workers: Vec<thread::JoinHandle<io::Result<()>>>,
+    stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let streaming = thread::spawn(move || stream_logs(reader, &mut writer));
-
     let _ = pager.wait();
-    let _ = tail.kill();
-    let _ = tail.wait();
-
-    match streaming.join() {
-        Ok(result) => result,
-        // The pager has already exited by this point, so the terminal is the
-        // user's again and a plain error beats a propagated panic.
-        Err(_) => Err(io::Error::other("log streaming thread panicked")),
+    for p in producers.iter_mut() {
+        let _ = p.kill();
     }
+    for p in producers.iter_mut() {
+        let _ = p.wait();
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    // The first failure wins, but every worker is still joined: returning early
+    // would leave the rest detached, and their producers are already dead.
+    let mut result = Ok(());
+    for w in workers {
+        match w.join() {
+            Ok(Err(e)) if result.is_ok() => result = Err(e),
+            // The pager has already exited by this point, so the terminal is
+            // the user's again and a plain error beats a propagated panic.
+            Err(_) if result.is_ok() => {
+                result = Err(io::Error::other("log streaming thread panicked"))
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+
+    fn record(source: Source, ms: i64, lines: Vec<String>) -> Record {
+        Record {
+            source,
+            time: crate::logfmt::LogTime(ms),
+            lines,
+        }
+    }
+
+    fn json_line(level: &str, message: &str) -> String {
+        format!(
+            "{{\"@timestamp\":\"t\",\"level\":\"{level}\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"{message}\"}}"
+        )
+    }
+
+    /// Emits with the cap out of reach, for the tests that are about
+    /// formatting rather than the bound.
+    fn emit(records: Vec<Record>, sources: &[Source]) -> String {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        emit_records(&mut out, records, sources, &mut written, MAX_BUFFER_BYTES).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn bn_lines(count: i64) -> Vec<Record> {
+        (0..count)
+            .map(|i| record(Source::Bn, i, vec![json_line("INFO", &format!("line{i}"))]))
+            .collect()
+    }
 
     #[test]
-    fn streams_and_formats_each_line() {
-        let input = "{\"@timestamp\":\"t\",\"level\":\"INFO\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"one\"}\n\
-                      {\"@timestamp\":\"t\",\"level\":\"ERROR\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"two\"}\n";
-        let reader = Cursor::new(input);
-        let mut output = Vec::new();
-
-        stream_logs(reader, &mut output).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("INFO [t1] C - one"));
-        assert!(output.contains("ERROR [t1] C - two"));
-        assert_eq!(output.lines().count(), 2);
+    fn emits_and_formats_each_line() {
+        let out = emit(
+            vec![
+                record(Source::Bn, 0, vec![json_line("INFO", "one")]),
+                record(Source::Bn, 1, vec![json_line("ERROR", "two")]),
+            ],
+            &[Source::Bn],
+        );
+        assert!(out.contains("INFO [t1] C - one"));
+        assert!(out.contains("ERROR [t1] C - two"));
+        assert_eq!(out.lines().count(), 2);
     }
 
     #[test]
     fn passes_through_malformed_lines() {
-        let reader = Cursor::new("garbage\n");
-        let mut output = Vec::new();
-
-        stream_logs(reader, &mut output).unwrap();
-
-        assert_eq!(String::from_utf8(output).unwrap().trim_end(), "garbage");
+        let out = emit(
+            vec![record(Source::Bn, 0, vec!["garbage".to_string()])],
+            &[Source::Bn],
+        );
+        assert_eq!(out.trim_end(), "garbage");
     }
 
-    fn log_line(message: &str) -> String {
-        format!(
-            "{{\"@timestamp\":\"t\",\"level\":\"INFO\",\"thread\":\"t1\",\"class\":\"C\",\"message\":\"{message}\"}}\n"
-        )
+    /// The regression that matters most in this feature: with one source, the
+    /// bytes are exactly what they were before any of it existed. No tag.
+    #[test]
+    fn a_single_source_session_emits_no_tag() {
+        let out = emit(
+            vec![record(Source::Bn, 0, vec![json_line("INFO", "hello")])],
+            &[Source::Bn],
+        );
+        assert!(out.contains("INFO [t1] C - hello"), "{out}");
+        assert!(!out.contains("[bn]"), "no tag on a single source: {out}");
+    }
+
+    /// With two sources every line says which it came from, continuation lines
+    /// included - a stack trace whose second line lost its tag would read as
+    /// the other process's output.
+    #[test]
+    fn two_sources_tag_every_line_including_continuations() {
+        let out = emit(
+            vec![
+                record(
+                    Source::Bn,
+                    0,
+                    vec![
+                        "2026-09-14 01:16:54.217 ERROR - boom".to_string(),
+                        "\tat Foo.java:42".to_string(),
+                    ],
+                ),
+                record(
+                    Source::Vc,
+                    1,
+                    vec!["2026-09-14 01:16:54.218 INFO  - fine".to_string()],
+                ),
+            ],
+            &[Source::Bn, Source::Vc],
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("[bn] "), "{:?}", lines[0]);
+        assert!(lines[1].starts_with("[bn] "), "{:?}", lines[1]);
+        assert!(lines[2].starts_with("[vc] "), "{:?}", lines[2]);
     }
 
     #[test]
-    fn stops_following_once_the_buffer_cap_is_reached() {
-        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
+    fn stops_emitting_once_the_buffer_cap_is_reached() {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        let hit = emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, 200).unwrap();
 
-        stream_logs_capped(Cursor::new(input), &mut output, 200).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
+        assert!(hit, "should report the cap was reached");
+        let out = String::from_utf8(out).unwrap();
         assert!(
-            output.contains("buffer limit reached"),
-            "no notice emitted: {output:?}"
+            out.contains("buffer limit reached"),
+            "no notice emitted: {out:?}"
         );
-        assert!(output.contains("Quit and rerun to resume"));
+        assert!(out.contains("Quit and rerun to resume"));
         assert!(
-            output.contains("line0"),
+            out.contains("line0"),
             "content before the cap should survive"
         );
         assert!(
-            !output.contains("line499"),
+            !out.contains("line499"),
             "content past the cap should be dropped"
         );
     }
 
     #[test]
     fn buffer_cap_bounds_what_is_written() {
-        let input: String = (0..500).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
+        let mut out = Vec::new();
+        let mut written = 0u64;
         let cap = 1024;
-
-        stream_logs_capped(Cursor::new(input), &mut output, cap).unwrap();
+        emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, cap).unwrap();
 
         // The log content itself stays under the cap; only the fixed-size
         // notice is allowed past it, so the bound stays meaningful.
         assert!(
-            (output.len() as u64) < cap + 200,
+            (out.len() as u64) < cap + 200,
             "wrote {} bytes for a {cap}-byte cap",
-            output.len()
+            out.len()
         );
     }
 
     #[test]
     fn a_stream_under_the_cap_is_untouched_and_has_no_notice() {
-        let input = log_line("only line");
-        let mut output = Vec::new();
-
-        stream_logs_capped(Cursor::new(input), &mut output, MAX_BUFFER_BYTES).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("only line"));
-        assert!(
-            !output.contains("buffer limit"),
-            "notice on an under-cap stream: {output:?}"
+        let out = emit(
+            vec![record(Source::Bn, 0, vec![json_line("INFO", "only line")])],
+            &[Source::Bn],
         );
-        assert_eq!(output.lines().count(), 1);
+        assert!(out.contains("only line"));
+        assert!(
+            !out.contains("buffer limit"),
+            "notice on an under-cap stream: {out:?}"
+        );
+        assert_eq!(out.lines().count(), 1);
     }
 
+    /// Hitting the cap ends the session's writing but is not a failure - the
+    /// buffer still works as scrollback, which is why it says so in-band.
     #[test]
     fn hitting_the_cap_is_not_an_error() {
-        let input: String = (0..100).map(|i| log_line(&format!("line{i}"))).collect();
-        let mut output = Vec::new();
-        assert!(stream_logs_capped(Cursor::new(input), &mut output, 50).is_ok());
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        assert!(emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, 50).is_ok());
+    }
+
+    /// The cap bounds the whole session, not one batch, which is the property
+    /// that has to survive having two producers instead of one.
+    #[test]
+    fn the_cap_accumulates_across_calls() {
+        let mut out = Vec::new();
+        let mut written = 0u64;
+        let cap = 400;
+
+        let first = emit_records(&mut out, bn_lines(4), &[Source::Bn], &mut written, cap).unwrap();
+        assert!(!first, "four short lines should fit under {cap}");
+        assert!(written > 0, "the running total must carry forward");
+
+        let second =
+            emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, cap).unwrap();
+        assert!(second, "the second batch should cross the same cap");
     }
 
     #[test]
@@ -496,18 +987,35 @@ mod tests {
     /// the pager on a quiet log must still end the session. If the wait/kill
     /// ordering is inverted this test hangs rather than fails, so it runs on a
     /// worker thread with a hard deadline.
+    /// A reader thread shaped like `run_logs`'s: it blocks on the producer's
+    /// stdout and only ends when the pipe closes.
+    fn blocking_reader(stdout: std::process::ChildStdout) -> thread::JoinHandle<io::Result<()>> {
+        thread::spawn(move || -> io::Result<()> {
+            for line in BufReader::new(stdout).lines() {
+                let _ = line?;
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn supervise_pager_returns_once_the_pager_exits_even_if_the_log_is_silent() {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut tail = never_ending_child();
             let stdout = tail.stdout.take().expect("piped");
+            let worker = blocking_reader(stdout);
             // A pager that exits promptly, as if the user pressed `q`.
             let pager = Command::new("sleep")
                 .arg("0.2")
                 .spawn()
                 .expect("spawn pager stand-in");
-            let result = supervise_pager(pager, tail, BufReader::new(stdout), io::sink());
+            let result = supervise_pager(
+                pager,
+                vec![tail],
+                vec![worker],
+                Arc::new(AtomicBool::new(false)),
+            );
             let _ = done_tx.send(result.is_ok());
         });
 
@@ -520,44 +1028,50 @@ mod tests {
         }
     }
 
-    /// The tailer must not outlive the session; leaking it was the original
-    /// bug behind the process-group work.
+    /// Every producer, not just the first. A survivor holds its reader thread
+    /// open and the join below it hangs; leaking one was the original bug
+    /// behind the process-group work.
     #[test]
-    fn supervise_pager_reaps_the_tailer() {
-        let mut tail = never_ending_child();
-        let pid = tail.id();
-        let stdout = tail.stdout.take().expect("piped");
+    fn supervise_pager_reaps_every_producer() {
+        let mut a = never_ending_child();
+        let mut b = never_ending_child();
+        let (pid_a, pid_b) = (a.id(), b.id());
+        let workers = vec![
+            blocking_reader(a.stdout.take().expect("piped")),
+            blocking_reader(b.stdout.take().expect("piped")),
+        ];
         let pager = Command::new("sleep")
             .arg("0.2")
             .spawn()
             .expect("spawn pager stand-in");
 
-        supervise_pager(pager, tail, BufReader::new(stdout), io::sink()).unwrap();
+        supervise_pager(pager, vec![a, b], workers, Arc::new(AtomicBool::new(false))).unwrap();
 
-        // The child was killed and waited on, so it is fully reaped rather than
-        // left as a zombie or still running.
-        let still_alive = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .expect("kill -0")
-            .success();
-        assert!(!still_alive, "tailer pid {pid} survived the session");
+        for pid in [pid_a, pid_b] {
+            let still_alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .expect("kill -0")
+                .success();
+            assert!(!still_alive, "producer pid {pid} survived the session");
+        }
     }
 
-    /// The colorized bytes must actually reach the sink the pager reads, not
-    /// just be produced and dropped.
+    /// The whole machine end to end: a producer, a reader feeding the merger,
+    /// and the emitter writing into the file `less` reads. The colorized bytes
+    /// must actually arrive there, not just be produced and dropped.
     #[test]
-    fn supervise_pager_streams_log_lines_into_the_sink() {
-        let mut source = Command::new("printf")
+    fn supervise_pager_streams_merged_lines_into_the_sink() {
+        let mut producer = Command::new("printf")
             .arg(
-                r#"{"@timestamp":"t","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#,
+                r#"{"@timestamp":"2026-09-14T01:16:54.217Z","level":"INFO","thread":"m","class":"C","message":"hello"}\n"#,
             )
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn printf");
-        let stdout = source.stdout.take().expect("piped");
+        let stdout = producer.stdout.take().expect("piped");
         let pager = Command::new("sleep")
-            .arg("0.3")
+            .arg("0.5")
             .spawn()
             .expect("spawn pager stand-in");
 
@@ -566,161 +1080,557 @@ mod tests {
             .tempfile()
             .unwrap();
         let writer = LineWriter::new(sink.reopen().unwrap());
-        supervise_pager(pager, source, BufReader::new(stdout), writer).unwrap();
+
+        let started = vec![Source::Bn];
+        let merger = Arc::new(Mutex::new(Merger::new(
+            started.clone(),
+            MERGE_WINDOW,
+            Instant::now(),
+            0,
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let merger = Arc::clone(&merger);
+            thread::spawn(move || -> io::Result<()> {
+                // The same shape as the reader in `run_logs`: lines straight
+                // into the merger, which owns the builder, and `eof` to finish
+                // whatever record was still open.
+                for line in BufReader::new(stdout).lines() {
+                    let line = line?;
+                    merger.lock().unwrap().push_line(
+                        Source::Bn,
+                        &line,
+                        Instant::now(),
+                        wall_clock_ms(),
+                    );
+                }
+                merger.lock().unwrap().eof(Source::Bn);
+                Ok(())
+            })
+        };
+        let emitter = {
+            let merger = Arc::clone(&merger);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || emit_loop(merger, stop, writer, started))
+        };
+
+        supervise_pager(pager, vec![producer], vec![reader, emitter], stop).unwrap();
 
         let written = std::fs::read_to_string(sink.path()).unwrap();
         assert!(written.contains("INFO [m] C - hello"), "got {written:?}");
+    }
+
+    /// The emitter polls the merger rather than blocking on a pipe, so closing
+    /// the producers' stdout says nothing to it. If `stop` is not set before
+    /// the join, this hangs rather than fails - hence the deadline.
+    #[test]
+    fn supervise_pager_stops_an_emitter_whose_source_never_reaches_eof() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let stop = Arc::new(AtomicBool::new(false));
+            let merger = Arc::new(Mutex::new(Merger::new(
+                vec![Source::Bn],
+                MERGE_WINDOW,
+                Instant::now(),
+                0,
+            )));
+            // No `eof` is ever recorded, standing in for a reader thread that
+            // died before it could.
+            let emitter = {
+                let merger = Arc::clone(&merger);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || emit_loop(merger, stop, io::sink(), vec![Source::Bn]))
+            };
+            let pager = Command::new("sleep")
+                .arg("0.2")
+                .spawn()
+                .expect("spawn pager stand-in");
+            let result = supervise_pager(pager, vec![], vec![emitter], stop);
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(ok) => assert!(ok, "supervise_pager returned an error"),
+            Err(_) => panic!("the emitter never stopped - `stop` is not reaching it"),
+        }
     }
 
     #[test]
     fn run_logs_reports_a_missing_log_file_instead_of_spawning_anything() {
         let missing = std::env::temp_dir().join("tekops-definitely-not-here.log");
         assert!(!missing.exists(), "test precondition");
-        let code = run_logs(Some(missing), 500, None, None, None, None);
+        let sources = LogSources {
+            bn: Some(LogTarget::File(missing)),
+            vc: None,
+        };
+        let code = run_logs(sources, 500);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
-    fn target(
-        path: Option<&str>,
-        container_flag: Option<&str>,
-        container_env: Option<&str>,
-        logs_file_env: Option<&str>,
-        detected: Option<&str>,
-    ) -> LogTarget {
-        resolve_log_target(
-            path.map(PathBuf::from),
-            container_flag.map(String::from),
-            container_env.map(String::from),
-            logs_file_env.map(String::from),
-            None,
-            None,
-            detected.map(String::from),
-        )
+    #[test]
+    fn slot_target_reads_the_slot_it_is_asked_for() {
+        let sources = LogSources {
+            bn: Some(LogTarget::Container("bn-c".into())),
+            vc: Some(LogTarget::Container("vc-c".into())),
+        };
+        assert_eq!(
+            slot_target(&sources, Source::Bn),
+            Some(&LogTarget::Container("bn-c".into()))
+        );
+        assert_eq!(
+            slot_target(&sources, Source::Vc),
+            Some(&LogTarget::Container("vc-c".into()))
+        );
+    }
+
+    /// The regression this pins: `tekops logs --vc-container x` resolves to
+    /// `{ bn: None, vc: Some(x) }`, and a `run_logs` that only read `.bn` would
+    /// silently fall through to the hardcoded default path instead - showing
+    /// the operator a stream they never asked for, or a "file not found" for a
+    /// path they never mentioned. The same fault hit the no-flag case on a
+    /// validator-only host, which is the deployment this feature exists for.
+    #[test]
+    fn a_validator_only_deployment_is_an_active_source() {
+        let sources = LogSources {
+            bn: None,
+            vc: Some(LogTarget::Container("rocketpool_validator".into())),
+        };
+        assert_eq!(sources.active(), vec![Source::Vc]);
+        assert_eq!(
+            slot_target(&sources, Source::Vc),
+            Some(&LogTarget::Container("rocketpool_validator".into()))
+        );
+    }
+
+    /// With no source at all there is nothing to tail, and saying so beats
+    /// opening a default path the operator never named. `resolve_log_sources`
+    /// makes this unreachable except via a selector, which `cli::check_selection`
+    /// rejects first with a message naming the slot.
+    #[test]
+    fn run_logs_fails_when_no_source_resolved() {
+        let sources = LogSources { bn: None, vc: None };
+        let code = run_logs(sources, 500);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    fn inputs() -> SourceInputs {
+        SourceInputs {
+            path: None,
+            container_flag: None,
+            vc_container_flag: None,
+            vc_logs_file_flag: None,
+            container_env: None,
+            logs_file_env: None,
+            vc_container_env: None,
+            vc_logs_file_env: None,
+            container_cfg: None,
+            logs_file_cfg: None,
+            vc_container_cfg: None,
+            vc_logs_file_cfg: None,
+            detected_bn: None,
+            detected_vc: None,
+            default_log_present: false,
+            select: None,
+        }
+    }
+
+    /// The second half of the reported bug. A bare-metal Teku writes its log
+    /// as its own service user, so the path exists and the operator cannot
+    /// read it. An `exists()` check passed, the slot spawned a `tail` that
+    /// died at once, and the session showed the validator alone under a `[vc]`
+    /// tag with nothing said about the other half.
+    #[test]
+    fn an_unreadable_file_is_named_rather_than_silently_empty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::File::open(&p).is_ok() {
+            // Running as root, where the mode bits do not apply.
+            return;
+        }
+
+        let why = file_failure(&p).expect("an unreadable file must be reported");
+        assert!(why.starts_with("cannot read log file"), "{why}");
+        assert!(why.contains(&p.display().to_string()), "{why}");
+    }
+
+    /// The pre-existing case keeps its pre-existing wording.
+    #[test]
+    fn a_missing_file_is_still_reported_as_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("nope.log");
+        assert!(!p.exists(), "test precondition");
+        assert_eq!(
+            file_failure(&p),
+            Some(format!("log file not found: {}", p.display()))
+        );
+    }
+
+    /// The state the operator cannot read off the screen: a file that opens,
+    /// follows, and has nothing to show.
+    #[test]
+    fn an_empty_file_is_noted_without_being_a_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "").expect("write");
+
+        assert_eq!(file_failure(&p), None, "an empty file still starts");
+        let note = empty_file_note(&p, Source::Bn).expect("an empty file must be noted");
+        assert!(note.starts_with("bn log file is empty"), "{note}");
+        assert!(note.contains(&p.display().to_string()), "{note}");
+    }
+
+    #[test]
+    fn a_file_with_content_is_not_noted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        assert_eq!(empty_file_note(&p, Source::Bn), None);
+    }
+
+    #[test]
+    fn a_readable_file_is_no_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("teku.log");
+        std::fs::write(&p, "line\n").expect("write");
+        assert_eq!(file_failure(&p), None);
+    }
+
+    /// The reported bug. A bare-metal beacon node writing the default path,
+    /// a Rocket Pool validator container, and nothing in the config file:
+    /// `tekops logs` printed the validator alone, and `tekops logs --bn`
+    /// failed outright with "no bn log source found".
+    #[test]
+    fn a_present_default_path_answers_the_bn_slot_beside_a_detected_validator() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: true,
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))),
+            "an unconfigured bare-metal beacon node still has its default log"
+        );
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+
+        let bn_only = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: true,
+            select: Some(Source::Bn),
+            ..inputs()
+        });
+        assert_eq!(
+            bn_only.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+        );
+        assert_eq!(bn_only.vc, None);
+    }
+
+    /// The other half of the same rule: on a host where that path does not
+    /// exist, the validator-only deployment still gets no spurious default and
+    /// no "file not found" for a path it never had.
+    #[test]
+    fn an_absent_default_path_leaves_a_validator_only_host_alone() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            default_log_present: false,
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+    }
+
+    /// Rule 1 still outranks the present default: naming the validator side by
+    /// flag means that side only, whatever is sitting at the default path.
+    #[test]
+    fn a_present_default_path_does_not_defeat_rule_one() {
+        let got = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("vc-c".into()),
+            default_log_present: true,
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(got.vc, Some(LogTarget::Container("vc-c".into())));
+    }
+
+    /// The reported deployment: a Rocket Pool validator container detected
+    /// alongside a beacon node that is not under Docker. Both sources, no flags.
+    #[test]
+    fn detection_alone_resolves_both_sources() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            logs_file_cfg: Some(PathBuf::from("/var/log/teku/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
+        );
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+    }
+
+    /// The back-compatibility rule, and the most important test in this task.
+    /// Naming one side and not the other means that one stream only - so every
+    /// invocation that works today prints exactly what it prints today, even on a
+    /// host where a validator container is sitting there detectable.
+    #[test]
+    fn naming_only_the_beacon_node_suppresses_a_detected_validator() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            detected_vc: Some("rocketpool_validator".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
+        assert_eq!(got.vc, None, "an unstated side stays silent");
+    }
+
+    #[test]
+    fn naming_only_the_validator_suppresses_a_detected_beacon_node() {
+        let got = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("rocketpool_validator".into()),
+            detected_bn: Some("eth-docker-consensus-1".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("rocketpool_validator".into()))
+        );
+    }
+
+    /// The asymmetric half of R12's boundary: a flag on one side silences a
+    /// *configured* source on the other, not just a detected one. This is
+    /// deliberate, not an oversight - rule 1's gate is `bn_explicit`/
+    /// `vc_explicit` (flag/env only), and `vc_container_cfg` here never
+    /// reaches that gate, so `vc_stated` (which does see it) is discarded
+    /// along with it. Do not "fix" this by widening the gate to config; that
+    /// is exactly the case `detection_alone_resolves_both_sources` above
+    /// pins the other way.
+    #[test]
+    fn a_flag_on_one_side_suppresses_a_configured_other_side() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("X".into()),
+            vc_container_cfg: Some("Y".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("X".into())));
+        assert_eq!(got.vc, None);
+    }
+
+    #[test]
+    fn naming_both_sides_gives_both() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("bn-c".into()),
+            vc_container_flag: Some("vc-c".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("bn-c".into())));
+        assert_eq!(got.vc, Some(LogTarget::Container("vc-c".into())));
+    }
+
+    /// The hardcoded default is a last resort for the whole command, not for the
+    /// beacon node's slot. A pure Rocket Pool node must not be handed a "file not
+    /// found" for a path it never had.
+    #[test]
+    fn the_default_path_applies_only_when_neither_slot_resolved() {
+        let nothing = resolve_log_sources(inputs());
+        assert_eq!(
+            nothing.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
+        );
+        assert_eq!(nothing.vc, None);
+
+        let vc_only = resolve_log_sources(SourceInputs {
+            detected_vc: Some("rocketpool_validator".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            vc_only.bn, None,
+            "no spurious default on a validator-only host"
+        );
+    }
+
+    /// The VC ladder has the same shape as the BN's: flag > env > config, and
+    /// naming a container beats naming a file within a tier.
+    #[test]
+    fn the_validator_ladder_matches_the_beacon_nodes_shape() {
+        let flag_wins = resolve_log_sources(SourceInputs {
+            vc_container_flag: Some("flag".into()),
+            vc_container_env: Some("env".into()),
+            vc_container_cfg: Some("cfg".into()),
+            ..inputs()
+        });
+        assert_eq!(flag_wins.vc, Some(LogTarget::Container("flag".into())));
+
+        let env_wins = resolve_log_sources(SourceInputs {
+            vc_container_env: Some("env".into()),
+            vc_container_cfg: Some("cfg".into()),
+            ..inputs()
+        });
+        assert_eq!(env_wins.vc, Some(LogTarget::Container("env".into())));
+
+        let container_beats_file = resolve_log_sources(SourceInputs {
+            vc_container_cfg: Some("cfg".into()),
+            vc_logs_file_cfg: Some(PathBuf::from("/cfg/validator.log")),
+            ..inputs()
+        });
+        assert_eq!(
+            container_beats_file.vc,
+            Some(LogTarget::Container("cfg".into()))
+        );
+    }
+
+    /// `--vc` filters what was resolved; it does not name anything.
+    #[test]
+    fn selecting_one_slot_drops_the_other() {
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("eth-docker-consensus-1".into()),
+            detected_vc: Some("eth-docker-validator-1".into()),
+            select: Some(Source::Vc),
+            ..inputs()
+        });
+        assert_eq!(got.bn, None);
+        assert_eq!(
+            got.vc,
+            Some(LogTarget::Container("eth-docker-validator-1".into()))
+        );
+    }
+
+    #[test]
+    fn active_lists_the_sources_that_resolved() {
+        let both = resolve_log_sources(SourceInputs {
+            detected_bn: Some("c".into()),
+            detected_vc: Some("v".into()),
+            ..inputs()
+        });
+        assert_eq!(both.active(), vec![Source::Bn, Source::Vc]);
+
+        let one = resolve_log_sources(SourceInputs {
+            container_flag: Some("c".into()),
+            ..inputs()
+        });
+        assert_eq!(one.active(), vec![Source::Bn]);
     }
 
     /// The two config rungs sit below both environment variables.
     #[test]
     fn the_logs_file_env_beats_the_config_container() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            Some("/var/log/teku/teku.log".into()),
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/var/log/teku/teku.log".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
         assert_eq!(
-            got,
-            LogTarget::File(PathBuf::from("/var/log/teku/teku.log"))
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
         );
     }
 
     #[test]
     fn the_container_env_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            None,
-            None,
-            Some("env-container".into()),
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("env-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_env: Some("env-container".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("env-container".into())));
     }
 
     /// Within the config tier, naming a container is the more specific statement,
     /// mirroring why $TEKOPS_CONTAINER beats $TEKOPS_LOGS_FILE.
     #[test]
     fn the_config_container_beats_the_config_logs_file() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("cfg-container".into())));
     }
 
     /// Config beats detection: a value the operator wrote down beats one tekops
     /// guessed.
     #[test]
     fn the_config_logs_file_beats_detection() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(PathBuf::from("/cfg/teku.log")),
-            Some("detected-container".into()),
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            detected_bn: Some("detected-container".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/cfg/teku.log")))
         );
-        assert_eq!(got, LogTarget::File(PathBuf::from("/cfg/teku.log")));
     }
 
     #[test]
     fn the_config_container_beats_detection() {
-        let got = resolve_log_target(
-            None,
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            None,
-            Some("detected-container".into()),
-        );
-        assert_eq!(got, LogTarget::Container("cfg-container".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_cfg: Some("cfg-container".into()),
+            detected_bn: Some("detected-container".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("cfg-container".into())));
     }
 
     /// Detection still beats the hardcoded default when the config says nothing.
     #[test]
     fn detection_still_beats_the_default_with_an_empty_config() {
-        let got = resolve_log_target(None, None, None, None, None, None, Some("d".into()));
-        assert_eq!(got, LogTarget::Container("d".into()));
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("d".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("d".into())));
     }
 
     /// The positional path outranks everything in the config, so naming a file on
     /// a configured host still reads that file.
     #[test]
     fn the_positional_path_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            Some(PathBuf::from("/tmp/x.log")),
-            None,
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::File(PathBuf::from("/tmp/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            path: Some(PathBuf::from("/tmp/x.log")),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/tmp/x.log"))));
     }
 
     #[test]
     fn container_flag_wins_over_everything_below_it() {
-        let t = target(None, Some("mine"), Some("env"), Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::Container("mine".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            container_env: Some("env".into()),
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
     }
 
-    /// The `target()` helper is frozen at `None, None` for the two config
-    /// rungs, so it cannot exercise flag-versus-config ordering. Called
-    /// directly here so a future edit that moved the config rungs above the
-    /// flag check would fail a test.
+    /// Called directly with the config rungs populated, so a future edit that
+    /// moved the config rungs above the flag check would fail this test.
     #[test]
     fn container_flag_beats_both_config_rungs() {
-        let got = resolve_log_target(
-            None,
-            Some("mine".into()),
-            None,
-            None,
-            Some("cfg-container".into()),
-            Some(PathBuf::from("/cfg/teku.log")),
-            None,
-        );
-        assert_eq!(got, LogTarget::Container("mine".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mine".into()),
+            container_cfg: Some("cfg-container".into()),
+            logs_file_cfg: Some(PathBuf::from("/cfg/teku.log")),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mine".into())));
     }
 
     /// The case that pins the ordering: naming a file on a host that also runs
@@ -728,26 +1638,36 @@ mod tests {
     /// positional path and would have tailed a container instead.
     #[test]
     fn explicit_path_beats_a_successful_detection() {
-        let t = target(
-            Some("/var/log/teku/teku.log"),
-            None,
-            None,
-            None,
-            Some("det"),
+        let got = resolve_log_sources(SourceInputs {
+            path: Some(PathBuf::from("/var/log/teku/teku.log")),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(
+            got.bn,
+            Some(LogTarget::File(PathBuf::from("/var/log/teku/teku.log")))
         );
-        assert_eq!(t, LogTarget::File(PathBuf::from("/var/log/teku/teku.log")));
     }
 
     #[test]
     fn container_env_beats_logs_file_env_and_detection() {
-        let t = target(None, None, Some("env"), Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::Container("env".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_env: Some("env".into()),
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("env".into())));
     }
 
     #[test]
     fn logs_file_env_beats_detection() {
-        let t = target(None, None, None, Some("/x.log"), Some("det"));
-        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/x.log".into()),
+            detected_bn: Some("det".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/x.log"))));
     }
 
     /// Detection sits above the hardcoded default because on a Docker host that
@@ -755,15 +1675,19 @@ mod tests {
     /// answer than a guaranteed "file not found".
     #[test]
     fn detection_beats_the_hardcoded_default_path() {
-        let t = target(None, None, None, None, Some("rocketpool_eth2"));
-        assert_eq!(t, LogTarget::Container("rocketpool_eth2".into()));
+        let got = resolve_log_sources(SourceInputs {
+            detected_bn: Some("rocketpool_eth2".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("rocketpool_eth2".into())));
     }
 
     #[test]
     fn falls_back_to_the_default_path_when_nothing_is_known() {
+        let got = resolve_log_sources(inputs());
         assert_eq!(
-            target(None, None, None, None, None),
-            LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG))
+            got.bn,
+            Some(LogTarget::File(PathBuf::from(DEFAULT_TEKU_LOG)))
         );
     }
 
@@ -771,16 +1695,22 @@ mod tests {
     /// gate it on any more.
     #[test]
     fn teku_logs_file_env_is_honoured() {
-        let t = target(None, None, None, Some("/x.log"), None);
-        assert_eq!(t, LogTarget::File(PathBuf::from("/x.log")));
+        let got = resolve_log_sources(SourceInputs {
+            logs_file_env: Some("/x.log".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::File(PathBuf::from("/x.log"))));
     }
 
     /// A custom stack tekops does not recognize is a supported deployment: the
     /// container override must work with detection having found nothing.
     #[test]
     fn custom_container_works_with_no_detection_at_all() {
-        let t = target(None, Some("mynode-teku"), None, None, None);
-        assert_eq!(t, LogTarget::Container("mynode-teku".into()));
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("mynode-teku".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("mynode-teku".into())));
     }
 
     #[test]

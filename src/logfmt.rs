@@ -18,6 +18,103 @@ fn color_for_level(level: &str) -> &'static str {
 /// path.
 const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
+/// A log timestamp as milliseconds since the Unix epoch.
+///
+/// One integer rather than a date type, because the only thing anything does
+/// with it is compare it against another one and occasionally add a day.
+/// Adding a date dependency to a single-binary CLI to do that would be a poor
+/// trade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogTime(pub i64);
+
+/// What `parse_timestamp` could recover from a line.
+///
+/// Teku's console layout has a time-only variant with no date at all, so a
+/// parsed timestamp is not always locatable on its own. Dating a `TimeOfDay`
+/// needs the source's recent history, which `merge.rs` keeps - resolving it
+/// here would mean guessing with less information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    Absolute(LogTime),
+    TimeOfDay(i64),
+}
+
+/// Milliseconds since midnight from `HH:MM:SS` or `HH:MM:SS.mmm`.
+///
+/// The separator before the milliseconds may be a comma: Teku's JSON layout
+/// writes `19:17:51,172`, which is what log4j2's `%d{DEFAULT}` produces, while
+/// its console layout writes a dot. Both are real and both arrive here.
+fn time_of_day_ms(s: &str) -> Option<i64> {
+    let (hms, millis) = match s.split_once(['.', ',']) {
+        Some((hms, ms)) => {
+            if ms.len() > 3 || ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // `.21` means 210ms, not 21ms.
+            let scaled: i64 = ms.parse::<i64>().ok()? * 10_i64.pow(3 - ms.len() as u32);
+            (hms, scaled)
+        }
+        None => (s, 0),
+    };
+
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some(h * 3_600_000 + m * 60_000 + sec * 1_000 + millis)
+}
+
+/// `YYYY-MM-DD` to days since the Unix epoch.
+fn date_days(s: &str) -> Option<i64> {
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(crate::dump::days_from_civil(y, m, d))
+}
+
+/// The timestamp of one log line, in whichever of Teku's three layouts it
+/// arrived.
+///
+/// | Layout | Shape | Zone |
+/// | --- | --- | --- |
+/// | JSON, bare-metal | `2026-09-17T19:17:51,172` | none stated |
+/// | JSON, ECS template | `2026-09-01T10:00:00.000Z` | UTC |
+/// | Console, both Docker stacks | `2026-09-14 01:16:54.217` | none stated |
+/// | Console, time-only | `01:16:54.217` | none stated, no date |
+///
+/// The first row is what a stock bare-metal Teku writes, taken off a real
+/// node: a comma before the milliseconds and no zone at all. The `Z`-suffixed
+/// form belongs to log4j2's ECS template, which this table once claimed was
+/// the bare-metal shape - it is not, and assuming so cost `merge.rs` every
+/// line of a bare-metal beacon node.
+///
+/// **Only the ECS form states a timezone; everything else is taken at face
+/// value.** If a beacon node logs local time while a validator container runs
+/// a non-UTC `TZ`, a merge across the two is wrong by that offset. Containers
+/// default to UTC and servers usually run UTC, so this is a documented
+/// limitation rather than a correction; the fix, if a real node shows it, is
+/// to estimate a per-source offset from arrival times.
+///
+/// Returning `None` is meaningful rather than a failure: a line with no
+/// timestamp is a stack trace's continuation, and `merge.rs` uses exactly
+/// this to keep a trace attached to the line that introduced it.
+pub fn parse_timestamp(s: &str) -> Option<Stamp> {
+    let s = s.trim_end_matches('Z');
+    if let Some((date, time)) = s.split_once(['T', ' ']) {
+        return Some(Stamp::Absolute(LogTime(
+            date_days(date)? * 86_400_000 + time_of_day_ms(time)?,
+        )));
+    }
+    time_of_day_ms(s).map(Stamp::TimeOfDay)
+}
+
 /// One log record's fields, however they were parsed.
 ///
 /// `middle` is the already-rendered `[thread] class ` segment (or empty),
@@ -87,6 +184,26 @@ fn parse_console(raw: &str) -> Option<Fields> {
     })
 }
 
+/// The timestamp field of a JSON log line, under either of the two names it
+/// is written with.
+///
+/// Teku's own JSON layout calls it `timestamp`; `@timestamp` is what log4j2's
+/// ECS and Logstash templates emit, and what a node configured with one of
+/// those writes. This module looked only for `@timestamp`, so a stock
+/// bare-metal Teku - which writes `timestamp` - rendered every line with an
+/// empty timestamp column, and `merge::leading_timestamp`, which shares this
+/// lookup, read every line as having no timestamp at all. That second one was
+/// not cosmetic: see the note on `RecordBuilder::push_line`.
+///
+/// `timestamp` is checked first because it is Teku's own; a line carrying
+/// both is a template that added one, and the node's own field is the one to
+/// trust.
+pub fn json_timestamp(value: &Value) -> Option<&str> {
+    ["timestamp", "@timestamp"]
+        .into_iter()
+        .find_map(|k| value.get(k).and_then(Value::as_str))
+}
+
 /// Log fields carry data the node didn't author - peer identifiers, remote
 /// agent strings, exception text from malformed gossip. The colorized output is
 /// written to a temp file that `less -R` renders with escapes live, so an
@@ -103,7 +220,7 @@ fn parse_json(value: &Value) -> Fields {
     let thread = get("thread");
     let class = get("class");
     Fields {
-        timestamp: get("@timestamp"),
+        timestamp: json_timestamp(value).map(sanitize).unwrap_or_default(),
         level: get("level"),
         // Built unconditionally, brackets and all, even when thread/class are
         // empty - see the note on `Fields::middle` for why this can't move
@@ -153,6 +270,44 @@ pub fn format_log_line(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line copied verbatim off a bare-metal node. Teku's own JSON layout
+    /// names the field `timestamp` and separates the milliseconds with a
+    /// comma; this module knew only `@timestamp` and a dot, so it rendered
+    /// every one of these lines with an empty timestamp column.
+    #[test]
+    fn the_real_bare_metal_json_line_keeps_its_timestamp() {
+        let raw = r#"{"timestamp":"2026-09-17T19:17:51,172","host":"validator","level":"INFO","thread":"TimeTickTask","class":"teku-event-log","message":"Slot Event  *** Slot: 15233787","throwable":""}"#;
+        let out = format_log_line(raw);
+        assert!(out.contains("2026-09-17T19:17:51,172"), "{out}");
+        assert!(out.contains("Slot Event"), "{out}");
+        assert!(!out.contains("  INFO"), "no empty timestamp column: {out}");
+    }
+
+    /// The other spelling still works: `@timestamp` is what log4j2's ECS and
+    /// Logstash templates write, and a node configured with one emits it.
+    #[test]
+    fn the_ecs_timestamp_field_is_still_read() {
+        let value: Value =
+            serde_json::from_str(r#"{"@timestamp":"2026-09-01T10:00:00.000Z"}"#).expect("json");
+        assert_eq!(json_timestamp(&value), Some("2026-09-01T10:00:00.000Z"));
+    }
+
+    /// Teku's own field wins when a template has added the other.
+    #[test]
+    fn tekus_own_timestamp_field_wins_over_an_added_one() {
+        let value: Value =
+            serde_json::from_str(r#"{"timestamp":"a","@timestamp":"b"}"#).expect("json");
+        assert_eq!(json_timestamp(&value), Some("a"));
+    }
+
+    #[test]
+    fn milliseconds_parse_after_a_comma_as_well_as_a_dot() {
+        assert_eq!(
+            parse_timestamp("19:17:51,172"),
+            parse_timestamp("19:17:51.172")
+        );
+    }
 
     #[test]
     fn formats_info_line_green() {
@@ -381,5 +536,73 @@ mod tests {
         let raw = r#"{"@timestamp":"t","level":"INFO","class":"C","message":"m"}"#;
         let out = format_log_line(raw);
         assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
+    }
+
+    /// The three shapes Teku emits, normalised to one comparable value. JSON is
+    /// what a bare-metal node writes; both Docker stacks run Teku with
+    /// `--log-destination=CONSOLE`, whose timestamp comes with or without a date.
+    #[test]
+    fn parses_all_three_timestamp_layouts() {
+        // 2026-09-01T10:00:00.000Z = 20697 days since the epoch, plus 10h.
+        let json = parse_timestamp("2026-09-01T10:00:00.000Z").unwrap();
+        assert_eq!(
+            json,
+            Stamp::Absolute(LogTime(
+                crate::dump::days_from_civil(2026, 9, 1) * 86_400_000 + 10 * 3_600_000
+            ))
+        );
+
+        let console = parse_timestamp("2026-09-14 01:16:54.217").unwrap();
+        assert_eq!(
+            console,
+            Stamp::Absolute(LogTime(
+                crate::dump::days_from_civil(2026, 9, 14) * 86_400_000
+                    + 3_600_000
+                    + 16 * 60_000
+                    + 54_000
+                    + 217
+            ))
+        );
+
+        let time_only = parse_timestamp("01:16:54.217").unwrap();
+        assert_eq!(
+            time_only,
+            Stamp::TimeOfDay(3_600_000 + 16 * 60_000 + 54_000 + 217)
+        );
+    }
+
+    /// Anything that is not one of the three shapes has no timestamp, which is
+    /// how a stack trace's continuation lines are recognised.
+    #[test]
+    fn rejects_anything_that_is_not_a_timestamp() {
+        for s in [
+            "",
+            "t",
+            "garbage",
+            "2026-09-14",
+            "at tech.pegasys.teku.Foo.bar(Foo.java:42)",
+        ] {
+            assert!(parse_timestamp(s).is_none(), "accepted {s:?}");
+        }
+    }
+
+    /// Milliseconds are optional in the wild; a timestamp without them must not
+    /// be silently rejected into passthrough.
+    #[test]
+    fn milliseconds_are_optional() {
+        assert_eq!(
+            parse_timestamp("01:16:54"),
+            Some(Stamp::TimeOfDay(3_600_000 + 16 * 60_000 + 54_000))
+        );
+    }
+
+    /// `days_from_civil` is the inverse of the `civil_from_days` already in
+    /// dump.rs. Round-tripping is what pins it.
+    #[test]
+    fn days_from_civil_round_trips() {
+        for (y, m, d) in [(1970, 1, 1), (2026, 9, 17), (2000, 2, 29), (1999, 12, 31)] {
+            let days = crate::dump::days_from_civil(y, m, d);
+            assert_eq!(crate::dump::civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
+        }
     }
 }
