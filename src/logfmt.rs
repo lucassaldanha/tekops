@@ -18,6 +18,97 @@ fn color_for_level(level: &str) -> &'static str {
 /// path.
 const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
+/// A log timestamp as milliseconds since the Unix epoch.
+///
+/// One integer rather than a date type, because the only thing anything does
+/// with it is compare it against another one and occasionally add a day.
+/// Adding a date dependency to a single-binary CLI to do that would be a poor
+/// trade.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogTime(pub i64);
+
+/// What `parse_timestamp` could recover from a line.
+///
+/// Teku's console layout has a time-only variant with no date at all, so a
+/// parsed timestamp is not always locatable on its own. Dating a `TimeOfDay`
+/// needs the source's recent history, which `merge.rs` keeps - resolving it
+/// here would mean guessing with less information.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    Absolute(LogTime),
+    TimeOfDay(i64),
+}
+
+/// Milliseconds since midnight from `HH:MM:SS` or `HH:MM:SS.mmm`.
+#[allow(dead_code)]
+fn time_of_day_ms(s: &str) -> Option<i64> {
+    let (hms, millis) = match s.split_once('.') {
+        Some((hms, ms)) => {
+            if ms.len() > 3 || ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // `.21` means 210ms, not 21ms.
+            let scaled: i64 = ms.parse::<i64>().ok()? * 10_i64.pow(3 - ms.len() as u32);
+            (hms, scaled)
+        }
+        None => (s, 0),
+    };
+
+    let mut parts = hms.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let sec: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some(h * 3_600_000 + m * 60_000 + sec * 1_000 + millis)
+}
+
+/// `YYYY-MM-DD` to days since the Unix epoch.
+#[allow(dead_code)]
+fn date_days(s: &str) -> Option<i64> {
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(crate::dump::days_from_civil(y, m, d))
+}
+
+/// The timestamp of one log line, in whichever of Teku's three layouts it
+/// arrived.
+///
+/// | Layout | Shape | Zone |
+/// | --- | --- | --- |
+/// | JSON, bare-metal | `2026-09-01T10:00:00.000Z` | UTC |
+/// | Console, both Docker stacks | `2026-09-14 01:16:54.217` | none stated |
+/// | Console, time-only | `01:16:54.217` | none stated, no date |
+///
+/// **The console layouts state no timezone and are taken at face value.** If
+/// a beacon node logs JSON in UTC while a validator container runs a non-UTC
+/// `TZ`, a merge across the two is wrong by that offset. Containers default
+/// to UTC and servers usually run UTC, so this is a documented limitation
+/// rather than a correction; the fix, if a real node shows it, is to estimate
+/// a per-source offset from arrival times.
+///
+/// Returning `None` is meaningful rather than a failure: a line with no
+/// timestamp is a stack trace's continuation, and `merge.rs` uses exactly
+/// this to keep a trace attached to the line that introduced it.
+#[allow(dead_code)]
+pub fn parse_timestamp(s: &str) -> Option<Stamp> {
+    let s = s.trim_end_matches('Z');
+    if let Some((date, time)) = s.split_once(['T', ' ']) {
+        return Some(Stamp::Absolute(LogTime(
+            date_days(date)? * 86_400_000 + time_of_day_ms(time)?,
+        )));
+    }
+    time_of_day_ms(s).map(Stamp::TimeOfDay)
+}
+
 /// One log record's fields, however they were parsed.
 ///
 /// `middle` is the already-rendered `[thread] class ` segment (or empty),
@@ -381,5 +472,73 @@ mod tests {
         let raw = r#"{"@timestamp":"t","level":"INFO","class":"C","message":"m"}"#;
         let out = format_log_line(raw);
         assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
+    }
+
+    /// The three shapes Teku emits, normalised to one comparable value. JSON is
+    /// what a bare-metal node writes; both Docker stacks run Teku with
+    /// `--log-destination=CONSOLE`, whose timestamp comes with or without a date.
+    #[test]
+    fn parses_all_three_timestamp_layouts() {
+        // 2026-09-01T10:00:00.000Z = 20697 days since the epoch, plus 10h.
+        let json = parse_timestamp("2026-09-01T10:00:00.000Z").unwrap();
+        assert_eq!(
+            json,
+            Stamp::Absolute(LogTime(
+                crate::dump::days_from_civil(2026, 9, 1) * 86_400_000 + 10 * 3_600_000
+            ))
+        );
+
+        let console = parse_timestamp("2026-09-14 01:16:54.217").unwrap();
+        assert_eq!(
+            console,
+            Stamp::Absolute(LogTime(
+                crate::dump::days_from_civil(2026, 9, 14) * 86_400_000
+                    + 3_600_000
+                    + 16 * 60_000
+                    + 54_000
+                    + 217
+            ))
+        );
+
+        let time_only = parse_timestamp("01:16:54.217").unwrap();
+        assert_eq!(
+            time_only,
+            Stamp::TimeOfDay(3_600_000 + 16 * 60_000 + 54_000 + 217)
+        );
+    }
+
+    /// Anything that is not one of the three shapes has no timestamp, which is
+    /// how a stack trace's continuation lines are recognised.
+    #[test]
+    fn rejects_anything_that_is_not_a_timestamp() {
+        for s in [
+            "",
+            "t",
+            "garbage",
+            "2026-09-14",
+            "at tech.pegasys.teku.Foo.bar(Foo.java:42)",
+        ] {
+            assert!(parse_timestamp(s).is_none(), "accepted {s:?}");
+        }
+    }
+
+    /// Milliseconds are optional in the wild; a timestamp without them must not
+    /// be silently rejected into passthrough.
+    #[test]
+    fn milliseconds_are_optional() {
+        assert_eq!(
+            parse_timestamp("01:16:54"),
+            Some(Stamp::TimeOfDay(3_600_000 + 16 * 60_000 + 54_000))
+        );
+    }
+
+    /// `days_from_civil` is the inverse of the `civil_from_days` already in
+    /// dump.rs. Round-tripping is what pins it.
+    #[test]
+    fn days_from_civil_round_trips() {
+        for (y, m, d) in [(1970, 1, 1), (2026, 9, 17), (2000, 2, 29), (1999, 12, 31)] {
+            let days = crate::dump::days_from_civil(y, m, d);
+            assert_eq!(crate::dump::civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
+        }
     }
 }
