@@ -109,16 +109,44 @@ validator alone.
 are mutually exclusive, and asking for a process that has no source is an
 error naming that process rather than an empty session.
 
-#### Two limitations worth knowing
+#### Timezones, and what happens when the two processes disagree
 
-**Timezone.** Almost nothing Teku writes states a zone. A stock bare-metal
-node's JSON is `2026-09-17T19:17:51,172` and the console layout both Docker
-stacks use is `2026-09-14 01:16:54.217`; only log4j2's ECS template writes the
-`Z`-suffixed UTC form. Anything without a zone is taken at face value, so if a
-bare-metal beacon node logging local time sits beside a validator container
-running a non-UTC `TZ`, the merge is wrong by that offset. Containers default
-to UTC and servers usually run UTC, so this is documented rather than
-corrected.
+Almost nothing Teku writes states a zone. A stock bare-metal node's JSON is
+`2026-09-17T19:17:51,172` and the console layout both Docker stacks use is
+`2026-09-14 01:16:54.217`; only log4j2's ECS template writes the `Z`-suffixed
+UTC form. So a bare-metal beacon node logging local time beside a validator
+container running UTC writes two sets of timestamps that cannot be compared -
+and ordering the merge by them directly would put every line of one process
+before every line of the other.
+
+**tekops measures the difference rather than trusting the printed times.**
+Each line's timestamp is compared against the clock on the machine when that
+line arrived, and the smallest such difference is taken as that process's
+offset - smallest because the delay in delivering a line is never negative, so
+the smallest sample is the least distorted one. A backlog is harmless to this:
+its lines were stamped long before they arrived, so they produce large
+samples, and the first live line produces a small one that wins.
+
+A correction is only applied when the two processes disagree **by at least
+fifteen minutes, and by within a second of a multiple of fifteen minutes** -
+every real timezone offset is a multiple of that, and a process that has
+merely been quiet for a while is only that, to the second, by coincidence.
+Anything else is left exactly as it was. When a correction is applied it says
+so, in the output:
+
+    *** tekops: bn stamps its log 12h ahead of vc - ordering by when the lines
+    arrived, not by the printed times
+
+Each line still shows the timestamp its own process wrote; only the ordering
+is corrected. Two adjacent lines twelve hours apart on the page are the
+expected sight on a node like that, and the note is what tells you so.
+
+The residual case is a `dump-logs` of a node where one process stopped writing
+a whole number of quarter-hours ago, to the second. That reads as a timezone
+and is corrected as one. It is a coincidence rather than a hazard, and the
+note is in the artifact either way.
+
+#### One more limitation worth knowing
 
 **Midnight in a backlog.** Teku's console layout has a time-only variant with
 no date. Those lines inherit the date of the last full timestamp from the same

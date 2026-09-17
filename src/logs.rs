@@ -103,7 +103,7 @@ fn emit_loop(
 
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let (ready, done) = {
+        let (ready, done, skew) = {
             let mut m = merger.lock().expect("merger mutex poisoned");
             // Once stopping, the window can produce nothing new: take
             // everything rather than leaving the session's tail unwritten.
@@ -119,9 +119,15 @@ fn emit_loop(
                 m.flush_stale(now);
                 m.drain_ready(now)
             };
-            (ready, m.is_done())
+            (ready, m.is_done(), m.take_skew_note())
         };
 
+        // Written before the records it explains. Two adjacent lines whose
+        // printed timestamps are half a day apart read as a broken merge
+        // unless something says the correction is deliberate.
+        if let Some(note) = skew {
+            writeln!(writer, "*** tekops: {}", sanitize(&note))?;
+        }
         if emit_records(&mut writer, ready, &sources, &mut written, MAX_BUFFER_BYTES)? {
             return Ok(());
         }
@@ -446,6 +452,24 @@ fn file_failure(path: &Path) -> Option<String> {
     }
 }
 
+/// This host's clock, in milliseconds since the epoch.
+///
+/// Paired with each line's arrival so `Merger` can estimate how far that
+/// source's own stamps sit from this clock - the correction that lets a
+/// bare-metal beacon node logging local time merge with a container logging
+/// UTC. `Instant` cannot serve: it is only comparable to itself, and the
+/// comparison needed here is against the times a process writes into its log.
+///
+/// Before the epoch is not a time any of this has to handle, so the failure
+/// is 0 rather than an error - which makes every offset look like the full
+/// age of the log, and the merge fall back to the printed stamps.
+pub(crate) fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Says so when a file target is empty, because the session cannot.
 ///
 /// An empty file is not a failure - `tail -F` will follow it and a log that
@@ -627,10 +651,7 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
     // source that was dropped above cannot block the merge waiting for lines
     // that will never come.
     let started: Vec<Source> = producers.iter().map(|(s, _)| *s).collect();
-    let session_start_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let session_start_ms = wall_clock_ms();
     let merger = Arc::new(Mutex::new(Merger::new(
         started.clone(),
         MERGE_WINDOW,
@@ -680,6 +701,7 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
                         source,
                         &line,
                         Instant::now(),
+                        wall_clock_ms(),
                     );
                 }
                 Ok(())
@@ -1076,10 +1098,12 @@ mod tests {
                 // whatever record was still open.
                 for line in BufReader::new(stdout).lines() {
                     let line = line?;
-                    merger
-                        .lock()
-                        .unwrap()
-                        .push_line(Source::Bn, &line, Instant::now());
+                    merger.lock().unwrap().push_line(
+                        Source::Bn,
+                        &line,
+                        Instant::now(),
+                        wall_clock_ms(),
+                    );
                 }
                 merger.lock().unwrap().eof(Source::Bn);
                 Ok(())

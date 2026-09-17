@@ -554,6 +554,39 @@ degrades to out-of-order output rather than to silence. Anything added here
 that can hold a record back needs the same question asked of it: what releases
 this when the producer never ends?
 
+**Sources are compared on a corrected timeline, not on the times they print.**
+Neither of Teku's common layouts states a timezone, so a bare-metal beacon node
+logging local time and a validator container logging UTC produce stamps that
+cannot be compared at all: ordered directly, every line of one sorts before
+every line of the other, and on a busy node the "ahead" source is starved for
+as long as the other keeps talking.
+
+So `Merger` estimates each source's offset from this host's clock as
+`min(arrival - stamp)` over its lines - the minimum because delivery delay is
+never negative, which makes the smallest sample the least distorted, and which
+incidentally rejects a backlog in favour of the first live line. `logs.rs` and
+`dump.rs` supply the arrival wall-clock; `Instant` cannot serve, being
+comparable only to itself.
+
+**The estimate is gated before it is used, and the gate is the subtle part.**
+`min(arrival - stamp)` cannot distinguish a source whose clock is an hour
+behind from a source whose newest line is an hour old. A live session resolves
+that by itself, since the next line written is a fresh sample - but `dump-logs`
+has no live phase, and there a merely quiet source would be "corrected" into
+the middle of the other's recent output. So `as_zone_offset` requires the
+difference to be at least fifteen minutes *and* within a second of a multiple
+of one, which every real timezone is and a stale source is only by
+coincidence. Failing the gate means no correction at all, which is the right
+answer whenever the evidence is weak. A correction that is applied is reported
+once, through `take_skew_note`, because two adjacent lines half a day apart
+otherwise read as a broken merge.
+
+The correction applies to **all** of a source's records, including undated
+ones: shifting a source's records together is what keeps its queue
+non-decreasing, and that is the invariant the head comparison rests on. The
+ordering key is also clamped to the last emitted time, so a refinement costs
+one record its exact position rather than sending the output backwards.
+
 **The `RecordBuilder`s live in `Merger`, not in the reader threads.** A reader
 blocks on `read_line`, so it can only ever act when a line arrives - precisely
 the wrong property for a record that needs releasing *because* no line has

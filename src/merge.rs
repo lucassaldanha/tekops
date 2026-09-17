@@ -67,6 +67,34 @@ pub struct Record {
 
 const DAY_MS: i64 = 86_400_000;
 
+/// What feeding one line did to a `RecordBuilder`.
+///
+/// `stamped_at` is separate from `completed` because they are about different
+/// lines: a timestamped line *closes* the record before it while *opening* its
+/// own, and the offset estimate needs this line's stamp paired with this
+/// line's arrival, not the previous record's.
+struct Pushed {
+    completed: Option<Record>,
+    stamped_at: Option<LogTime>,
+}
+
+/// A duration as an operator would say it: `12h`, `5h30m`, `90s`.
+///
+/// Only ever used for the skew note, where the number is the whole point -
+/// `12h` says "timezone" to anyone reading it, where `43200000ms` says
+/// nothing.
+fn humanize_ms(ms: i64) -> String {
+    let seconds = ms / 1_000;
+    let (h, m, s) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    match (h, m, s) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m{s}s"),
+        (h, 0, _) => format!("{h}h"),
+        (h, m, _) => format!("{h}h{m}m"),
+    }
+}
+
 /// Groups one source's raw lines into records and gives every record a
 /// comparable timestamp.
 ///
@@ -117,17 +145,20 @@ impl RecordBuilder {
     /// bare-metal Teku did while `leading_timestamp` looked for the wrong JSON
     /// key. Any unparsed layout must degrade to out-of-order output rather
     /// than to silence.
-    fn push_line(&mut self, raw: &str) -> Option<Record> {
+    fn push_line(&mut self, raw: &str) -> Pushed {
         let Some(stamp) = leading_timestamp(raw) else {
             match &mut self.pending {
                 Some(p) => p.lines.push(raw.to_string()),
                 // Nothing to continue, and nothing that ever will: emit.
                 None if self.last.is_none() => {
-                    return Some(Record {
-                        source: self.source,
-                        time: LogTime(self.session_start_ms),
-                        lines: vec![raw.to_string()],
-                    })
+                    return Pushed {
+                        completed: Some(Record {
+                            source: self.source,
+                            time: LogTime(self.session_start_ms),
+                            lines: vec![raw.to_string()],
+                        }),
+                        stamped_at: None,
+                    }
                 }
                 // This source does carry timestamps, so a later line will
                 // close this record. It opens at whatever time the source
@@ -140,16 +171,22 @@ impl RecordBuilder {
                     })
                 }
             }
-            return None;
+            return Pushed {
+                completed: None,
+                stamped_at: None,
+            };
         };
 
         let time = self.resolve(stamp);
         self.last = Some(time);
-        self.pending.replace(Record {
-            source: self.source,
-            time,
-            lines: vec![raw.to_string()],
-        })
+        Pushed {
+            completed: self.pending.replace(Record {
+                source: self.source,
+                time,
+                lines: vec![raw.to_string()],
+            }),
+            stamped_at: Some(time),
+        }
     }
 
     /// The record still in progress, if there is one. Taken at EOF, and by
@@ -238,6 +275,54 @@ pub struct Merger {
     last_line: Vec<Instant>,
     eof: Vec<bool>,
     window: Duration,
+    /// Each source's estimated offset from this host's clock, in
+    /// milliseconds, as `min(arrival - stamp)` over its lines. `None` until
+    /// that source has produced a line with a timestamp this module can read.
+    offsets: Vec<Option<i64>>,
+    /// What is actually added to each source's stamps before comparing them -
+    /// zero unless the offsets show a difference that looks like a timezone.
+    /// Derived from `offsets` by `recompute_corrections`, which is the only
+    /// thing that writes it.
+    corrections: Vec<i64>,
+    /// The corrected time of the last record emitted, which nothing emitted
+    /// afterwards may precede. See `key`.
+    last_emitted: Option<i64>,
+    /// Set once, when calibration first shows the sources disagreeing by more
+    /// than `SKEW_WORTH_REPORTING`. Taken by the caller, never printed here -
+    /// this module has no output of its own.
+    skew_note: Option<String>,
+    /// Whether the skew has already been judged. Separate from `skew_note`
+    /// being `Some`, which stops being true the moment the note is taken.
+    skew_judged: bool,
+}
+
+/// The granularity every real timezone offset is a multiple of. India is
+/// `+05:30`, Nepal `+05:45`, the Chatham Islands `+12:45`; nothing in use is
+/// finer.
+const ZONE_STEP_MS: i64 = 15 * 60_000;
+
+/// How far a difference may sit from a multiple of `ZONE_STEP_MS` and still be
+/// read as a timezone.
+///
+/// Wide enough to absorb the estimate's own error - the newest line of a
+/// source is a fraction of a second old, not zero - and narrow enough that a
+/// source which merely went quiet has to land within a second of a quarter
+/// hour to be mistaken for one.
+const ZONE_TOLERANCE_MS: i64 = 1_000;
+
+/// A difference between two sources' offsets, read as a timezone offset if it
+/// can be, and `None` if it cannot.
+///
+/// `None` is the answer for everything below one step, which includes every
+/// ordinary case: two processes on one host, both stamping the same clock,
+/// differ by milliseconds.
+fn as_zone_offset(difference: i64) -> Option<i64> {
+    if difference < ZONE_STEP_MS {
+        return None;
+    }
+    let steps = (difference + ZONE_STEP_MS / 2) / ZONE_STEP_MS;
+    let rounded = steps * ZONE_STEP_MS;
+    ((difference - rounded).abs() <= ZONE_TOLERANCE_MS).then_some(rounded)
 }
 
 impl Merger {
@@ -271,6 +356,11 @@ impl Merger {
             last_line: vec![started_at; n],
             eof: vec![false; n],
             window,
+            offsets: vec![None; n],
+            corrections: vec![0; n],
+            last_emitted: None,
+            skew_note: None,
+            skew_judged: false,
         }
     }
 
@@ -285,12 +375,153 @@ impl Merger {
     /// completed.
     ///
     /// `at` is when the line arrived, and it is what `flush_stale` and the
-    /// emission rule both measure silence against.
-    pub fn push_line(&mut self, source: Source, raw: &str, at: Instant) {
+    /// emission rule both measure silence against. `arrival_ms` is the same
+    /// moment on the wall clock, which `Instant` cannot give: it is only
+    /// comparable to itself, and an offset is a comparison against the
+    /// timestamps a process writes.
+    pub fn push_line(&mut self, source: Source, raw: &str, at: Instant, arrival_ms: i64) {
         let i = self.index(source);
         self.last_line[i] = at;
-        if let Some(record) = self.builders[i].push_line(raw) {
+        let pushed = self.builders[i].push_line(raw);
+        if let Some(stamp) = pushed.stamped_at {
+            self.observe(i, arrival_ms - stamp.0);
+        }
+        if let Some(record) = pushed.completed {
             self.queues[i].push_back(record);
+        }
+    }
+
+    /// Folds one `arrival - stamp` sample into a source's offset estimate.
+    ///
+    /// **The minimum, not the latest or the mean.** Every sample is the true
+    /// offset plus however long that line took to reach us, and that delay is
+    /// never negative - so the smallest sample is the least contaminated one.
+    /// This is the filter NTP uses, and it is what makes a backlog harmless:
+    /// `tail -n 500` hands over lines stamped minutes ago, which produce large
+    /// samples, and the first live line produces a small one that wins
+    /// outright. A mean would let the backlog drag the estimate for the rest of
+    /// the session; the latest sample would let one stale line undo it.
+    fn observe(&mut self, i: usize, sample: i64) {
+        self.offsets[i] = Some(match self.offsets[i] {
+            Some(current) => current.min(sample),
+            None => sample,
+        });
+        self.recompute_corrections();
+    }
+
+    /// Turns the offset estimates into the corrections actually applied -
+    /// **only when the difference between them looks like a timezone.**
+    ///
+    /// The estimate cannot tell two things apart on its own: a source whose
+    /// clock really is an hour behind, and a source whose newest line is
+    /// simply an hour old. `min(arrival - stamp)` reads identically in both
+    /// cases. In a live session that resolves itself, because the next line
+    /// the source writes is a fresh sample - but `dump-logs` has no live phase
+    /// at all, and there a source that has been quiet would otherwise be
+    /// "corrected" into the middle of the other's recent output, which is a
+    /// worse lie than leaving it where it was.
+    ///
+    /// So the estimate must clear a bar before it is used: the sources must
+    /// disagree by at least a quarter of an hour, and by *within a second of a
+    /// multiple* of one. Every real timezone offset is a multiple of fifteen
+    /// minutes; a stale source is only that, to the second, by coincidence.
+    /// Failing the bar means no correction at all, which is the behaviour this
+    /// had before and is right whenever the evidence is weak.
+    fn recompute_corrections(&mut self) {
+        self.corrections = vec![0; self.sources.len()];
+
+        let mut known = Vec::with_capacity(self.sources.len());
+        for offset in &self.offsets {
+            match offset {
+                Some(o) => known.push(*o),
+                // A source with nothing to say yet cannot be compared, and
+                // correcting the others against a missing one would be a guess.
+                None => return,
+            }
+        }
+        if known.len() < 2 {
+            return;
+        }
+
+        let base = *known.iter().min().expect("at least two sources");
+        let spread = *known.iter().max().expect("at least two sources") - base;
+        let Some(zone) = as_zone_offset(spread) else {
+            return;
+        };
+
+        for i in 0..self.sources.len() {
+            self.corrections[i] =
+                as_zone_offset(self.offsets[i].expect("checked above") - base).unwrap_or(0);
+        }
+        self.note_skew(base, zone);
+    }
+
+    /// Says once that a correction is being applied, and how big it is.
+    fn note_skew(&mut self, base: i64, zone: i64) {
+        if self.skew_judged {
+            return;
+        }
+        self.skew_judged = true;
+
+        // The source at `base` has the smallest offset, which means it stamps
+        // times furthest ahead of this host's clock: the offset is what has to
+        // be *added* to a source's stamps to land on that clock.
+        let ahead = self.sources[self
+            .offsets
+            .iter()
+            .position(|o| *o == Some(base))
+            .expect("base came from these offsets")];
+        let behind = self.sources[self
+            .offsets
+            .iter()
+            .position(|o| *o != Some(base))
+            .expect("the spread is non-zero, so some source differs")];
+        self.skew_note = Some(format!(
+            "{} stamps its log {} ahead of {} - ordering by when the lines arrived, \
+             not by the printed times",
+            ahead.tag(),
+            humanize_ms(zone),
+            behind.tag(),
+        ));
+    }
+
+    /// The skew note, once. `None` afterwards, and `None` when the sources
+    /// agree or only one of them is being read.
+    pub fn take_skew_note(&mut self) -> Option<String> {
+        self.skew_note.take()
+    }
+
+    /// One source's estimated offset. Test-only: production reads the
+    /// correction through the ordering, never as a number, and the one number
+    /// an operator needs is in the skew note.
+    ///
+    /// `None` until that source has produced a readable timestamp.
+    #[cfg(test)]
+    pub fn offset_ms(&self, source: Source) -> Option<i64> {
+        self.offsets[self.index(source)]
+    }
+
+    /// Where a record sorts, on the one timeline every source is corrected
+    /// onto.
+    ///
+    /// The offset applies to **every** record of a source, including the
+    /// undated ones that landed at the session start: shifting all of a
+    /// source's records together is what keeps its queue non-decreasing, which
+    /// is the invariant the head comparison rests on. A source with no
+    /// estimate yet is taken at face value, which is right for the only
+    /// records that can exist in that state - undated ones, already stamped
+    /// with this host's own clock.
+    ///
+    /// Clamped to `last_emitted` so a refinement can never send the output
+    /// backwards. An offset only ever shrinks, so a late correction can
+    /// normalise a queued record to earlier than one already written, and the
+    /// operator would see the timeline step back on itself. Costing that
+    /// record its exact position is the cheaper of the two.
+    fn key(&self, i: usize, record: &Record) -> i64 {
+        let corrected = record.time.0.saturating_add(self.corrections[i]);
+        match self.last_emitted {
+            Some(floor) => corrected.max(floor),
+            None => corrected,
         }
     }
 
@@ -358,7 +589,7 @@ impl Merger {
     pub fn drain_ready(&mut self, now: Instant) -> Vec<Record> {
         let mut out = Vec::new();
         while let Some(i) = self.next_index(now) {
-            out.push(self.queues[i].pop_front().expect("head was just checked"));
+            out.push(self.take(i));
         }
         out
     }
@@ -377,7 +608,7 @@ impl Merger {
         }
         let mut out = Vec::new();
         while let Some(i) = self.earliest_head() {
-            out.push(self.queues[i].pop_front().expect("head was just checked"));
+            out.push(self.take(i));
         }
         out
     }
@@ -389,9 +620,16 @@ impl Merger {
         self.queues
             .iter()
             .enumerate()
-            .filter_map(|(i, q)| q.front().map(|r| (i, r.time)))
-            .min_by_key(|(i, time)| (*time, *i))
+            .filter_map(|(i, q)| q.front().map(|r| (i, self.key(i, r))))
+            .min_by_key(|(i, key)| (*key, *i))
             .map(|(i, _)| i)
+    }
+
+    /// Pops the chosen head and records where the timeline has reached.
+    fn take(&mut self, i: usize) -> Record {
+        let record = self.queues[i].pop_front().expect("head was just checked");
+        self.last_emitted = Some(self.key(i, &record));
+        record
     }
 
     /// The queue whose head may be emitted now, if any.
@@ -421,12 +659,296 @@ impl Merger {
 mod tests {
     use super::*;
 
+    /// Pushes a line as if it arrived at the moment it was stamped, so the
+    /// source's offset estimate lands on zero. The right setup for every test
+    /// that is about the emission rule rather than about the correction.
+    fn synced(m: &mut Merger, source: Source, raw: &str, at: Instant) {
+        let stamped = match leading_timestamp(raw) {
+            Some(Stamp::Absolute(t)) => t.0,
+            Some(Stamp::TimeOfDay(ms)) => ms,
+            None => 0,
+        };
+        m.push_line(source, raw, at, stamped);
+    }
+
     fn rec(source: Source, ms: i64, text: &str) -> Record {
         Record {
             source,
             time: LogTime(ms),
             lines: vec![text.to_string()],
         }
+    }
+
+    /// Midnight UTC on the day the reference lines were taken off a node.
+    fn day_ms() -> i64 {
+        crate::dump::days_from_civil(2026, 9, 17) * 86_400_000
+    }
+
+    /// A console-layout line stamped at `h:m:s` on that day, tagged so the
+    /// assertions can read the order off the output.
+    fn at(h: i64, m: i64, s: i64, text: &str) -> String {
+        on(17, h, m, s, text)
+    }
+
+    /// The same, on a named day of that month - a source stamping twelve hours
+    /// ahead crosses midnight while the host has not.
+    fn on(day: i64, h: i64, m: i64, s: i64, text: &str) -> String {
+        format!("2026-09-{day:02} {h:02}:{m:02}:{s:02}.000 INFO  - {text}")
+    }
+
+    fn ms(h: i64, m: i64, s: i64) -> i64 {
+        day_ms() + h * 3_600_000 + m * 60_000 + s * 1_000
+    }
+
+    /// The reported deployment, reduced to its essentials: a bare-metal beacon
+    /// node stamping local time 12 hours ahead of a validator container
+    /// stamping UTC. Both wrote their lines at the same real moments -
+    /// 12:00:00 and 12:00:02 on the host's clock - and the output must say so.
+    ///
+    /// Ordered by the stamps alone, every vc line sorts twelve hours before
+    /// every bn line and the interleaving is a fiction.
+    #[test]
+    fn two_sources_twelve_hours_apart_are_ordered_by_what_really_happened() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+
+        // Host clock 11:59:58 through 12:00:02 on the 17th. bn stamps twelve
+        // hours ahead, so it crosses midnight into the 18th while the host has
+        // not; vc stamps the host's own time.
+        m.push_line(
+            Source::Bn,
+            &on(17, 23, 59, 58, "bn first"),
+            t0,
+            ms(11, 59, 58),
+        );
+        m.push_line(
+            Source::Vc,
+            &on(17, 11, 59, 59, "vc first"),
+            t0,
+            ms(11, 59, 59),
+        );
+        m.push_line(Source::Bn, &on(18, 0, 0, 1, "bn second"), t0, ms(12, 0, 1));
+        m.push_line(Source::Vc, &on(17, 12, 0, 2, "vc second"), t0, ms(12, 0, 2));
+
+        let later = t0 + Duration::from_millis(300);
+        m.flush_stale(later);
+        let drained = m.drain_ready(later);
+        let expected = [
+            on(17, 23, 59, 58, "bn first"),
+            on(17, 11, 59, 59, "vc first"),
+            on(18, 0, 0, 1, "bn second"),
+            on(17, 12, 0, 2, "vc second"),
+        ];
+        assert_eq!(
+            texts(&drained),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the two sources interleave by when their lines actually arrived"
+        );
+    }
+
+    /// Two sources that agree are left alone: the correction must not invent
+    /// an offset where there is none.
+    #[test]
+    fn agreeing_sources_are_not_corrected() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+        m.push_line(Source::Bn, &at(12, 0, 0, "bn"), t0, ms(12, 0, 0));
+        m.push_line(Source::Vc, &at(12, 0, 1, "vc"), t0, ms(12, 0, 1));
+
+        let later = t0 + Duration::from_millis(300);
+        m.flush_stale(later);
+        let drained = m.drain_ready(later);
+        let expected = [at(12, 0, 0, "bn"), at(12, 0, 1, "vc")];
+        assert_eq!(
+            texts(&drained),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    /// The offset is the *minimum* of `arrival - stamp`, not the newest
+    /// sample. That is what makes a backlog harmless: its lines were stamped
+    /// long before they arrived, so they produce large samples, and the live
+    /// line that follows produces a small one and wins. Taking the latest
+    /// sample instead would let one stale line poison the estimate.
+    #[test]
+    fn the_offset_is_the_minimum_sample_so_a_backlog_cannot_poison_it() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+
+        // A backlog burst: stamped an hour ago, all arriving now.
+        m.push_line(Source::Bn, &at(11, 0, 0, "old"), t0, ms(12, 0, 0));
+        assert_eq!(
+            m.offset_ms(Source::Bn),
+            Some(3_600_000),
+            "only stale samples so far"
+        );
+
+        // Then a live line, stamped as it arrives.
+        m.push_line(Source::Bn, &at(12, 0, 1, "live"), t0, ms(12, 0, 1));
+        assert_eq!(
+            m.offset_ms(Source::Bn),
+            Some(0),
+            "the live sample is smaller and wins"
+        );
+    }
+
+    /// A refinement shifts a source's whole timeline, so a record queued
+    /// before it could normalise to earlier than something already emitted.
+    /// Output that steps backwards is worse than output that is slightly
+    /// coarse, so the key is clamped to what was last emitted.
+    #[test]
+    fn a_refined_offset_never_sends_the_output_backwards() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+        let later = t0 + Duration::from_millis(300);
+
+        // vc calibrates immediately and emits.
+        m.push_line(Source::Vc, &at(12, 0, 0, "vc first"), t0, ms(12, 0, 0));
+        m.flush_stale(later);
+        let first = m.drain_ready(later);
+        assert_eq!(texts(&first), vec![at(12, 0, 0, "vc first").as_str()]);
+
+        // bn's first sample is stale, so its offset starts too large; the next
+        // line refines it downwards and would otherwise sort before vc's.
+        m.push_line(Source::Bn, &at(10, 0, 0, "bn stale"), t0, ms(12, 0, 0));
+        m.push_line(Source::Bn, &at(12, 0, 5, "bn live"), t0, ms(12, 0, 5));
+
+        let last = t0 + Duration::from_millis(600);
+        m.flush_stale(last);
+        let drained = m.drain_ready(last);
+        let expected = [at(10, 0, 0, "bn stale"), at(12, 0, 5, "bn live")];
+        assert_eq!(
+            texts(&drained),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "still in the source's own order, and after what was already emitted"
+        );
+    }
+
+    /// A corrected twelve-hour skew has to be visible. Two adjacent lines
+    /// whose printed timestamps differ by half a day look like a broken merge
+    /// unless the correction says it is there.
+    #[test]
+    fn a_large_skew_is_reported_once() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+        assert_eq!(
+            m.take_skew_note(),
+            None,
+            "nothing to say before calibration"
+        );
+
+        m.push_line(Source::Bn, &on(17, 23, 59, 58, "bn"), t0, ms(11, 59, 58));
+        m.push_line(Source::Vc, &on(17, 11, 59, 59, "vc"), t0, ms(11, 59, 59));
+
+        let note = m
+            .take_skew_note()
+            .expect("a half-day skew must be reported");
+        assert!(note.contains("bn"), "{note}");
+        assert!(note.contains("vc"), "{note}");
+        assert!(note.contains("12h"), "{note}");
+        assert_eq!(m.take_skew_note(), None, "said once, not on every tick");
+    }
+
+    /// The gate, directly. Everything below a quarter hour is ordinary
+    /// disagreement; above it, only a near-exact multiple is a timezone.
+    #[test]
+    fn only_a_plausible_timezone_is_read_as_one() {
+        assert_eq!(as_zone_offset(0), None, "identical clocks");
+        assert_eq!(as_zone_offset(1_000), None, "a second of delivery jitter");
+        assert_eq!(as_zone_offset(14 * 60_000), None, "under one step");
+        assert_eq!(as_zone_offset(15 * 60_000), Some(15 * 60_000), "+00:15");
+        assert_eq!(
+            as_zone_offset(12 * 3_600_000 + 400),
+            Some(12 * 3_600_000),
+            "a real offset, plus the estimate's own error"
+        );
+        assert_eq!(
+            as_zone_offset(5 * 3_600_000 + 30 * 60_000),
+            Some(5 * 3_600_000 + 30 * 60_000),
+            "+05:30 is a real zone"
+        );
+        assert_eq!(
+            as_zone_offset(37 * 60_000),
+            None,
+            "a source quiet for 37 minutes is not in another timezone"
+        );
+    }
+
+    /// The failure that made the gate necessary, from `dump-logs`: with no
+    /// live phase there is nothing to calibrate against, so a source whose
+    /// newest line is a second older than the other's reads as a source whose
+    /// clock is a second behind. Correcting on that evidence reorders a dump
+    /// that was already right.
+    #[test]
+    fn a_source_whose_newest_line_is_merely_older_is_not_corrected() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            0,
+        );
+        let read_at = ms(20, 0, 0);
+
+        // A dump: every line arrives now, whatever it is stamped.
+        m.push_line(Source::Bn, &at(1, 0, 0, "bn one"), t0, read_at);
+        m.push_line(Source::Bn, &at(1, 0, 2, "bn two"), t0, read_at);
+        m.push_line(Source::Vc, &at(1, 0, 1, "vc one"), t0, read_at);
+
+        let drained = m.drain_all();
+        let expected = [
+            at(1, 0, 0, "bn one"),
+            at(1, 0, 1, "vc one"),
+            at(1, 0, 2, "bn two"),
+        ];
+        assert_eq!(
+            texts(&drained),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the printed stamps are the only evidence here, and they were right"
+        );
+    }
+
+    #[test]
+    fn a_small_skew_is_not_worth_reporting() {
+        let t0 = Instant::now();
+        let mut m = Merger::new(
+            vec![Source::Bn, Source::Vc],
+            Duration::from_millis(250),
+            t0,
+            ms(12, 0, 0),
+        );
+        m.push_line(Source::Bn, &at(12, 0, 0, "bn"), t0, ms(12, 0, 0));
+        m.push_line(Source::Vc, &at(12, 0, 1, "vc"), t0, ms(12, 0, 1));
+        assert_eq!(
+            m.take_skew_note(),
+            None,
+            "ordinary delivery jitter is not a timezone"
+        );
     }
 
     /// The one-record lag. A timestamped line opens a record that only the
@@ -439,7 +961,7 @@ mod tests {
     fn a_pending_record_is_released_once_its_source_goes_quiet() {
         let t0 = Instant::now();
         let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
-        m.push_line(Source::Bn, "01:00:00.000 INFO  - newest", t0);
+        synced(&mut m, Source::Bn, "01:00:00.000 INFO  - newest", t0);
 
         // Still open: a stack trace may yet follow, and it must travel with
         // the line that introduced it.
@@ -464,13 +986,15 @@ mod tests {
     fn a_stack_trace_arriving_in_a_burst_is_not_split_by_the_flush() {
         let t0 = Instant::now();
         let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
-        m.push_line(Source::Bn, "01:00:00.000 ERROR - boom", t0);
-        m.push_line(
+        synced(&mut m, Source::Bn, "01:00:00.000 ERROR - boom", t0);
+        synced(
+            &mut m,
             Source::Bn,
             "\tat org.example.Thing",
             t0 + Duration::from_millis(1),
         );
-        m.push_line(
+        synced(
+            &mut m,
             Source::Bn,
             "\tat org.example.Other",
             t0 + Duration::from_millis(2),
@@ -489,8 +1013,8 @@ mod tests {
     fn a_flushed_record_keeps_its_queue_non_decreasing() {
         let t0 = Instant::now();
         let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
-        m.push_line(Source::Bn, "01:00:00.000 INFO  - first", t0);
-        m.push_line(Source::Bn, "01:00:01.000 INFO  - second", t0);
+        synced(&mut m, Source::Bn, "01:00:00.000 INFO  - first", t0);
+        synced(&mut m, Source::Bn, "01:00:01.000 INFO  - second", t0);
         let first = m.drain_ready(t0);
         assert_eq!(texts(&first), vec!["01:00:00.000 INFO  - first"]);
 
@@ -510,9 +1034,9 @@ mod tests {
     fn a_busy_source_keeps_its_record_open() {
         let t0 = Instant::now();
         let mut m = Merger::new(vec![Source::Bn], Duration::from_millis(250), t0, 0);
-        m.push_line(Source::Bn, "01:00:00.000 INFO  - open", t0);
+        synced(&mut m, Source::Bn, "01:00:00.000 INFO  - open", t0);
         let busy = t0 + Duration::from_millis(200);
-        m.push_line(Source::Bn, "\tstill writing", busy);
+        synced(&mut m, Source::Bn, "\tstill writing", busy);
 
         m.flush_stale(busy + Duration::from_millis(100));
         assert!(
@@ -550,7 +1074,7 @@ mod tests {
         let mut b = RecordBuilder::new(Source::Bn, 1_000);
         let got: Vec<Record> = ["not a log line at all", "nor this one", "nor this"]
             .iter()
-            .filter_map(|l| b.push_line(l))
+            .filter_map(|l| b.push_line(l).completed)
             .collect();
         assert_eq!(
             got.len(),
@@ -566,13 +1090,14 @@ mod tests {
     #[test]
     fn a_continuation_after_a_timestamped_line_still_joins_it() {
         let mut b = RecordBuilder::new(Source::Bn, 1_000);
-        assert!(b.push_line("01:00:00.000 INFO  - boom").is_none());
+        assert!(b.push_line("01:00:00.000 INFO  - boom").completed.is_none());
         assert!(
-            b.push_line("\tat org.example.Thing").is_none(),
+            b.push_line("\tat org.example.Thing").completed.is_none(),
             "a trace line joins the record above it"
         );
         let closed = b
             .push_line("01:00:01.000 INFO  - next")
+            .completed
             .expect("the next timestamped line closes the record");
         assert_eq!(closed.lines.len(), 2);
     }
@@ -676,16 +1201,20 @@ mod tests {
         let mut b = RecordBuilder::new(Source::Bn, 0);
         assert!(b
             .push_line("2026-09-14 01:16:54.217 ERROR - Failed to import block")
+            .completed
             .is_none());
         assert!(b
             .push_line("java.lang.IllegalStateException: nope")
+            .completed
             .is_none());
         assert!(b
             .push_line("\tat tech.pegasys.teku.Foo.bar(Foo.java:42)")
+            .completed
             .is_none());
 
         let done = b
             .push_line("2026-09-14 01:16:55.000 INFO  - Slot event")
+            .completed
             .expect("the next timestamped line completes the previous record");
         assert_eq!(done.lines.len(), 3, "trace lines must travel together");
         assert!(done.lines[2].contains("Foo.java:42"));
@@ -706,6 +1235,7 @@ mod tests {
         let mut b = RecordBuilder::new(Source::Vc, 7_000);
         let done = b
             .push_line("docker: no such container")
+            .completed
             .expect("nothing precedes it, so nothing can close it later");
         assert_eq!(done.lines, vec!["docker: no such container"]);
         assert_eq!(done.time, LogTime(7_000), "falls back to session start");
@@ -723,6 +1253,7 @@ mod tests {
         // The third line is what closes and returns the backwards record.
         let clamped = b
             .push_line("2026-09-14 03:00:00.000 INFO  - forward")
+            .completed
             .expect("the backwards record is returned here");
 
         assert!(

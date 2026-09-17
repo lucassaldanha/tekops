@@ -4,7 +4,7 @@
 //! helpers are pure and hold every formatting decision, and `run_dump` holds
 //! all the I/O.
 
-use crate::logs::{producer_argv, slot_target, LogSources, LogTarget, Mode};
+use crate::logs::{producer_argv, slot_target, wall_clock_ms, LogSources, LogTarget, Mode};
 use crate::merge::{Merger, Source, MERGE_WINDOW};
 use crate::redact::Redactor;
 use crate::stack::Stack;
@@ -222,7 +222,7 @@ fn read_source(
     // is for the follow-mode producers that never get one.
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|e| DumpError::Io(e.to_string()))?;
-        merger.push_line(source, &line, Instant::now());
+        merger.push_line(source, &line, Instant::now(), wall_clock_ms());
     }
     merger.eof(source);
 
@@ -281,6 +281,14 @@ fn read_sources(
     }
     if !read_any {
         return Err(first_failure.unwrap_or(DumpError::Io("no log source to read".to_string())));
+    }
+
+    // A dump is read by someone who was not there, so a corrected skew matters
+    // more here than on screen: without it, two adjacent lines stamped half a
+    // day apart look like evidence of a broken node rather than of two
+    // timezones.
+    if let Some(skew) = merger.take_skew_note() {
+        notes.push(format!("*** tekops: {skew}"));
     }
 
     // The tag is prepended *after* redaction, which is what makes it safe by
