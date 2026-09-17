@@ -12,6 +12,7 @@ mod http;
 mod logfmt;
 mod loglevel;
 mod logs;
+mod merge;
 mod metrics;
 mod output;
 mod protocol;

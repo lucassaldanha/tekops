@@ -18,20 +18,12 @@ fn color_for_level(level: &str) -> &'static str {
 /// path.
 const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
-// The types and functions below (LogTime, Stamp, parse_timestamp, and their
-// helpers) have no caller outside of tests in this commit. They will be wired
-// into merge.rs in a later task; until then, they appear as dead code to
-// rustc. The #[allow(dead_code)] attributes suppress warnings that would
-// otherwise fail the build under -D warnings. They will be removed once
-// merge.rs consumes these items.
-
 /// A log timestamp as milliseconds since the Unix epoch.
 ///
 /// One integer rather than a date type, because the only thing anything does
 /// with it is compare it against another one and occasionally add a day.
 /// Adding a date dependency to a single-binary CLI to do that would be a poor
 /// trade.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LogTime(pub i64);
 
@@ -41,7 +33,6 @@ pub struct LogTime(pub i64);
 /// parsed timestamp is not always locatable on its own. Dating a `TimeOfDay`
 /// needs the source's recent history, which `merge.rs` keeps - resolving it
 /// here would mean guessing with less information.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stamp {
     Absolute(LogTime),
@@ -49,7 +40,6 @@ pub enum Stamp {
 }
 
 /// Milliseconds since midnight from `HH:MM:SS` or `HH:MM:SS.mmm`.
-#[allow(dead_code)]
 fn time_of_day_ms(s: &str) -> Option<i64> {
     let (hms, millis) = match s.split_once('.') {
         Some((hms, ms)) => {
@@ -74,7 +64,6 @@ fn time_of_day_ms(s: &str) -> Option<i64> {
 }
 
 /// `YYYY-MM-DD` to days since the Unix epoch.
-#[allow(dead_code)]
 fn date_days(s: &str) -> Option<i64> {
     let mut parts = s.split('-');
     let y: i64 = parts.next()?.parse().ok()?;
@@ -105,7 +94,6 @@ fn date_days(s: &str) -> Option<i64> {
 /// Returning `None` is meaningful rather than a failure: a line with no
 /// timestamp is a stack trace's continuation, and `merge.rs` uses exactly
 /// this to keep a trace attached to the line that introduced it.
-#[allow(dead_code)]
 pub fn parse_timestamp(s: &str) -> Option<Stamp> {
     let s = s.trim_end_matches('Z');
     if let Some((date, time)) = s.split_once(['T', ' ']) {
