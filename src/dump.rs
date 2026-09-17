@@ -283,10 +283,10 @@ fn read_sources(
         return Err(first_failure.unwrap_or(DumpError::Io("no log source to read".to_string())));
     }
 
-    // A dump is read by someone who was not there, so a corrected skew matters
-    // more here than on screen: without it, two adjacent lines stamped half a
-    // day apart look like evidence of a broken node rather than of two
-    // timezones.
+    // A dump is read by someone who was not there, so this matters more here
+    // than on screen: an artifact whose two halves are stamped hours apart
+    // looks like evidence about the node, and without the note there is
+    // nothing to say the times are simply not comparable.
     if let Some(skew) = merger.take_skew_note() {
         notes.push(format!("*** tekops: {skew}"));
     }

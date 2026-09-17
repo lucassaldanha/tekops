@@ -122,9 +122,9 @@ fn emit_loop(
             (ready, m.is_done(), m.take_skew_note())
         };
 
-        // Written before the records it explains. Two adjacent lines whose
-        // printed timestamps are half a day apart read as a broken merge
-        // unless something says the correction is deliberate.
+        // Written before the records it explains. An interleaving of two
+        // clocks that disagree looks like a broken merge, and the operator
+        // cannot act on it without being told which knob to turn.
         if let Some(note) = skew {
             writeln!(writer, "*** tekops: {}", sanitize(&note))?;
         }
