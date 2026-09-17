@@ -184,7 +184,7 @@ impl fmt::Display for DetectError {
 ///
 /// Takes the output as a parameter rather than running `docker` itself, so the
 /// whole matching rule is unit-testable on a machine with no Docker installed -
-/// the same shape, and for the same reason, as `logs::resolve_log_target`.
+/// the same shape, and for the same reason, as `logs::resolve_log_sources`.
 ///
 /// `only` narrows the search to a single stack's naming, which is what
 /// `--stack` contributes to detection. Note it contributes a *filter*, never a
@@ -442,9 +442,10 @@ mod tests {
     /// `--stack bare-metal` is the escape hatch for a host that runs Docker
     /// alongside a bare-metal node: narrowing to a stack with no
     /// `container_suffix()` can never match anything, so detection turns off
-    /// and `resolve_log_target` falls through to the file-path behaviour. This
-    /// already worked - `container_suffix()` is `None` for `BareMetal` and the
-    /// loop skips a `None` suffix - but nothing pinned it before this test.
+    /// and `resolve_log_sources` falls through to its bn slot's file-path
+    /// default. This already worked - `container_suffix()` is `None` for
+    /// `BareMetal` and the loop skips a `None` suffix - but nothing pinned it
+    /// before this test.
     #[test]
     fn narrowing_to_bare_metal_matches_nothing() {
         let ps = "eth-docker-consensus-1\nrocketpool_eth2\n";

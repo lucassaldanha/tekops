@@ -35,9 +35,10 @@ pub const MERGE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Which process a record came from.
 ///
-/// No `#[allow(dead_code)]` here: `logs::LogSources::active` constructs both
-/// variants, and that is enough to keep them live even though `active` itself
-/// is not yet called from `main`.
+/// No `#[allow(dead_code)]` here: `resolve_log_sources`'s rule 3 pattern-matches
+/// both variants (`Some(Source::Bn) => ...`, `Some(Source::Vc) => ...` on
+/// `inputs.select`), which is reachable from `main` via `run_logs`, and a
+/// pattern match on a variant counts as a use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
     Bn,

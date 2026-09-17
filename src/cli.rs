@@ -917,9 +917,17 @@ fn note_ambiguity(found: Result<(Stack, String), DetectError>) -> Option<(Stack,
 
 /// Whether `docker ps` has anything left to answer.
 ///
-/// The logical negation of every rung in `logs::resolve_log_target` above
-/// `detected`. Extracted so the two call sites cannot drift apart and so the
-/// condition is testable without spawning Docker.
+/// The logical negation of every rung in `logs::resolve_log_sources`'s bn
+/// ladder above `detected_bn`. Extracted so the two call sites cannot drift
+/// apart and so the condition is testable without spawning Docker.
+///
+/// This checks only the bn rungs - it does not yet know about
+/// `vc_container`/`vc_logs_file`, so it still gates the single spawn that
+/// answers both `detected_bn` and `detected_vc`. `resolve_log_sources`'s own
+/// doc comment states the rule this must widen to: skippable only when
+/// *both* slots are already answered, because the bn rungs alone must not
+/// suppress the spawn that a separated deployment's vc slot still needs.
+/// Widening this function to that per-slot rule is a later task's job.
 fn needs_detection(
     path: Option<&PathBuf>,
     container_flag: Option<&String>,

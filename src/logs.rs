@@ -152,9 +152,16 @@ pub struct SourceInputs {
 ///    interact with rule 1.
 ///
 /// `cli.rs::needs_detection` is this function's precedence list negated by
-/// hand. A rung added above `detected_bn`/`detected_vc` means a clause added
-/// there, or a configured operator pays for a `docker ps` spawn whose answer
-/// cannot be used.
+/// hand, and since R12 the negation is per-slot: detection is skippable only
+/// when *both* slots are already answered. The bn rungs alone no longer
+/// suppress the spawn, because `docker ps` now also answers `detected_vc` -
+/// a host with `logs_file` configured and a Rocket Pool validator container
+/// running needs that spawn to find its second stream at all. So a rung
+/// added above `detected_bn`/`detected_vc` means a clause added there, and a
+/// rung that only answers one slot must not gate the whole condition. Get
+/// the first wrong and a configured operator pays for a `docker ps` spawn
+/// whose answer cannot be used; get the second wrong and a separated
+/// deployment silently keeps printing one stream.
 pub fn resolve_log_sources(inputs: SourceInputs) -> LogSources {
     let bn_flags = [
         inputs.container_flag.map(LogTarget::Container),
@@ -766,6 +773,25 @@ mod tests {
             got.vc,
             Some(LogTarget::Container("rocketpool_validator".into()))
         );
+    }
+
+    /// The asymmetric half of R12's boundary: a flag on one side silences a
+    /// *configured* source on the other, not just a detected one. This is
+    /// deliberate, not an oversight - rule 1's gate is `bn_explicit`/
+    /// `vc_explicit` (flag/env only), and `vc_container_cfg` here never
+    /// reaches that gate, so `vc_stated` (which does see it) is discarded
+    /// along with it. Do not "fix" this by widening the gate to config; that
+    /// is exactly the case `detection_alone_resolves_both_sources` above
+    /// pins the other way.
+    #[test]
+    fn a_flag_on_one_side_suppresses_a_configured_other_side() {
+        let got = resolve_log_sources(SourceInputs {
+            container_flag: Some("X".into()),
+            vc_container_cfg: Some("Y".into()),
+            ..inputs()
+        });
+        assert_eq!(got.bn, Some(LogTarget::Container("X".into())));
+        assert_eq!(got.vc, None);
     }
 
     #[test]
