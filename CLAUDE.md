@@ -62,6 +62,7 @@ absent-is-not-zero); new code is expected to follow them.
 | `curl.rs` | the HTTPS boundary, shelled out to `curl` |
 | `output.rs` | pure formatting functions, plus the `--json` convention |
 | `logfmt.rs` | one log line in, one colorized line out |
+| `merge.rs` | ordering two log sources into one timeline; pure |
 | `logs.rs` | `tekops logs`: target resolution, streaming, process lifetime |
 | `dump.rs` | `tekops dump-logs` |
 | `redact.rs` | the anonymiser behind `dump-logs` |

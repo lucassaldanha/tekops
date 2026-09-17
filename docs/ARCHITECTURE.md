@@ -28,7 +28,7 @@ building, the local gate and shipping.
 Four shapes repeat across the tree. A new module is expected to follow them, and
 most of the entries below are an instance of one.
 
-**Split pure from I/O.** `logs::resolve_log_target`, `completions::plan`,
+**Split pure from I/O.** `logs::resolve_log_sources`, `completions::plan`,
 `stack::detect_stack`, `logfmt::format_log_line`, `docker::parse_inspect`,
 `config::parse`, `doctor::evaluate` and the `host.rs` parsers all take every
 input as a parameter, with a thin I/O wrapper as the only thing that touches the
@@ -116,7 +116,7 @@ never be the right addition to their error path.
   everything environment-dependent (the `$SHELL` detection, `dirs_from_env`,
   the preview, the prompt) so `completions` itself stays pure.
 - `logs` is the one command whose handler does **not** live here: `run_logs`
-  and `supervise_pager` are in `logs.rs`, next to the `stream_logs` loop and
+  and `supervise_pager` are in `logs.rs`, next to the `emit_records` loop and
   the buffer cap they drive. This file only parses the positional and flags
   (`--container`, `--stack`) and calls `logs::run_logs`.
 
@@ -149,7 +149,7 @@ itself precisely so that ordering is testable.
 
 The config is loaded once by `run()` **before dispatch**, so a malformed
 file fails every command including `about` and `update`, which read none of
-the eight keys: the file being broken is a fact about the installation rather
+the ten keys: the file being broken is a fact about the installation rather
 than about one command, and reporting it from whichever command the operator
 runs first is the shortest path to fixing it. That failure prints directly
 and does **not** go through `exit_for_api`, whose `--stack` hint would point
@@ -194,7 +194,7 @@ pays for it. `needs_detection` is a single extracted predicate with its own
 doc comment and per-clause tests, called by both the `Logs` and `DumpLogs`
 arms - it used to be two hand-inlined copies of the condition, which is two
 places to forget a rung rather than one. It still has to track every branch
-of `logs::resolve_log_target`'s precedence ladder that fires before its
+of `logs::resolve_log_sources`'s precedence ladder that fires before its
 `detected` parameter, because it is that ladder's logical negation living in
 a different file, and nothing ties the two together at compile time; the
 extraction removes the duplication, not the drift risk, and the tie is a
@@ -513,69 +513,169 @@ bytes inside a JSON string are invalid JSON, so a test literal must spell
 the escape out (a backslash followed by u001b) or it silently exercises
 the passthrough path instead of the parsed-field path.
 
+## `merge.rs`
+
+Ordering two log sources into one timeline. Pure: no threads, no IO, no clock
+of its own - every instant arrives as a parameter. `logs.rs` owns the threads
+that feed it.
+
+**The merge unit is a record, not a line.** A record is one timestamped line
+plus the untimestamped lines that follow it from the same source. Teku logs a
+stack trace as one timestamped line followed by continuations carrying no
+timestamp, so sorting lines would scatter a trace through the other source's
+output. This is a correctness requirement, not an optimisation: a line-level
+merge is wrong on any node that logs an exception.
+
+**The rule.** Each source's own records are non-decreasing in time, so only
+the head of each queue matters. Emit the earliest head when every *other*
+source either has a head to compare against, or has been silent longer than
+`MERGE_WINDOW`, or is at EOF. A source with an empty queue that is neither
+idle nor finished may still deliver something older, and emitting past it is
+the exact inversion this exists to prevent.
+
+That one rule covers both the `-n` backlog and live follow with no mode
+switch. `tail -n 500` and `docker logs --tail 500` deliver their backlog as an
+immediate burst, both queues fill, and the same comparison sorts it exactly.
+
+**`Merger::new` takes `started_at` rather than exposing a `start()` method**,
+so a source's idle clock cannot be left unseeded. An unseeded source is never
+idle, which would hang the other source's entire backlog forever on a quiet
+node - a silent hang, the worst failure this type could have, so the type
+makes it unrepresentable.
+
+**Monotonicity is enforced, not assumed.** `RecordBuilder` clamps a timestamp
+that moves backwards to its predecessor, and a record whose first line has no
+parseable timestamp inherits the previous one's. Both keep the per-source
+queue ordered, which is what the head-only comparison depends on; without the
+clamp a clock change would corrupt the merge rather than misplace one line.
+`Merger::push` is deliberately a plain `push_back` and does **not** sort
+defensively - that would cost time on every record and, worse, would mask a
+`RecordBuilder` that stopped clamping, making the invariant untestable.
+
+Ties break toward the source declared first, so output is stable run to run
+and a dump diffs against itself.
+
 ## `logs.rs`
 
 `tekops logs`: resolving what to tail, streaming it, and the whole session's
 process lifetime.
 
 Holds `DEFAULT_TEKU_LOG` (the path the old bashrc function tailed),
-`LogTarget` (`File` or `Container`), `resolve_log_target`, the `stream_logs`
-loop and the buffer cap it drives, plus the command handler itself
+`LogTarget` (`File` or `Container`), `LogSources` and `resolve_log_sources`,
+`emit_records` and the buffer cap it drives, plus the command handler itself
 (`run_logs`) and `supervise_pager`. The last two were moved out of `cli.rs`,
 which had grown to hold the clap definitions, every command handler, *and*
 the subtlest process-lifetime code in the tree; that lifetime is only
-intelligible next to `stream_logs` and `MAX_BUFFER_BYTES`, which is this
-file. `cli.rs` keeps only the parsing.
+intelligible next to the emitter and `MAX_BUFFER_BYTES`, which is this file.
+`cli.rs` keeps only the parsing.
 
-### The precedence ladder
+### Two ladders, three rules
 
-`resolve_log_target` has seven levels: the `--container` flag or the
-positional path (clap keeps those mutually exclusive, so there is no
-ordering question between them) beats `$TEKOPS_CONTAINER`, which beats
-`$TEKOPS_LOGS_FILE`, which beats the config file's `container`, which beats
-its `logs_file`, which beats `docker ps` detection, which beats the
-hardcoded default.
+`resolve_log_sources` resolves one source per process into
+`LogSources { bn, vc }`. Each slot runs the same seven-level ladder the single
+source used to: the flag or positional path beats the environment variable,
+which beats the config file, which beats `docker ps` detection, which beats
+the hardcoded default; within a tier, naming a container beats naming a file.
 
 The principle is flags beat environment beats config beats detection beats
 hardcoded default. Config sits below the environment because a variable is
 the more specific act - it was typed for this session - and above detection
-because a value the operator wrote down beats one tekops guessed; within
-each tier, naming a container beats naming a file for the same reason in
-both, it is the more specific statement. Detection sits below the positional
-path specifically so naming a file on a host that also happens to run Docker
-still reads that file rather than tailing an unrelated container, and above
-the hardcoded default because that default path doesn't exist on a Docker
-host, where a detected container is a far better answer than a guaranteed
-"file not found".
+because a value the operator wrote down beats one tekops guessed. Detection
+sits below the positional path specifically so naming a file on a host that
+also happens to run Docker still reads that file rather than tailing an
+unrelated container, and above the hardcoded default because that default
+path doesn't exist on a Docker host.
+
+Three rules sit on top, and each stops a specific wrong answer:
+
+1. **Naming one side by flag or environment variable yields that side only.**
+   Without it, `tekops logs --container rocketpool_validator` would start
+   printing a second stream on any host where detection also found a consensus
+   container - a silent change to what an existing command prints. **The
+   config file deliberately does not count here.** A flag or a variable is
+   typed for this invocation; config is ambient and describes the node. Were
+   config to gate this rule, the deployment the feature exists for - a
+   bare-metal beacon node with `logs_file` configured, beside a Rocket Pool
+   validator container - would silently show one stream and never the
+   validator, with no flags set and nothing in the output to say so.
+2. **The hardcoded default is a whole-command last resort**, not a per-slot
+   one, so a pure Rocket Pool node is not handed a "file not found" for a path
+   it never had.
+3. **`--bn`/`--vc` filter after both ladders run.** They name nothing, so they
+   cannot interact with rule 1. Because rule 2 runs before rule 3, a selector
+   can legitimately leave both slots empty; `cli::check_selection` catches that
+   and names the missing process rather than opening a default path or
+   presenting an empty session.
 
 Every input arrives as a parameter rather than being read inside the
 function, the same shape `completions::plan` uses for the same reason: the
 whole ladder is testable with no environment races and no Docker installed.
-`cli::needs_detection` is this ladder's logical negation and has to track
-every rung that fires before its `detected` parameter - see its doc comment.
+`cli::needs_detection` is this ladder's logical negation, and since the split
+the negation is **per-slot**: detection is skippable only when both slots are
+answered. A configured beacon node alone must not suppress the spawn, because
+the same `docker ps` is what finds the validator container beside it.
+
+### One emitter, two producers
+
+`run_logs` spawns one producer per resolved source, gives each a reader thread
+feeding a shared `Merger`, and runs a single emitter thread writing the merged
+result into the file `less` reads.
+
+**The emitter is the sole writer**, which is what keeps `MAX_BUFFER_BYTES`
+bounding the session as a whole. Letting each producer write its own would
+split the cap between them and quietly halve it - the same failure
+`producer_argv`'s doc comment was already avoiding when it chose to merge
+stderr in the shell rather than add a second writing thread.
+
+The emitter polls rather than blocking on a pipe, so closing the producers'
+stdout says nothing to it. Hence the `stop` flag, set by `supervise_pager`
+after the kills and before the joins. A reader that dies on an IO error still
+records EOF, so only a panicking one strictly needs the flag - but without it
+the join would hang on a thread that never returns, with the terminal already
+handed back.
+
+`emit_records` tags a line `[bn]`/`[vc]` **only when more than one source is
+active**, so a single-source session's bytes are exactly what they were before
+any of this existed. Continuation lines are tagged too: a stack trace whose
+second line lost its tag would read as the other process's output.
+
+**A source that cannot start is recorded rather than fatal**, so a separated
+node does not lose its working half to a beacon node whose default log path is
+absent. The reasons are only promoted from `note:` to `error:` when no source
+starts at all, which is what keeps a lone missing file reporting exactly the
+message it always did.
 
 ### Scrollback depth
 
 `-n`/`--lines` defaults to 500 and is interpolated straight into the `tail
 -n` (or `docker logs --tail`) invocation, so `0` is legal and means "follow
 only new output" rather than being a value to validate away. It is a `u32`,
-so clap rejects negatives itself. Those pre-loaded lines pass through
-`stream_logs` into the temp buffer like any other, so they count toward
-`MAX_BUFFER_BYTES` and are searchable from the start of the session - at a
-few hundred bytes per Teku line, even a large `-n` is nowhere near the cap.
+so clap rejects negatives itself. Those pre-loaded lines pass through the
+merger and `emit_records` into the temp buffer like any other, so they count
+toward `MAX_BUFFER_BYTES` and are searchable from the start of the session -
+at a few hundred bytes per Teku line, even a large `-n` is nowhere near the
+cap. **`-n` is per source**: on a separated deployment it is the last N lines
+of each, merged, so a two-source session buffers up to twice as much.
 
 ### Streaming and the buffer cap
 
-`stream_logs<R: BufRead, W: Write>` is generic specifically so it is
-testable with in-memory buffers instead of real subprocess pipes. It
-delegates to `stream_logs_capped` with `MAX_BUFFER_BYTES` (256 MiB). The cap
-exists because the buffer is a real file that only ever grows, and `/tmp` is
-tmpfs - RAM - on most systemd distros, on the machine running the validator.
-Stopping is the only bound that keeps the pager coherent: truncating a file
-`less` holds offsets into corrupts what it displays. Hitting the cap emits
-an in-band notice and returns `Ok`, since the session still works as
-scrollback. It is tested with an injected small limit rather than by pushing
-256 MiB through a real `tail`.
+`emit_records<W: Write>` is generic over its writer specifically so it is
+testable with in-memory buffers instead of real subprocess pipes, and takes
+`max_bytes` as a parameter for the same reason - the cap's behaviour is
+pinned with an injected small limit rather than by pushing 256 MiB through a
+real `tail`. `emit_loop` passes `MAX_BUFFER_BYTES` (256 MiB).
+
+The cap exists because the buffer is a real file that only ever grows, and
+`/tmp` is tmpfs - RAM - on most systemd distros, on the machine running the
+validator. Stopping is the only bound that keeps the pager coherent:
+truncating a file `less` holds offsets into corrupts what it displays.
+Hitting the cap emits an in-band notice and returns `Ok`, since the session
+still works as scrollback.
+
+**The running byte count is carried across calls**, because the cap bounds the
+session and not one batch. With two producers that is the whole point: a cap
+applied per batch, or per producer, would silently stop bounding the thing it
+names.
 
 `producer_argv` builds the argv for whichever of `tail -F` or `docker logs
 -f` the resolved target needs (the container arm goes via `sh -c` with
@@ -590,21 +690,30 @@ second copy of it is a second place to get it wrong.
 
 ### Process lifetime (non-obvious, don't regress)
 
-`run_logs` spawns `tail -F` piped through `stream_logs`, which writes the
-colorized output into a real temp file (`tempfile::Builder`) rather than
-into the pager's stdin directly - see below for why. `less` then opens that
-temp file by path.
+`run_logs` spawns one producer per resolved source, gives each a reader
+thread feeding a shared `Merger`, and runs an emitter thread that writes the
+merged colorized output into a real temp file (`tempfile::Builder`) rather
+than into the pager's stdin directly - see below for why. `less` then opens
+that temp file by path.
 
-`tail -F` never reaches EOF by design, so the streaming loop cannot be what
-ends the process. `stream_logs` runs on a separate thread and the **main
-thread blocks on `pager.wait()`** instead. When the pager exits, `tail` is
-killed and its stdout pipe hits EOF, ending the streaming thread with
-`Ok(())`, and the temp file (owned by a `NamedTempFile` local to `run_logs`)
-is removed by its `Drop` as the function returns. Getting the wait/kill
-ordering backwards - blocking the main thread on the streaming loop, or not
-killing `tail` before joining - reintroduces a hang when quitting the pager
-on a small or quiet log. That was a real regression caught in final review,
-not a hypothetical.
+Neither `tail -F` nor `docker logs -f` reaches EOF by design, so no reader can
+be what ends the process. They run on their own threads and the **main thread
+blocks on `pager.wait()`** instead. When the pager exits, **every** producer
+is killed before **any** thread is joined - a survivor holds its reader open
+and the join hangs exactly as it would have with one - their stdout pipes hit
+EOF, and the temp file (owned by a `NamedTempFile` local to `run_logs`) is
+removed by its `Drop` as the function returns. Getting the wait/kill ordering
+backwards - blocking the main thread on a reader, or joining before killing -
+reintroduces a hang when quitting the pager on a small or quiet log. That was
+a real regression caught in final review, not a hypothetical.
+
+The emitter needs one thing more, because it polls the merger rather than
+blocking on a pipe: closing the producers' stdout tells it nothing. The
+`stop` flag, set after the kills and before the joins, is what ends it. A
+reader that dies on an IO error still records EOF for its source, so only a
+panicking one strictly needs the flag - but without it that join hangs on a
+thread that will never return, with the terminal already handed back to the
+user. Both hangs have their own deadline test.
 
 That ordering lives in `supervise_pager` and has a regression test:
 `supervise_pager_returns_once_the_pager_exits_even_if_the_log_is_silent`
@@ -797,7 +906,7 @@ since the whole point is handing an operator a set of logger names they
 could not have worked out themselves.
 
 Everything here except `load` is a pure function over its arguments, the
-same split `logs::resolve_log_target` and `completions::plan` use: the
+same split `logs::resolve_log_sources` and `completions::plan` use: the
 argument handling, the URL rewriting and the body parsing are all testable
 with no network and no environment.
 
@@ -1067,7 +1176,7 @@ only the validator suffix can tell tekops that Docker is involved.
 
 `detect_stack` takes `docker ps` output as a parameter rather than running
 `docker` itself, so the matching rule is testable with no Docker installed -
-the same shape as `logs::resolve_log_target`. It requires exactly one match:
+the same shape as `logs::resolve_log_sources`. It requires exactly one match:
 zero is an error rather than a fallback and two is an error rather than a
 guess, since tailing the wrong node's logs looks exactly like tailing the
 right one until it matters.
@@ -1107,7 +1216,7 @@ are pure and take every input as a parameter, so the whole surface is
 testable with no environment races and no files on disk; `load` is the only
 function here that touches a filesystem.
 
-The file carries exactly the eight settings that already have `$TEKOPS_*`
+The file carries exactly the ten settings that already have `$TEKOPS_*`
 variables, and nothing else. Every key is a variable is a flag, which is
 the one sentence that makes the feature explainable. Per-command defaults
 (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -1118,7 +1227,15 @@ too - `GITHUB_TOKEN`/`GH_TOKEN` are shared conventions with the `gh` CLI
 rather than tekops settings, and `gist.rs` already works to keep that
 credential out of `/proc/<pid>/cmdline` on a machine running a validator.
 
-The count moved from six to eight when the metrics endpoint split in two:
+The log-source split to ten is the instructive contrast: `container` and
+`logs_file` kept their spelling with **no** deprecated alias, because nothing
+about their meaning changed. They named "the log source" and now name "the
+beacon node's log source", which on an all-in-one node is the same container
+and the same file. An alias is owed when a key's meaning changes, not when a
+sibling appears beside it.
+
+The count moved from six to eight when the metrics endpoint split in two, and
+to ten when the log source did the same (`vc_container`, `vc_logs_file`):
 `bn_metric_url` and `vc_metric_url` joined the struct, and the field they
 replaced, `metric_url`, **stayed rather than being removed**. `Config`
 derives `deny_unknown_fields`, so dropping a key outright would reject every
@@ -1227,7 +1344,7 @@ time on purpose - an appended stanza is reached after a framework's own
 runs again after it joins `fpath`.
 
 **`plan` is pure and takes every directory as a parameter** (`Dirs`), the
-same shape and for the same reason as `logs::resolve_log_target`: the whole
+same shape and for the same reason as `logs::resolve_log_sources`: the whole
 path computation is testable against a tempdir with no environment races.
 `cli::run_autocomplete` holds the env reads, the preview and the prompt, and
 `cli::dirs_from_env` is the one place `HOME`/`XDG_*` are read. The rc stanza

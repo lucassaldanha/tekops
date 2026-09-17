@@ -44,6 +44,76 @@ Execution-client logs are not supported; see issue #3 for that decision.
 Under Docker the source is a container rather than a file. See
 [Docker deployments](#docker-deployments).
 
+### Separated deployments: two logs at once
+
+    tekops logs                                    # both processes, merged, if both are found
+    tekops logs --vc                               # just the validator client
+    tekops logs --bn                               # just the beacon node
+    tekops logs --vc-container rocketpool_validator
+    tekops logs --vc-logs-file /var/log/teku/validator.log
+
+A separated deployment runs the beacon node and the validator client as two
+processes with two logs. Rocket Pool's External Consensus Client mode is the
+common case - the validator runs under Docker against a beacon node Rocket
+Pool did not start - but a separated bare-metal node has the same shape with
+two files.
+
+**With both sources known, `logs` shows both, merged into one timeline and
+tagged:**
+
+    [bn] 14:02:11.104 INFO  - Slot event: slot=1234567
+    [vc] 14:02:11.210 INFO  - Attestation published slot=1234567
+    [bn] 14:02:11.402 WARN  - Late block import (312ms)
+    [vc] 14:02:11.887 INFO  - Duties scheduled for epoch 38580
+
+Lines are ordered by their own timestamps, not by when they arrived, so what
+the beacon node was doing at the moment the validator did something reads off
+in sequence. Live output is held for 250ms before being written, which is what
+buys that ordering when one producer delivers in bursts - `docker logs`
+routinely does. **With one source there is no tag and no delay**; the output
+is exactly what it has always been.
+
+`-n` is per source. `-n 500` means the last 500 lines of each, merged.
+
+The validator's source resolves on its own ladder, the same shape as the
+beacon node's: `--vc-container` / `--vc-logs-file`, then
+`$TEKOPS_VC_CONTAINER` / `$TEKOPS_VC_LOGS_FILE`, then `vc_container` /
+`vc_logs_file` in the config file, then `docker ps` detection. The beacon
+node's existing spellings - the positional path, `--container`,
+`$TEKOPS_CONTAINER`, `$TEKOPS_LOGS_FILE`, `container`, `logs_file` - are
+its own.
+
+**Naming one side by flag or environment variable shows only that side.**
+`tekops logs --container rocketpool_validator` prints that one stream, as it
+always has, even on a host where detection also finds a consensus container.
+Naming both shows both.
+
+**The config file does not work that way, and this is a real change.** A
+configured `container` alongside a detected validator container now yields
+*both* streams where it previously yielded one. That is deliberate: a flag or
+a variable is typed for this invocation, whereas the config file is ambient
+and describes the node. It is also what makes the common separated deployment
+work with no flags at all - a bare-metal beacon node with `logs_file`
+configured, beside a Rocket Pool validator container.
+
+`--bn` and `--vc` filter whatever resolved, rather than naming anything. They
+are mutually exclusive, and asking for a process that has no source is an
+error naming that process rather than an empty session.
+
+#### Two limitations worth knowing
+
+**Timezone.** Teku's JSON layout stamps UTC; its console layout, which both
+Docker stacks use, states no zone at all and is taken at face value. If a
+bare-metal beacon node logging JSON sits beside a validator container running
+a non-UTC `TZ`, the merge is wrong by that offset. Containers default to UTC
+and servers usually run UTC, so this is documented rather than corrected.
+
+**Midnight in a backlog.** Teku's console layout has a time-only variant with
+no date. Those lines inherit the date of the last full timestamp from the same
+source, and a backwards jump in time of day is read as a day rollover. A live
+session crosses midnight correctly; a `-n` backlog that spans midnight can
+misorder around the boundary.
+
 ### In the pager
 
 `logs` opens `less` in follow mode, so everything `less` does is available:
@@ -90,6 +160,21 @@ lines with sensitive values anonymised. The source is resolved exactly as for
 [`logs`](#logs) - the same optional path, the same `--container`, the same
 `$TEKOPS_CONTAINER` / `$TEKOPS_LOGS_FILE` / `docker ps` ladder - so anything
 that works there works here.
+
+That includes [separated deployments](#separated-deployments-two-logs-at-once):
+`--vc-container`, `--vc-logs-file`, `--bn` and `--vc` all work the same, and
+with both sources known the dump is one merged, `[bn]`/`[vc]`-tagged stream
+rather than one process's half of it. The header names both sources. `-n` is
+per source here too.
+
+The tag is added *after* anonymising, so the redactor only ever sees the
+node's own bytes and cannot rewrite the column saying which process a line
+came from.
+
+A source that cannot be read does not cost the dump its working half, but it
+does not vanish silently either - the reason is written into the artifact as a
+`*** tekops:` note, because the dump exists to be handed to someone else. Only
+when nothing can be read does the command fail.
 
 Where the output goes:
 
@@ -507,15 +592,21 @@ On a host that runs both a bare-metal node and Docker, `--stack bare-metal`
 (or `TEKOPS_STACK=bare-metal`) turns container detection off entirely and
 restores the plain file-path behaviour, since narrowing to a stack with no
 container suffix can never match anything `docker ps` returns. That switch is
-total: it turns off `doctor`'s validator-container detection too, and `doctor`
-skips the `docker ps` spawn altogether.
+total: it turns off validator-container detection too, and `doctor` skips the
+`docker ps` spawn altogether.
 
-`doctor` looks for a validator container as well - `*-validator-1` on Eth
-Docker, `*_validator` on Rocket Pool - and resolves the two independently, so
-a validator running under Docker against a beacon node that isn't is reported
-as what it is. Naming a stack yourself still outranks both detections and
-applies to both processes. `tekops logs` asks only the consensus question,
-since a log target is one file or one container.
+**A validator container is detected as well** - `*-validator-1` on Eth Docker,
+`*_validator` on Rocket Pool - and the two are resolved independently, so a
+validator running under Docker against a beacon node that isn't is seen as
+what it is. `doctor` reports both; `logs` and `dump-logs` read both, merged
+(see [Separated deployments](#separated-deployments-two-logs-at-once)).
+Naming a stack yourself still outranks both detections and applies to both
+processes.
+
+One `docker ps` answers both questions, and it is skipped only when both slots
+are already answered by a flag, a variable or the config file. A configured
+beacon node alone does not suppress it: the same spawn is what finds the
+validator container beside it.
 
 ### Stack profiles
 
@@ -570,7 +661,7 @@ config file, so it survives a new shell and can be copied to a second node.
 or `$XDG_CONFIG_HOME/tekops/config.toml` when that variable is set. An absent
 file is not an error, and neither is an absent `$HOME`.
 
-`config.example.toml` ships in the release tarball and documents all eight
+`config.example.toml` ships in the release tarball and documents all ten
 keys. Its keys are commented out, so copying it verbatim changes nothing -
 uncomment only the lines you want. Be deliberate about `stack` in particular:
 uncommenting it changes every default port at once.
@@ -582,9 +673,16 @@ uncommenting it changes every default port at once.
 | `bn_metric_url` | `$TEKOPS_BN_METRIC_URL` | Beacon node Prometheus scrape URL       |
 | `vc_metric_url` | `$TEKOPS_VC_METRIC_URL` | Validator client Prometheus scrape URL  |
 | `metric_url`    | `$TEKOPS_METRIC_URL`    | Deprecated alias for `bn_metric_url`    |
-| `container`     | `$TEKOPS_CONTAINER`     | Container to read logs from             |
-| `logs_file`     | `$TEKOPS_LOGS_FILE`     | Log file to tail                        |
+| `container`     | `$TEKOPS_CONTAINER`     | Beacon node's container to read logs from |
+| `logs_file`     | `$TEKOPS_LOGS_FILE`     | Beacon node's log file to tail          |
+| `vc_container`  | `$TEKOPS_VC_CONTAINER`  | Validator client's container            |
+| `vc_logs_file`  | `$TEKOPS_VC_LOGS_FILE`  | Validator client's log file             |
 | `data_dir`      | `$TEKOPS_DATA_DIR`      | Filesystem `doctor` checks for space    |
+
+`container` and `logs_file` keep their spelling and now mean the beacon
+node's - on an all-in-one node that is the same container and the same file,
+so nothing about an existing file changes meaning. Unlike `metric_url`, they
+need no deprecated alias.
 
 ### The metrics endpoints
 

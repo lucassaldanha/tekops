@@ -433,14 +433,21 @@ pub fn run() -> ExitCode {
                 ps.as_deref().and_then(|ps| detect_or_note(ps, given_stack));
             let detected_vc = ps
                 .as_deref()
-                .and_then(|ps| detect_validator_or_note(ps, given_stack))
-                .map(|(_, name)| name);
+                .and_then(|ps| detect_validator_or_note(ps, given_stack));
             // Unlike `logs`, which only ever wants the container name, the
             // header reports which stack this came from. Detection already
             // knows, so a detected stack beats "unknown" - the same
             // flag > env > config > detection ladder the rest of the command
             // uses.
-            let resolved_stack = given_stack.or(detected.as_ref().map(|(s, _)| *s));
+            //
+            // The validator detection answers this too, and has to: on a
+            // Rocket Pool node in External Consensus Client mode there is no
+            // consensus container to find, so reading only `detected` would
+            // stamp "unknown" on a dump from a node whose stack tekops just
+            // identified from its validator container.
+            let resolved_stack = given_stack
+                .or(detected.as_ref().map(|(s, _)| *s))
+                .or(detected_vc.as_ref().map(|(s, _)| *s));
             let select = selector(bn, vc);
             let sources = crate::logs::resolve_log_sources(crate::logs::SourceInputs {
                 path,
@@ -456,7 +463,7 @@ pub fn run() -> ExitCode {
                 vc_container_cfg: cfg.vc_container.clone(),
                 vc_logs_file_cfg: cfg.vc_logs_file.clone(),
                 detected_bn: detected.as_ref().map(|(_, name)| name.clone()),
-                detected_vc,
+                detected_vc: detected_vc.map(|(_, name)| name),
                 select,
             });
             if let Err(e) = check_selection(&sources, select) {
