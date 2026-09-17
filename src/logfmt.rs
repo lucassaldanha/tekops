@@ -18,6 +18,13 @@ fn color_for_level(level: &str) -> &'static str {
 /// path.
 const LEVELS: [&str; 6] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL"];
 
+// The types and functions below (LogTime, Stamp, parse_timestamp, and their
+// helpers) have no caller outside of tests in this commit. They will be wired
+// into merge.rs in a later task; until then, they appear as dead code to
+// rustc. The #[allow(dead_code)] attributes suppress warnings that would
+// otherwise fail the build under -D warnings. They will be removed once
+// merge.rs consumes these items.
+
 /// A log timestamp as milliseconds since the Unix epoch.
 ///
 /// One integer rather than a date type, because the only thing anything does

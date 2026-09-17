@@ -105,6 +105,11 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Lives here rather than in `logfmt.rs`, which is its only caller, so the
 /// pair stays together - splitting them is how one of them gets "fixed"
 /// without the other.
+///
+/// Currently only called from logfmt tests; will be wired into merge.rs in a
+/// later task. The #[allow(dead_code)] suppresses warnings that would
+/// otherwise fail the build under -D warnings and will be removed once
+/// merge.rs consumes it.
 #[allow(dead_code)]
 pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
