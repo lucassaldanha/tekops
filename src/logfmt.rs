@@ -1,4 +1,6 @@
 use crate::term::sanitize;
+use jiff::tz::TimeZone;
+use jiff::Timestamp;
 use serde_json::Value;
 
 fn color_for_level(level: &str) -> &'static str {
@@ -113,6 +115,89 @@ pub fn parse_timestamp(s: &str) -> Option<Stamp> {
         )));
     }
     time_of_day_ms(s).map(Stamp::TimeOfDay)
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// The zone `tekops logs --tz` renders timestamps in.
+///
+/// Every stamp is read as UTC. That is the premise of the flag: tekops
+/// recommends logging UTC, and `--tz` is how an operator reads such a log in
+/// their own time. A node already logging local time would be shifted twice,
+/// and nothing in the line can tell tekops that it was.
+///
+/// `today` is the zone's offset at session start, in milliseconds, and is only
+/// for the time-only console layout: with no date there is no instant to look
+/// an offset up by, so a session that crosses a DST change keeps rendering
+/// those lines at the offset it started with.
+pub struct DisplayZone {
+    tz: TimeZone,
+    today: i64,
+}
+
+impl DisplayZone {
+    pub fn new(tz: TimeZone, now: Timestamp) -> Self {
+        let today = i64::from(tz.to_offset(now).seconds()) * 1_000;
+        Self { tz, today }
+    }
+}
+
+/// `s` rewritten into `zone`, in the same shape it arrived in, with the offset
+/// appended (replacing a `Z` if it had one).
+///
+/// Same shape means the same date/time separator, the same millisecond
+/// separator and the same number of millisecond digits, so a converted line
+/// reads like the node wrote it. The offset is what keeps it honest: an
+/// unsuffixed local time would sit in the pager looking exactly like the UTC
+/// stamps the node writes.
+///
+/// `None` for anything `parse_timestamp` does not accept, which the caller
+/// leaves untouched rather than guessing at.
+fn restamp(s: &str, zone: &DisplayZone) -> Option<String> {
+    let body = s.strip_suffix('Z').unwrap_or(s);
+    let (date_sep, time) = match body.split_once(['T', ' ']) {
+        Some((date, time)) => (Some(&body[date.len()..=date.len()]), time),
+        None => (None, body),
+    };
+    let millis = time
+        .split_once(['.', ','])
+        .map(|(hms, ms)| (&time[hms.len()..=hms.len()], ms.len()));
+
+    let (days, ms_of_day, offset) = match parse_timestamp(s)? {
+        Stamp::Absolute(LogTime(ms)) => {
+            let at = Timestamp::from_millisecond(ms).ok()?;
+            let offset = i64::from(zone.tz.to_offset(at).seconds()) * 1_000;
+            let local = ms + offset;
+            (
+                Some(local.div_euclid(DAY_MS)),
+                local.rem_euclid(DAY_MS),
+                offset,
+            )
+        }
+        Stamp::TimeOfDay(ms) => (None, (ms + zone.today).rem_euclid(DAY_MS), zone.today),
+    };
+
+    let mut out = String::new();
+    if let (Some(days), Some(sep)) = (days, date_sep) {
+        let (y, m, d) = crate::dump::civil_from_days(days);
+        out.push_str(&format!("{y:04}-{m:02}-{d:02}{sep}"));
+    }
+    let secs = ms_of_day / 1_000;
+    out.push_str(&format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60
+    ));
+    if let Some((sep, width)) = millis {
+        let ms = format!("{:03}", ms_of_day % 1_000);
+        out.push_str(sep);
+        out.push_str(&ms[..width]);
+    }
+    let sign = if offset < 0 { '-' } else { '+' };
+    let off_min = offset.abs() / 60_000;
+    out.push_str(&format!("{sign}{:02}:{:02}", off_min / 60, off_min % 60));
+    Some(out)
 }
 
 /// One log record's fields, however they were parsed.
@@ -257,14 +342,22 @@ fn render(f: &Fields) -> String {
 /// checks so it cannot claim arbitrary text, and anything neither parser
 /// accepts is still untrusted bytes headed for a terminal, so it gets the same
 /// sanitizing.
-pub fn format_log_line(raw: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        return render(&parse_json(&value));
+///
+/// With a `zone`, a parsed record's timestamp is rewritten into it (see
+/// `restamp`). A passthrough line is never touched: it has no timestamp field,
+/// and rewriting digits inside free text would be a guess.
+pub fn format_log_line(raw: &str, zone: Option<&DisplayZone>) -> String {
+    let mut fields = if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        parse_json(&value)
+    } else if let Some(fields) = parse_console(raw) {
+        fields
+    } else {
+        return sanitize(raw);
+    };
+    if let Some(stamp) = zone.and_then(|z| restamp(&fields.timestamp, z)) {
+        fields.timestamp = stamp;
     }
-    if let Some(fields) = parse_console(raw) {
-        return render(&fields);
-    }
-    sanitize(raw)
+    render(&fields)
 }
 
 #[cfg(test)]
@@ -278,7 +371,7 @@ mod tests {
     #[test]
     fn the_real_bare_metal_json_line_keeps_its_timestamp() {
         let raw = r#"{"timestamp":"2026-09-17T19:17:51,172","host":"validator","level":"INFO","thread":"TimeTickTask","class":"teku-event-log","message":"Slot Event  *** Slot: 15233787","throwable":""}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("2026-09-17T19:17:51,172"), "{out}");
         assert!(out.contains("Slot Event"), "{out}");
         assert!(!out.contains("  INFO"), "no empty timestamp column: {out}");
@@ -312,7 +405,7 @@ mod tests {
     #[test]
     fn formats_info_line_green() {
         let raw = r#"{"@timestamp":"2026-09-01T10:00:00.000Z","level":"INFO","thread":"main","class":"Node","message":"Started"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(
             out.starts_with("\u{1b}[32m"),
             "expected green color code, got: {out}"
@@ -324,7 +417,7 @@ mod tests {
     #[test]
     fn formats_error_line_red_with_throwable() {
         let raw = r#"{"@timestamp":"t","level":"ERROR","thread":"t1","class":"C","message":"boom","throwable":"java.lang.RuntimeException: boom\n\tat C.run"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.starts_with("\u{1b}[31m"));
         assert!(out.contains("t ERROR [t1] C - boom\njava.lang.RuntimeException: boom"));
     }
@@ -332,30 +425,30 @@ mod tests {
     #[test]
     fn formats_warn_yellow_and_debug_cyan() {
         let warn = r#"{"@timestamp":"t","level":"WARN","thread":"t1","class":"C","message":"m"}"#;
-        assert!(format_log_line(warn).starts_with("\u{1b}[33m"));
+        assert!(format_log_line(warn, None).starts_with("\u{1b}[33m"));
 
         let debug = r#"{"@timestamp":"t","level":"DEBUG","thread":"t1","class":"C","message":"m"}"#;
-        assert!(format_log_line(debug).starts_with("\u{1b}[36m"));
+        assert!(format_log_line(debug, None).starts_with("\u{1b}[36m"));
     }
 
     #[test]
     fn unknown_level_has_no_color_code() {
         let raw = r#"{"@timestamp":"t","level":"TRACE","thread":"t1","class":"C","message":"m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.starts_with("\u{1b}[0m"));
     }
 
     #[test]
     fn missing_throwable_has_no_extra_line() {
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"t1","class":"C","message":"m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert_eq!(out.matches('\n').count(), 0);
     }
 
     #[test]
     fn malformed_json_passes_through_unchanged() {
         let raw = "not json at all";
-        assert_eq!(format_log_line(raw), "not json at all");
+        assert_eq!(format_log_line(raw, None), "not json at all");
     }
 
     #[test]
@@ -366,7 +459,7 @@ mod tests {
         // string are invalid, and would silently divert this to the
         // malformed-line path instead of the parsed-field path under test.
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"main","class":"P2P","message":"peer: \u001b[2J\u001b]0;PWNED\u0007\u001b[31mFAKE ERROR\u001b[0m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
 
         // Exactly two escapes survive: the ones tekops itself wraps the line in.
         assert_eq!(
@@ -385,7 +478,7 @@ mod tests {
 
     #[test]
     fn strips_terminal_escapes_from_malformed_lines_too() {
-        let out = format_log_line("garbage \u{1b}[2J more");
+        let out = format_log_line("garbage \u{1b}[2J more", None);
         assert!(
             !out.contains('\u{1b}'),
             "escape leaked via the passthrough path: {out:?}"
@@ -395,7 +488,7 @@ mod tests {
     #[test]
     fn keeps_newlines_in_java_stack_traces() {
         let raw = r#"{"@timestamp":"t","level":"ERROR","thread":"t1","class":"C","message":"boom","throwable":"java.lang.RuntimeException\n\tat C.run"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("java.lang.RuntimeException\n\tat C.run"));
     }
 
@@ -403,7 +496,7 @@ mod tests {
     #[test]
     fn formats_teku_console_lines_with_the_same_colors_as_json() {
         let raw = "2026-09-14 01:16:54.217 INFO  - Teku version: teku/v26.7.1";
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(
             out.starts_with("\u{1b}[32m"),
             "expected green, got: {out:?}"
@@ -420,12 +513,12 @@ mod tests {
     #[test]
     fn console_handles_both_padded_and_unpadded_levels() {
         let unpadded = "2026-09-14 01:17:07.062 ERROR - Failed to update fork choice";
-        let out = format_log_line(unpadded);
+        let out = format_log_line(unpadded, None);
         assert!(out.starts_with("\u{1b}[31m"), "got: {out:?}");
         assert!(out.contains("01:17:07.062 ERROR - Failed to update fork choice"));
 
         let padded = "2026-09-14 01:17:12.652 WARN  - Syncing started";
-        assert!(format_log_line(padded).starts_with("\u{1b}[33m"));
+        assert!(format_log_line(padded, None).starts_with("\u{1b}[33m"));
     }
 
     /// The no-date variant of the console format, for a node started with
@@ -433,7 +526,7 @@ mod tests {
     #[test]
     fn console_parses_the_time_only_timestamp_variant() {
         let raw = "01:16:54.217 INFO  - Started";
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.starts_with("\u{1b}[32m"), "got: {out:?}");
         assert!(out.contains("01:16:54.217 INFO - Started"));
     }
@@ -444,7 +537,7 @@ mod tests {
     fn console_message_containing_a_pipe_is_not_mangled() {
         let raw =
             "2026-09-14 01:16:54.282 INFO  - Configuration | Network: hoodi, Storage Mode: MINIMAL";
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(
             out.contains("INFO - Configuration | Network: hoodi, Storage Mode: MINIMAL"),
             "got: {out:?}"
@@ -456,7 +549,7 @@ mod tests {
     #[test]
     fn console_message_may_contain_the_separator() {
         let raw = "2026-09-14 01:16:54.217 INFO  - peer said a - b - c";
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("INFO - peer said a - b - c"), "got: {out:?}");
     }
 
@@ -465,14 +558,17 @@ mod tests {
     #[test]
     fn prose_that_merely_contains_a_level_word_is_not_a_log_record() {
         assert_eq!(
-            format_log_line("some text INFO - hello"),
+            format_log_line("some text INFO - hello", None),
             "some text INFO - hello"
         );
     }
 
     #[test]
     fn a_line_with_no_separator_falls_through_to_passthrough() {
-        assert_eq!(format_log_line("just some output"), "just some output");
+        assert_eq!(
+            format_log_line("just some output", None),
+            "just some output"
+        );
     }
 
     /// Java stack traces arrive as continuation lines. They stay readable via
@@ -481,7 +577,7 @@ mod tests {
     fn console_stack_trace_continuation_lines_pass_through() {
         let raw = "\tat tech.pegasys.teku.Foo.run(Foo.java:42)";
         assert_eq!(
-            format_log_line(raw),
+            format_log_line(raw, None),
             "\tat tech.pegasys.teku.Foo.run(Foo.java:42)"
         );
     }
@@ -492,7 +588,7 @@ mod tests {
     #[test]
     fn strips_terminal_escapes_from_console_messages() {
         let raw = "2026-09-14 01:16:54.217 INFO  - peer: \u{1b}[2J\u{1b}]0;PWNED\u{7}\u{1b}[31mFAKE\u{1b}[0m";
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert_eq!(
             out.matches('\u{1b}').count(),
             2,
@@ -507,7 +603,7 @@ mod tests {
     #[test]
     fn json_rendering_is_unchanged_by_the_shared_renderer() {
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"main","class":"Node","message":"Started"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("t INFO [main] Node - Started"), "got: {out:?}");
     }
 
@@ -516,7 +612,7 @@ mod tests {
     #[test]
     fn json_still_wins_over_console_parsing() {
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"a - b","class":"C","message":"m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("[a - b] C - m"), "got: {out:?}");
     }
 
@@ -526,7 +622,7 @@ mod tests {
     #[test]
     fn json_with_an_empty_thread_still_renders_empty_brackets() {
         let raw = r#"{"@timestamp":"t","level":"INFO","thread":"","class":"C","message":"m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
     }
 
@@ -534,7 +630,7 @@ mod tests {
     #[test]
     fn json_with_no_thread_key_still_renders_empty_brackets() {
         let raw = r#"{"@timestamp":"t","level":"INFO","class":"C","message":"m"}"#;
-        let out = format_log_line(raw);
+        let out = format_log_line(raw, None);
         assert!(out.contains("t INFO [] C - m"), "got: {out:?}");
     }
 
@@ -594,6 +690,126 @@ mod tests {
             parse_timestamp("01:16:54"),
             Some(Stamp::TimeOfDay(3_600_000 + 16 * 60_000 + 54_000))
         );
+    }
+
+    fn fixed(hours: i8, minutes: i8) -> DisplayZone {
+        let secs = i32::from(hours) * 3_600 + i32::from(minutes) * 60;
+        let tz = TimeZone::fixed(jiff::tz::Offset::from_seconds(secs).expect("offset"));
+        DisplayZone::new(tz, Timestamp::UNIX_EPOCH)
+    }
+
+    fn stamp_of(raw: &str, zone: &DisplayZone) -> String {
+        let out = format_log_line(raw, Some(zone));
+        out.trim_start_matches(|c| c != 'm')[1..]
+            .split(' ')
+            .next()
+            .expect("a timestamp")
+            .to_string()
+    }
+
+    /// The real bare-metal line again: comma millis, no zone, read as UTC.
+    #[test]
+    fn tz_rewrites_the_bare_metal_json_stamp_in_its_own_shape() {
+        let raw = r#"{"timestamp":"2026-09-17T19:17:51,172","level":"INFO","thread":"T","class":"C","message":"m"}"#;
+        assert_eq!(
+            stamp_of(raw, &fixed(12, 0)),
+            "2026-09-18T07:17:51,172+12:00"
+        );
+    }
+
+    /// The `Z` states UTC, which the offset now states instead.
+    #[test]
+    fn tz_replaces_a_z_suffix_with_the_offset() {
+        let raw = r#"{"@timestamp":"2026-09-01T10:00:00.000Z","level":"INFO","thread":"T","class":"C","message":"m"}"#;
+        assert_eq!(
+            stamp_of(raw, &fixed(12, 0)),
+            "2026-09-01T22:00:00.000+12:00"
+        );
+    }
+
+    #[test]
+    fn tz_moves_the_date_back_across_midnight_west_of_utc() {
+        let raw = "2026-09-14 01:16:54.217 INFO  - Started";
+        let out = format_log_line(raw, Some(&fixed(-5, 0)));
+        assert!(
+            out.contains("2026-09-13 20:16:54.217-05:00 INFO - Started"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn tz_handles_half_hour_offsets_on_both_sides() {
+        let raw = "2026-09-14 01:16:54.217 INFO  - m";
+        let out = format_log_line(raw, Some(&fixed(5, 30)));
+        assert!(
+            out.contains("2026-09-14 06:46:54.217+05:30 INFO"),
+            "{out:?}"
+        );
+        let out = format_log_line(raw, Some(&fixed(-3, -30)));
+        assert!(
+            out.contains("2026-09-13 21:46:54.217-03:30 INFO"),
+            "{out:?}"
+        );
+    }
+
+    /// No date means no instant to look an offset up by, so the session's
+    /// offset is used and the time wraps around the clock.
+    #[test]
+    fn tz_shifts_a_time_only_stamp_by_the_session_offset() {
+        let raw = "13:16:54.217 INFO  - m";
+        let out = format_log_line(raw, Some(&fixed(12, 0)));
+        assert!(out.contains("01:16:54.217+12:00 INFO - m"), "{out:?}");
+    }
+
+    /// The offset is looked up per line, so one session renders both sides of
+    /// a DST change correctly.
+    #[test]
+    fn tz_applies_each_instants_own_dst_offset() {
+        let tz = TimeZone::posix("NZST-12NZDT,M9.5.0,M4.1.0/3").expect("posix tz");
+        let zone = DisplayZone::new(tz, Timestamp::UNIX_EPOCH);
+        let winter = "2026-07-01 00:00:00.000 INFO  - m";
+        let summer = "2026-12-01 00:00:00.000 INFO  - m";
+        assert!(format_log_line(winter, Some(&zone)).contains("2026-07-01 12:00:00.000+12:00"));
+        assert!(format_log_line(summer, Some(&zone)).contains("2026-12-01 13:00:00.000+13:00"));
+    }
+
+    /// The time-only layout takes the offset in force when the session began.
+    #[test]
+    fn tz_time_only_offset_comes_from_session_start() {
+        let tz = TimeZone::posix("NZST-12NZDT,M9.5.0,M4.1.0/3").expect("posix tz");
+        let december = Timestamp::from_second(1_796_083_200).expect("2026-12-01");
+        let zone = DisplayZone::new(tz, december);
+        let out = format_log_line("00:00:00 INFO  - m", Some(&zone));
+        assert!(out.contains("13:00:00+13:00 INFO"), "{out:?}");
+    }
+
+    /// Absent milliseconds stay absent and a short fraction keeps its width.
+    #[test]
+    fn tz_keeps_the_millisecond_width_it_was_given() {
+        let zone = fixed(1, 0);
+        assert!(
+            format_log_line("2026-09-14 01:16:54 INFO  - m", Some(&zone))
+                .contains("2026-09-14 02:16:54+01:00 INFO")
+        );
+        assert!(
+            format_log_line("2026-09-14 01:16:54.21 INFO  - m", Some(&zone))
+                .contains("2026-09-14 02:16:54.21+01:00 INFO")
+        );
+    }
+
+    /// A timestamp field tekops cannot read is shown as it came, not dropped.
+    #[test]
+    fn tz_leaves_an_unparseable_stamp_alone() {
+        let raw = r#"{"@timestamp":"t","level":"INFO","thread":"main","class":"Node","message":"Started"}"#;
+        let out = format_log_line(raw, Some(&fixed(12, 0)));
+        assert!(out.contains("t INFO [main] Node - Started"), "{out:?}");
+    }
+
+    /// Free text is never rewritten, even when it starts with a time.
+    #[test]
+    fn tz_does_not_touch_passthrough_lines() {
+        let raw = "01:16:54 something that is not a record";
+        assert_eq!(format_log_line(raw, Some(&fixed(12, 0))), raw);
     }
 
     /// `days_from_civil` is the inverse of the `civil_from_days` already in

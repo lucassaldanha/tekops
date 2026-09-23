@@ -9,6 +9,13 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 comfy-table = "7"
 ctrlc = { version = "3", features = ["termination"] }
+# Pure Rust, no C. Only for `logs --tz`: an offset per instant needs the
+# zone's DST history, and hand-parsing TZif files is not worth owning.
+# default-features = false drops the bundled tzdb (Windows/wasm only) and the
+# Android concatenated format; what remains reads the host's
+# /usr/share/zoneinfo at runtime, so the binary carries no zone data.
+# Measured marginal cost: 292,000 bytes (release, aarch64-apple-darwin).
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tz-fat", "tzdb-zoneinfo"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pure Rust, no C and no transitive C, so it does not reintroduce what

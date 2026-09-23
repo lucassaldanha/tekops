@@ -64,3 +64,9 @@
 # container's own mounts answer this, so set it only to override them.
 # ($TEKOPS_DATA_DIR)
 #data_dir = "/var/lib/teku"
+
+# Zone `tekops logs` shows timestamps in: "local" for this host's, or an IANA
+# name. Assumes the node logs UTC, and appends the offset to every converted
+# stamp. `dump-logs` is unaffected and stays in the node's own time.
+# ($TEKOPS_TZ)
+#tz = "local"

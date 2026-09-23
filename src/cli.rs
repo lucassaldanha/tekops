@@ -154,6 +154,9 @@ enum Commands {
         /// Deployment to narrow container detection to (or $TEKOPS_STACK)
         #[arg(long)]
         stack: Option<Stack>,
+        /// Show timestamps in this zone, read as UTC: `local` or an IANA name (or $TEKOPS_TZ)
+        #[arg(long, value_name = "ZONE")]
+        tz: Option<String>,
     },
     /// Write the last N log lines to a shareable file or gist, anonymised
     DumpLogs {
@@ -330,7 +333,20 @@ pub fn run() -> ExitCode {
             bn,
             vc,
             stack,
+            tz,
         } => {
+            // Before detection, so a mistyped zone fails without spawning
+            // `docker ps` first.
+            let zone = match resolve_tz(tz, env::var("TEKOPS_TZ").ok(), cfg.tz.clone()) {
+                None => None,
+                Some((name, from)) => match crate::config::zone_named(&name) {
+                    Ok(tz) => Some(crate::logfmt::DisplayZone::new(tz, jiff::Timestamp::now())),
+                    Err(e) => {
+                        eprintln!("error: {from}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
             // Detection only runs when nothing else has answered - see
             // `needs_detection`.
             let container_env = env::var("TEKOPS_CONTAINER").ok();
@@ -387,7 +403,7 @@ pub fn run() -> ExitCode {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
-            run_logs(sources, lines)
+            run_logs(sources, lines, zone)
         }
         Commands::DumpLogs {
             path,
@@ -849,6 +865,25 @@ fn run_doctor(
 fn resolve_stack(flag: Option<Stack>, env: Option<String>, cfg: Option<Stack>) -> Option<Stack> {
     flag.or_else(|| env.and_then(|v| Stack::from_str(&v, true).ok()))
         .or(cfg)
+}
+
+/// The zone `logs` renders in, if any, and where it was named: flag, then
+/// `$TEKOPS_TZ`, then config.
+///
+/// Unlike `$TEKOPS_STACK`, a bad `$TEKOPS_TZ` is fatal rather than ignored.
+/// The stack rule exists because a bad variable would break every command;
+/// this one is read by `logs` alone, and silently showing UTC to an operator
+/// who asked for local time is the confusing outcome. The origin is returned
+/// so that error can say which of the three to fix. An empty variable is
+/// unset, the way a script "unsets" one by exporting it empty.
+fn resolve_tz(
+    flag: Option<String>,
+    env: Option<String>,
+    cfg: Option<String>,
+) -> Option<(String, &'static str)> {
+    flag.map(|v| (v, "--tz"))
+        .or_else(|| env.filter(|v| !v.is_empty()).map(|v| (v, "$TEKOPS_TZ")))
+        .or_else(|| cfg.map(|v| (v, "config tz")))
 }
 
 /// The Beacon API base URL: flag, then `$TEKOPS_API_URL`, then config, then
@@ -2307,6 +2342,34 @@ mod tests {
     #[test]
     fn update_rejects_a_second_positional() {
         assert!(Cli::try_parse_from(["tekops", "update", "check", "0.3.0"]).is_err());
+    }
+
+    #[test]
+    fn tz_precedence_is_flag_then_env_then_config() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            resolve_tz(s("UTC"), s("local"), s("Europe/London")),
+            Some(("UTC".into(), "--tz"))
+        );
+        assert_eq!(
+            resolve_tz(None, s("local"), s("Europe/London")),
+            Some(("local".into(), "$TEKOPS_TZ"))
+        );
+        assert_eq!(
+            resolve_tz(None, s(""), s("Europe/London")),
+            Some(("Europe/London".into(), "config tz"))
+        );
+        assert_eq!(resolve_tz(None, None, None), None);
+    }
+
+    #[test]
+    fn logs_accepts_a_tz() {
+        assert!(Cli::try_parse_from(["tekops", "logs", "--tz", "local"]).is_ok());
+    }
+
+    #[test]
+    fn dump_logs_has_no_tz() {
+        assert!(Cli::try_parse_from(["tekops", "dump-logs", "--tz", "local"]).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::logfmt::format_log_line;
+use crate::logfmt::{format_log_line, DisplayZone};
 use crate::merge::{Merger, Record, Source, MERGE_WINDOW};
 use crate::term::sanitize;
 use std::io::{self, BufRead, BufReader, LineWriter, Write};
@@ -45,11 +45,12 @@ fn emit_records<W: Write>(
     sources: &[Source],
     written: &mut u64,
     max_bytes: u64,
+    zone: Option<&DisplayZone>,
 ) -> io::Result<bool> {
     let tagged = sources.len() > 1;
     for record in records {
         for line in &record.lines {
-            let formatted = format_log_line(line);
+            let formatted = format_log_line(line, zone);
             let text = if tagged {
                 format!("[{}] {formatted}", record.source.tag())
             } else {
@@ -98,6 +99,7 @@ fn emit_loop(
     stop: Arc<AtomicBool>,
     mut writer: impl Write,
     sources: Vec<Source>,
+    zone: Option<DisplayZone>,
 ) -> io::Result<()> {
     let mut written: u64 = 0;
 
@@ -128,7 +130,14 @@ fn emit_loop(
         if let Some(note) = skew {
             writeln!(writer, "*** tekops: {}", sanitize(&note))?;
         }
-        if emit_records(&mut writer, ready, &sources, &mut written, MAX_BUFFER_BYTES)? {
+        if emit_records(
+            &mut writer,
+            ready,
+            &sources,
+            &mut written,
+            MAX_BUFFER_BYTES,
+            zone.as_ref(),
+        )? {
             return Ok(());
         }
         if done || stopping {
@@ -497,7 +506,7 @@ fn empty_file_note(path: &Path, source: Source) -> Option<String> {
 /// and a single emitter thread writing the merged result into the file `less`
 /// reads. The merge rule itself lives in `merge.rs` and is pure; everything
 /// here is the IO around it.
-pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
+pub fn run_logs(sources: LogSources, lines: u32, zone: Option<DisplayZone>) -> ExitCode {
     let active = sources.active();
     if active.is_empty() {
         eprintln!("error: no log source to read");
@@ -717,7 +726,7 @@ pub fn run_logs(sources: LogSources, lines: u32) -> ExitCode {
         let merger = Arc::clone(&merger);
         let stop = Arc::clone(&stop);
         let sources = started.clone();
-        thread::spawn(move || emit_loop(merger, stop, LineWriter::new(writer), sources))
+        thread::spawn(move || emit_loop(merger, stop, LineWriter::new(writer), sources, zone))
     });
 
     match supervise_pager(pager, children, workers, stop) {
@@ -812,7 +821,15 @@ mod tests {
     fn emit(records: Vec<Record>, sources: &[Source]) -> String {
         let mut out = Vec::new();
         let mut written = 0u64;
-        emit_records(&mut out, records, sources, &mut written, MAX_BUFFER_BYTES).unwrap();
+        emit_records(
+            &mut out,
+            records,
+            sources,
+            &mut written,
+            MAX_BUFFER_BYTES,
+            None,
+        )
+        .unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -891,7 +908,15 @@ mod tests {
     fn stops_emitting_once_the_buffer_cap_is_reached() {
         let mut out = Vec::new();
         let mut written = 0u64;
-        let hit = emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, 200).unwrap();
+        let hit = emit_records(
+            &mut out,
+            bn_lines(500),
+            &[Source::Bn],
+            &mut written,
+            200,
+            None,
+        )
+        .unwrap();
 
         assert!(hit, "should report the cap was reached");
         let out = String::from_utf8(out).unwrap();
@@ -915,7 +940,15 @@ mod tests {
         let mut out = Vec::new();
         let mut written = 0u64;
         let cap = 1024;
-        emit_records(&mut out, bn_lines(500), &[Source::Bn], &mut written, cap).unwrap();
+        emit_records(
+            &mut out,
+            bn_lines(500),
+            &[Source::Bn],
+            &mut written,
+            cap,
+            None,
+        )
+        .unwrap();
 
         // The log content itself stays under the cap; only the fixed-size
         // notice is allowed past it, so the bound stays meaningful.
@@ -946,7 +979,15 @@ mod tests {
     fn hitting_the_cap_is_not_an_error() {
         let mut out = Vec::new();
         let mut written = 0u64;
-        assert!(emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, 50).is_ok());
+        assert!(emit_records(
+            &mut out,
+            bn_lines(100),
+            &[Source::Bn],
+            &mut written,
+            50,
+            None
+        )
+        .is_ok());
     }
 
     /// The cap bounds the whole session, not one batch, which is the property
@@ -957,12 +998,27 @@ mod tests {
         let mut written = 0u64;
         let cap = 400;
 
-        let first = emit_records(&mut out, bn_lines(4), &[Source::Bn], &mut written, cap).unwrap();
+        let first = emit_records(
+            &mut out,
+            bn_lines(4),
+            &[Source::Bn],
+            &mut written,
+            cap,
+            None,
+        )
+        .unwrap();
         assert!(!first, "four short lines should fit under {cap}");
         assert!(written > 0, "the running total must carry forward");
 
-        let second =
-            emit_records(&mut out, bn_lines(100), &[Source::Bn], &mut written, cap).unwrap();
+        let second = emit_records(
+            &mut out,
+            bn_lines(100),
+            &[Source::Bn],
+            &mut written,
+            cap,
+            None,
+        )
+        .unwrap();
         assert!(second, "the second batch should cross the same cap");
     }
 
@@ -1112,7 +1168,7 @@ mod tests {
         let emitter = {
             let merger = Arc::clone(&merger);
             let stop = Arc::clone(&stop);
-            thread::spawn(move || emit_loop(merger, stop, writer, started))
+            thread::spawn(move || emit_loop(merger, stop, writer, started, None))
         };
 
         supervise_pager(pager, vec![producer], vec![reader, emitter], stop).unwrap();
@@ -1140,7 +1196,7 @@ mod tests {
             let emitter = {
                 let merger = Arc::clone(&merger);
                 let stop = Arc::clone(&stop);
-                thread::spawn(move || emit_loop(merger, stop, io::sink(), vec![Source::Bn]))
+                thread::spawn(move || emit_loop(merger, stop, io::sink(), vec![Source::Bn], None))
             };
             let pager = Command::new("sleep")
                 .arg("0.2")
@@ -1164,7 +1220,7 @@ mod tests {
             bn: Some(LogTarget::File(missing)),
             vc: None,
         };
-        let code = run_logs(sources, 500);
+        let code = run_logs(sources, 500, None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
@@ -1210,7 +1266,7 @@ mod tests {
     #[test]
     fn run_logs_fails_when_no_source_resolved() {
         let sources = LogSources { bn: None, vc: None };
-        let code = run_logs(sources, 500);
+        let code = run_logs(sources, 500, None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 

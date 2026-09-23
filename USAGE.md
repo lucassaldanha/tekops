@@ -44,6 +44,40 @@ Execution-client logs are not supported; see issue #3 for that decision.
 Under Docker the source is a container rather than a file. See
 [Docker deployments](#docker-deployments).
 
+### Reading a UTC log in your own time
+
+    tekops logs --tz local               # this host's timezone
+    tekops logs --tz Pacific/Auckland    # any IANA zone name
+
+Logging UTC is the recommendation (see
+[Timezones](#timezones-the-two-processes-must-agree-on-a-clock)), but a UTC
+stamp is awkward to read when you are asking "what happened ten minutes
+ago". `--tz` rewrites each line's timestamp into the zone you name, keeping
+the line's own layout and appending the offset so a converted time can never
+be mistaken for one the node wrote:
+
+    2026-09-17T19:17:51,172 INFO ...            # as written
+    2026-09-18T07:17:51,172+12:00 INFO ...      # with --tz Pacific/Auckland
+
+- **Timestamps are read as UTC.** That is what the flag is for. A node that
+  already logs local time gets shifted a second time, and nothing in the line
+  tells tekops otherwise.
+- **The offset is looked up per line**, so a session spanning a DST change
+  shows each side at its own offset. The exception is Teku's time-only console
+  layout, which carries no date: those lines use the offset in force when the
+  session started.
+- Lines without a recognisable timestamp - stack-trace continuations, anything
+  shown as-is - are left untouched.
+- `--tz UTC` is accepted and renders `+00:00`, which is a way to confirm the
+  node really is logging UTC.
+- `--tz` can also come from `$TEKOPS_TZ` or `tz` in the config file. An unknown
+  name is an error naming where it came from, including from the variable:
+  silently falling back to UTC when you asked for local time would be the
+  confusing outcome.
+
+**`dump-logs` does not take `--tz`.** A dump is something you share, and it
+stays in the node's own time.
+
 ### Separated deployments: two logs at once
 
     tekops logs                                    # both processes, merged, if both are found
@@ -707,7 +741,7 @@ config file, so it survives a new shell and can be copied to a second node.
 or `$XDG_CONFIG_HOME/tekops/config.toml` when that variable is set. An absent
 file is not an error, and neither is an absent `$HOME`.
 
-`config.example.toml` ships in the release tarball and documents all ten
+`config.example.toml` ships in the release tarball and documents all eleven
 keys. Its keys are commented out, so copying it verbatim changes nothing -
 uncomment only the lines you want. Be deliberate about `stack` in particular:
 uncommenting it changes every default port at once.
@@ -724,6 +758,7 @@ uncommenting it changes every default port at once.
 | `vc_container`  | `$TEKOPS_VC_CONTAINER`  | Validator client's container            |
 | `vc_logs_file`  | `$TEKOPS_VC_LOGS_FILE`  | Validator client's log file             |
 | `data_dir`      | `$TEKOPS_DATA_DIR`      | Filesystem `doctor` checks for space    |
+| `tz`            | `$TEKOPS_TZ`           | Zone `logs` shows timestamps in         |
 
 `container` and `logs_file` keep their spelling and now mean the beacon
 node's - on an all-in-one node that is the same container and the same file,

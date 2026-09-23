@@ -5,7 +5,7 @@
 //! testable with no environment races and no files on disk; `load` is the only
 //! function here that touches a filesystem.
 //!
-//! The file carries exactly the ten settings that already have `$TEKOPS_*`
+//! The file carries exactly the eleven settings that already have `$TEKOPS_*`
 //! variables, and nothing else. Every key is a variable is a flag, which is
 //! the one sentence that makes the feature explainable. Per-command defaults
 //! (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -70,6 +70,12 @@ pub struct Config {
     pub vc_container: Option<String>,
     pub vc_logs_file: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
+    /// The zone `tekops logs` renders timestamps in: `local` or an IANA name.
+    ///
+    /// A `String` rather than a resolved zone because resolving one reads the
+    /// host's tzdb, and `parse` is pure. `load` does the check instead, so a
+    /// bad name still fails every command the way a bad `stack` does.
+    pub tz: Option<String>,
 }
 
 /// Why a config file could not be turned into a `Config`.
@@ -128,6 +134,26 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
     })
 }
 
+/// The zone a `tz` value names: `local` for this host's, otherwise an IANA
+/// name looked up in the host's tzdb.
+///
+/// Lives here because the config file is where a bad name has to fail at load
+/// time; `--tz` and `$TEKOPS_TZ` go through the same function, so the three
+/// spellings accept exactly the same names - the same reasoning `stack` gets
+/// from sharing `Stack`. The error is sanitized because it quotes a name this
+/// binary did not author.
+pub fn zone_named(name: &str) -> Result<jiff::tz::TimeZone, String> {
+    let zone = if name == "local" {
+        jiff::tz::TimeZone::try_system()
+            .map_err(|e| format!("could not determine this host's timezone: {e}"))
+    } else {
+        jiff::tz::TimeZone::get(name).map_err(|_| {
+            format!("unknown timezone {name:?} - expected `local` or an IANA name like Pacific/Auckland")
+        })
+    };
+    zone.map_err(|e| sanitize(&e))
+}
+
 /// Reads and parses the config file, if there is one.
 ///
 /// An absent file is an empty config. Anything else that stops the read is an
@@ -139,7 +165,16 @@ pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
         return Ok(Config::default());
     };
     match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text, path),
+        Ok(text) => {
+            let cfg = parse(&text, path)?;
+            if let Some(name) = &cfg.tz {
+                zone_named(name).map_err(|message| ConfigError::Malformed {
+                    path: path.to_path_buf(),
+                    message: format!("tz: {message}"),
+                })?;
+            }
+            Ok(cfg)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(ConfigError::Unreadable {
             path: path.to_path_buf(),
@@ -352,6 +387,35 @@ data_dir = "/var/lib/teku"
         assert_eq!(load(Some(&p)).unwrap().stack, Some(Stack::RocketPool));
     }
 
+    #[test]
+    fn a_known_tz_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "tz = \"UTC\"\n").unwrap();
+        assert_eq!(load(Some(&p)).unwrap().tz.as_deref(), Some("UTC"));
+    }
+
+    /// `parse` cannot check a zone name without reading the tzdb, so `load`
+    /// does - and a typo there has to be as fatal as one in `stack`.
+    #[test]
+    fn an_unknown_tz_fails_the_load_naming_the_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "tz = \"Pacific/Aukland\"\n").unwrap();
+        let err = load(Some(&p)).unwrap_err().to_string();
+        assert!(err.contains(&p.display().to_string()), "{err}");
+        assert!(
+            err.contains("tz: unknown timezone \"Pacific/Aukland\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_tz_name_with_escapes_is_sanitized_in_the_error() {
+        let err = zone_named("x\u{1b}[2J").unwrap_err();
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+    }
+
     /// A directory where a file is expected is a real operator mistake and
     /// must not be silently swallowed as "absent".
     #[test]
@@ -441,6 +505,7 @@ data_dir = "/var/lib/teku"
             vc_container: Some("vc".into()),
             vc_logs_file: Some(PathBuf::from("/vc")),
             data_dir: Some(PathBuf::from("/b")),
+            tz: Some("local".into()),
         };
         let rendered = toml::to_string(&populated).expect("Config must serialize");
         let from_struct: BTreeSet<String> = rendered

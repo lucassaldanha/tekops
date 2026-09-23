@@ -149,7 +149,7 @@ itself precisely so that ordering is testable.
 
 The config is loaded once by `run()` **before dispatch**, so a malformed
 file fails every command including `about` and `update`, which read none of
-the ten keys: the file being broken is a fact about the installation rather
+the eleven keys: the file being broken is a fact about the installation rather
 than about one command, and reporting it from whichever command the operator
 runs first is the shortest path to fixing it. That failure prints directly
 and does **not** go through `exit_for_api`, whose `--stack` hint would point
@@ -158,7 +158,11 @@ distinction `run_log_level` draws for a bad fetched body.
 
 `logs` gets its own `--stack` on the `Logs` variant instead of an arg
 struct, since there it narrows `docker ps` detection to one stack's naming
-rather than setting a URL. Neither struct's fields mark `global = true` any
+rather than setting a URL. It also takes `--tz`, which `resolve_tz` folds
+with `$TEKOPS_TZ` and the config's `tz`. A bad `$TEKOPS_TZ` is fatal, unlike
+`$TEKOPS_STACK`: the stack leniency exists because a bad variable would break
+every command, and only `logs` reads this one, where silently showing UTC to
+an operator who asked for local time is the worse outcome. Neither struct's fields mark `global = true` any
 more: that existed only so trailing flags kept parsing on subcommands, and
 with no subcommand tree left it was a no-op on every remaining command.
 
@@ -512,6 +516,30 @@ and a test asserts exactly that count. When writing tests here: raw control
 bytes inside a JSON string are invalid JSON, so a test literal must spell
 the escape out (a backslash followed by u001b) or it silently exercises
 the passthrough path instead of the parsed-field path.
+
+### `--tz`
+
+`format_log_line` takes an optional `DisplayZone`, and with one `restamp`
+rewrites a parsed record's timestamp into it. Only the timestamp field of a
+record a parser accepted is touched; passthrough lines are left alone, since
+rewriting digits in free text would be a guess.
+
+**Every stamp is read as UTC**, which is the premise of the flag (issue #30):
+tekops recommends a UTC log, and `--tz` is for reading one. This is also why
+the output keeps the line's own shape (date separator, millisecond separator
+and width) but always **appends the offset**: a converted time with no suffix
+would look exactly like the unzoned stamps Teku writes, which is the
+confusion the flag exists to remove.
+
+The offset is looked up per instant, so DST is right on both sides of a
+change. The time-only console layout has no instant to look one up by, so
+`DisplayZone` carries the offset at session start and those lines use it.
+The arithmetic is done on `LogTime` milliseconds with `dump::civil_from_days`;
+`jiff` is used only to answer "what is the offset at this instant", and
+`DisplayZone::new` takes `now` as a parameter so the module stays pure. The
+tests use fixed offsets and a POSIX TZ string, so none depends on the host's
+zoneinfo. `dump-logs` never calls it: a dump is shared and stays in the node's
+own time.
 
 ## `merge.rs`
 
@@ -1300,7 +1328,7 @@ are pure and take every input as a parameter, so the whole surface is
 testable with no environment races and no files on disk; `load` is the only
 function here that touches a filesystem.
 
-The file carries exactly the ten settings that already have `$TEKOPS_*`
+The file carries exactly the eleven settings that already have `$TEKOPS_*`
 variables, and nothing else. Every key is a variable is a flag, which is
 the one sentence that makes the feature explainable. Per-command defaults
 (`lines`, `json`) are deliberately absent: they have no variable, so they
@@ -1333,6 +1361,13 @@ pins that the key keeps parsing; `cli.rs`'s
 meaning it resolves to now. `doctor`'s "metrics layout" check (see the
 `doctor.rs` entry) is what catches an operator who set this key under its
 old meaning and never moved it.
+
+**`tz` is the one key `parse` does not fully check.** It stays a `String`,
+because resolving a zone name reads the host's tzdb and `parse` is pure, so
+`load` resolves it after parsing and fails the same way a bad `stack` does -
+before dispatch, naming the file. `zone_named` lives here rather than in
+`cli.rs` for that reason, and `--tz` and `$TEKOPS_TZ` go through it too, so
+the three spellings accept exactly the same names.
 
 `path` returns `Option`, and a missing `$HOME` *and* `$XDG_CONFIG_HOME`
 yields `None` rather than an error. That is why this module has its own path
