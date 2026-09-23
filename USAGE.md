@@ -315,6 +315,36 @@ shapes Teku actually emits, and it can miss something unusual. Read
 the file before you share it - that is what the `--gist` confirmation exists
 for.
 
+### Anonymising any log file
+
+    tekops dump-logs ./lighthouse.log -o ./lighthouse-anon.txt
+    journalctl -u geth --no-pager | tekops dump-logs /dev/stdin -o ./geth-anon.txt
+    tekops dump-logs ./besu.log -n 100000 --gist
+
+The anonymiser does not care where the log came from. Give `dump-logs` a path
+and it reads that file as plain text, one line at a time: a consensus or
+execution client, a systemd journal export, a log copied off another machine.
+It does not parse the lines, so they come out in the same order they went in,
+and the file does not need to be Teku's or to have timestamps at all.
+
+With a path it touches nothing on the node - no `docker`, no Beacon API - so
+it works on your own machine too, against a log someone copied over. It needs
+`tail`, which every Linux and macOS machine has.
+
+A few things to know:
+
+- **It is still the last `-n` lines.** The default is 1000. To anonymise the
+  whole file, pass an `-n` larger than its line count. The output is capped at
+  16 MiB either way; past that it is cut off with a `*** tekops:` note.
+- **Piped input goes through `/dev/stdin`.** `-` is not special; it is read as a
+  file named `-`.
+- **`-o /dev/stdout` prints the output path on the last line.** The redaction
+  summary goes to stderr, but the path of the file written goes to stdout.
+  Write to a real file instead if you want the output clean.
+- **The patterns were written for what Teku logs.** Other clients may print
+  sensitive values in shapes it does not recognise - a validator index after a
+  keyword Teku does not use, for instance. Read the result before you share it.
+
 ### Uploading to a gist
 
     export GITHUB_TOKEN=ghp_...     # a PAT with the 'gist' scope
