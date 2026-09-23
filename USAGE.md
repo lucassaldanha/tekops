@@ -6,7 +6,7 @@ Anything you would otherwise export as a `TEKOPS_*` variable can live in a
 config file instead - see [Configuration file](#configuration-file).
 
     tekops logs [path]
-    tekops dump-logs [path] [-n N] [-o FILE] [--gist] [--header] [--doctor]
+    tekops dump-logs [path] [-n N|all] [-o FILE|-] [--gist] [--header] [--doctor]
     tekops peers
     tekops health
     tekops head
@@ -230,7 +230,9 @@ output that may never arrive.
 
     tekops dump-logs                       # last 1000 lines -> ./tekops-dump-<timestamp>.txt
     tekops dump-logs -n 2000               # 2000 lines instead
+    tekops dump-logs -n all                # the whole log
     tekops dump-logs -o ./teku-issue.txt   # write somewhere specific
+    tekops dump-logs -o - | less           # write to stdout
     tekops dump-logs --header              # prepend a provenance block
     tekops dump-logs --doctor              # embed a doctor report above the logs
     tekops dump-logs --gist                # upload to a secret gist instead of writing a file
@@ -262,8 +264,18 @@ Where the output goes:
 | --- | --- |
 | neither | writes `./tekops-dump-<timestamp>.txt` |
 | `-o PATH` | writes `PATH` |
+| `-o -` | writes the dump to stdout, and nothing else to stdout |
 | `--gist` | uploads, writes no file |
 | `--gist -o PATH` | writes `PATH` **and** uploads |
+| `--gist -o -` | refused: both want stdout |
+
+With a file, its path is printed on stdout once it is written; with `-o -`
+it is not, so the output pipes cleanly. The redaction summary always goes to
+stderr.
+
+`-n all` reads the whole log. Whatever `-n` says, tekops stops reading a
+source at 16 MiB and notes it in the dump, so a months-old log file cannot
+fill the node's memory.
 
 The file is written with owner-only permissions (0600). With no flags the
 contents are exactly the redacted lines and nothing else, so the file stays
@@ -317,9 +329,9 @@ for.
 
 ### Anonymising any log file
 
-    tekops dump-logs ./lighthouse.log -o ./lighthouse-anon.txt
-    journalctl -u geth --no-pager | tekops dump-logs /dev/stdin -o ./geth-anon.txt
-    tekops dump-logs ./besu.log -n 100000 --gist
+    tekops dump-logs ./lighthouse.log -n all -o ./lighthouse-anon.txt
+    journalctl -u geth --no-pager | tekops dump-logs /dev/stdin -n all -o -
+    tekops dump-logs ./besu.log -n all --gist
 
 The anonymiser does not care where the log came from. Give `dump-logs` a path
 and it reads that file as plain text, one line at a time: a consensus or
@@ -333,14 +345,11 @@ it works on your own machine too, against a log someone copied over. It needs
 
 A few things to know:
 
-- **It is still the last `-n` lines.** The default is 1000. To anonymise the
-  whole file, pass an `-n` larger than its line count. The output is capped at
-  16 MiB either way; past that it is cut off with a `*** tekops:` note.
-- **Piped input goes through `/dev/stdin`.** `-` is not special; it is read as a
-  file named `-`.
-- **`-o /dev/stdout` prints the output path on the last line.** The redaction
-  summary goes to stderr, but the path of the file written goes to stdout.
-  Write to a real file instead if you want the output clean.
+- **Pass `-n all` for the whole file.** Without it you get the last 1000
+  lines, same as on the node. Either way, reading stops at 16 MiB with a
+  `*** tekops:` note.
+- **Piped input goes through `/dev/stdin`.** `-` is not special as a path; it
+  is read as a file named `-`. It is special for `-o`, where it means stdout.
 - **The patterns were written for what Teku logs.** Other clients may print
   sensitive values in shapes it does not recognise - a validator index after a
   keyword Teku does not use, for instance. Read the result before you share it.

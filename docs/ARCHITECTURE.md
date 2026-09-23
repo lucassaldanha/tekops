@@ -800,6 +800,12 @@ share one function rather than being two, because the container arm's
 positional-argument shape (`"$1"`/`"$2"`) is the injection guard and a
 second copy of it is a second place to get it wrong.
 
+The count is a `Lines`, not a `u32`, because the two producers spell "the
+whole log" differently: `tail -n +1` and `docker logs --tail all`. A sentinel
+number would have to be translated in both arms anyway, and `tail -n all` is
+a usage error. Only `dump-logs -n all` produces `Lines::All`; `tekops logs`
+keeps a plain `u32`, since following from line 1 buries the live tail.
+
 ### Process lifetime (non-obvious, don't regress)
 
 `run_logs` spawns one producer per resolved source, gives each a reader
@@ -926,6 +932,18 @@ missed.
 
 **A `--doctor` failure never fails the dump**: the command exists for the
 case where the node is sick.
+
+**`MAX_DUMP_BYTES` is enforced twice, and both are needed.** `read_capped`
+stops *reading* a source at the cap and kills its producer; the output cap in
+`read_sources` bounds the artifact. The output cap alone runs after every
+record is already in the merger, which is fine for a 1000-line tail and not
+for `-n all` against a months-old `teku.log`. The read cap is tested with an
+endless reader, which is the only way to tell the two apart.
+
+**`-o -` is stdout, and nothing else goes there.** The path line that follows a
+file write is skipped, so the output pipes cleanly. `--gist -o -` is refused
+in `destination` for the same reason: `--gist` puts the URL alone on stdout so
+it can be piped to `pbcopy`. A closed pipe (`| head`) is not an error.
 
 `logs::Mode::Once` means none of `run_logs`'s pager, signal-handler,
 process-group or temp-file machinery applies here at all - that whole

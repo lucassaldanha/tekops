@@ -357,6 +357,40 @@ pub enum Mode {
     Once,
 }
 
+/// How much of a log a producer starts from.
+///
+/// `All` exists for `dump-logs`, where anonymising a whole file is a real use;
+/// `tekops logs` only ever passes `Last`, since following a log from its first
+/// line would bury the live tail under history. The two producers spell "all"
+/// differently, which is why this is a type rather than a sentinel count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lines {
+    Last(u32),
+    All,
+}
+
+impl std::str::FromStr for Lines {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "all" {
+            return Ok(Lines::All);
+        }
+        s.parse()
+            .map(Lines::Last)
+            .map_err(|_| format!("expected a line count or `all`, got `{s}`"))
+    }
+}
+
+impl std::fmt::Display for Lines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Lines::Last(n) => write!(f, "{n}"),
+            Lines::All => f.write_str("all"),
+        }
+    }
+}
+
 /// The command that produces raw log lines for one session.
 ///
 /// Returned as data rather than a built `Command` so the argv shape is
@@ -387,7 +421,10 @@ pub enum Mode {
 /// and in particular the container arm's positional-argument shape, is
 /// identical between the two - which is the reason this is one function with a
 /// mode rather than two functions.
-pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec<String>) {
+///
+/// `Lines::All` is `tail -n +1` ("from line 1") on the file path and `--tail
+/// all` on the container path; `Lines`'s `Display` already renders the latter.
+pub fn producer_argv(target: &LogTarget, lines: Lines, mode: Mode) -> (String, Vec<String>) {
     match target {
         LogTarget::File(path) => {
             let mut argv = Vec::new();
@@ -395,7 +432,10 @@ pub fn producer_argv(target: &LogTarget, lines: u32, mode: Mode) -> (String, Vec
                 argv.push("-F".to_string());
             }
             argv.push("-n".to_string());
-            argv.push(lines.to_string());
+            argv.push(match lines {
+                Lines::Last(n) => n.to_string(),
+                Lines::All => "+1".to_string(),
+            });
             argv.push(path.display().to_string());
             ("tail".to_string(), argv)
         }
@@ -573,7 +613,7 @@ pub fn run_logs(sources: LogSources, lines: u32, zone: Option<DisplayZone>) -> E
             }
         }
 
-        let (prog, args) = producer_argv(target, lines, Mode::Follow);
+        let (prog, args) = producer_argv(target, Lines::Last(lines), Mode::Follow);
         match Command::new(&prog)
             .args(&args)
             .stdout(Stdio::piped())
@@ -1771,8 +1811,11 @@ mod tests {
 
     #[test]
     fn file_targets_still_spawn_tail_exactly_as_before() {
-        let (prog, args) =
-            producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 500, Mode::Follow);
+        let (prog, args) = producer_argv(
+            &LogTarget::File(PathBuf::from("/a.log")),
+            Lines::Last(500),
+            Mode::Follow,
+        );
         assert_eq!(prog, "tail");
         assert_eq!(args, vec!["-F", "-n", "500", "/a.log"]);
     }
@@ -1781,7 +1824,7 @@ mod tests {
     fn container_targets_spawn_docker_logs_with_stderr_merged() {
         let (prog, args) = producer_argv(
             &LogTarget::Container("rocketpool_eth2".into()),
-            500,
+            Lines::Last(500),
             Mode::Follow,
         );
         assert_eq!(prog, "sh");
@@ -1809,7 +1852,11 @@ mod tests {
     #[test]
     fn a_hostile_container_name_stays_data_not_code() {
         let hostile = "x\"; touch /tmp/pwned; echo \"";
-        let (_, args) = producer_argv(&LogTarget::Container(hostile.into()), 500, Mode::Follow);
+        let (_, args) = producer_argv(
+            &LogTarget::Container(hostile.into()),
+            Lines::Last(500),
+            Mode::Follow,
+        );
         assert!(
             !args[1].contains("pwned"),
             "container name leaked into the script: {}",
@@ -1825,9 +1872,17 @@ mod tests {
     /// is docker's spelling of the same thing. The two must agree.
     #[test]
     fn zero_lines_is_passed_through_on_both_paths() {
-        let (_, file) = producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 0, Mode::Follow);
+        let (_, file) = producer_argv(
+            &LogTarget::File(PathBuf::from("/a.log")),
+            Lines::Last(0),
+            Mode::Follow,
+        );
         assert_eq!(file[2], "0");
-        let (_, container) = producer_argv(&LogTarget::Container("c".into()), 0, Mode::Follow);
+        let (_, container) = producer_argv(
+            &LogTarget::Container("c".into()),
+            Lines::Last(0),
+            Mode::Follow,
+        );
         assert_eq!(container[3], "0");
     }
 
@@ -1835,8 +1890,11 @@ mod tests {
     /// about the argv must be identical to the follow case.
     #[test]
     fn once_mode_drops_the_follow_flag_for_a_file() {
-        let (prog, args) =
-            producer_argv(&LogTarget::File(PathBuf::from("/a.log")), 1000, Mode::Once);
+        let (prog, args) = producer_argv(
+            &LogTarget::File(PathBuf::from("/a.log")),
+            Lines::Last(1000),
+            Mode::Once,
+        );
         assert_eq!(prog, "tail");
         assert!(!args.contains(&"-F".to_string()));
         assert_eq!(args, vec!["-n", "1000", "/a.log"]);
@@ -1848,7 +1906,7 @@ mod tests {
     fn once_mode_drops_the_follow_flag_for_a_container() {
         let (prog, args) = producer_argv(
             &LogTarget::Container("eth-docker-consensus-1".into()),
-            1000,
+            Lines::Last(1000),
             Mode::Once,
         );
         assert_eq!(prog, "sh");
@@ -1858,5 +1916,44 @@ mod tests {
         assert_eq!(args[2], "sh");
         assert_eq!(args[3], "1000");
         assert_eq!(args[4], "eth-docker-consensus-1");
+    }
+
+    /// `tail -n +1` is "from line 1", i.e. the whole file. A bare `-n all`
+    /// would be a `tail` usage error.
+    #[test]
+    fn all_lines_reads_a_file_from_its_first_line() {
+        let (prog, args) = producer_argv(
+            &LogTarget::File(PathBuf::from("/a.log")),
+            Lines::All,
+            Mode::Once,
+        );
+        assert_eq!(prog, "tail");
+        assert_eq!(args, vec!["-n", "+1", "/a.log"]);
+    }
+
+    /// `docker logs --tail all` is docker's own spelling, and it still
+    /// arrives positionally, never inside the script text.
+    #[test]
+    fn all_lines_is_docker_tail_all_for_a_container() {
+        let (_, args) = producer_argv(&LogTarget::Container("c".into()), Lines::All, Mode::Once);
+        assert_eq!(args[1], "exec docker logs --tail \"$1\" \"$2\" 2>&1");
+        assert_eq!(args[3], "all");
+    }
+
+    #[test]
+    fn lines_parses_a_count_or_all() {
+        assert_eq!("1000".parse::<Lines>(), Ok(Lines::Last(1000)));
+        assert_eq!("0".parse::<Lines>(), Ok(Lines::Last(0)));
+        assert_eq!("all".parse::<Lines>(), Ok(Lines::All));
+        assert!("ALL".parse::<Lines>().is_err());
+        assert!("-5".parse::<Lines>().is_err());
+        assert!("lots".parse::<Lines>().is_err());
+    }
+
+    /// The header prints the value back, so it has to read the way it was typed.
+    #[test]
+    fn lines_displays_the_way_it_is_typed() {
+        assert_eq!(Lines::Last(1000).to_string(), "1000");
+        assert_eq!(Lines::All.to_string(), "all");
     }
 }

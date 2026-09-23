@@ -7,7 +7,7 @@ use crate::http::ApiError;
 use crate::loglevel::{
     self, resolve_log_level_target, LogLevelError, LogLevelSpec, LogLevelTarget,
 };
-use crate::logs::run_logs;
+use crate::logs::{run_logs, Lines};
 use crate::merge::Source;
 use crate::metrics::MetricsClient;
 use crate::output::{
@@ -163,10 +163,10 @@ enum Commands {
         /// Path to a log file (defaults to the Teku log, or a detected container)
         #[arg(conflicts_with = "container")]
         path: Option<PathBuf>,
-        /// How many lines to dump
-        #[arg(short = 'n', long = "lines", default_value_t = 1000)]
-        lines: u32,
-        /// Write the dump here (default: ./tekops-dump-<timestamp>.txt)
+        /// How many lines to dump, or `all` for the whole log
+        #[arg(short = 'n', long = "lines", default_value = "1000", value_name = "N")]
+        lines: Lines,
+        /// Write the dump here, or `-` for stdout (default: ./tekops-dump-<timestamp>.txt)
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
         /// Upload to a secret GitHub gist (needs $GITHUB_TOKEN or $GH_TOKEN)
@@ -1713,9 +1713,23 @@ mod tests {
     fn dump_logs_defaults_to_a_thousand_lines() {
         let cli = Cli::try_parse_from(["tekops", "dump-logs"]).unwrap();
         match cli.command {
-            Commands::DumpLogs { lines, .. } => assert_eq!(lines, 1000),
+            Commands::DumpLogs { lines, .. } => assert_eq!(lines, Lines::Last(1000)),
             _ => panic!("expected a DumpLogs command"),
         }
+    }
+
+    #[test]
+    fn dump_logs_accepts_all_lines() {
+        let cli = Cli::try_parse_from(["tekops", "dump-logs", "-n", "all"]).unwrap();
+        match cli.command {
+            Commands::DumpLogs { lines, .. } => assert_eq!(lines, Lines::All),
+            _ => panic!("expected a DumpLogs command"),
+        }
+    }
+
+    #[test]
+    fn dump_logs_rejects_a_line_count_that_is_neither_a_number_nor_all() {
+        assert!(Cli::try_parse_from(["tekops", "dump-logs", "-n", "lots"]).is_err());
     }
 
     #[test]
@@ -1764,7 +1778,7 @@ mod tests {
                 doctor,
                 ..
             } => {
-                assert_eq!(lines, 50);
+                assert_eq!(lines, Lines::Last(50));
                 assert_eq!(output, Some(PathBuf::from("out.txt")));
                 assert!(gist && yes && header && doctor);
             }

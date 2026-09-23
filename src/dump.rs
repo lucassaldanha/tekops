@@ -4,7 +4,7 @@
 //! helpers are pure and hold every formatting decision, and `run_dump` holds
 //! all the I/O.
 
-use crate::logs::{producer_argv, slot_target, wall_clock_ms, LogSources, LogTarget, Mode};
+use crate::logs::{producer_argv, slot_target, wall_clock_ms, Lines, LogSources, LogTarget, Mode};
 use crate::merge::{Merger, Source, MERGE_WINDOW};
 use crate::redact::Redactor;
 use crate::stack::Stack;
@@ -17,11 +17,12 @@ use std::time::Instant;
 
 /// A ceiling on how much a single dump will hold in memory.
 ///
-/// `tail -n` and `docker logs --tail` already bound the line *count*, so this
-/// only matters for a log whose individual lines are enormous - a stack-trace
-/// storm, or a line carrying an embedded payload. Sixteen mebibytes is far
-/// above any honest 1000-line dump and far below anything that would trouble
-/// the node.
+/// With a line count, `tail -n` and `docker logs --tail` already bound the
+/// read, so this only matters for a log whose individual lines are enormous - a
+/// stack-trace storm, or a line carrying an embedded payload. With `-n all`
+/// nothing else bounds it, and this is what stops a months-old log file being
+/// read whole into memory. Sixteen mebibytes is far above any honest 1000-line
+/// dump and far below anything that would trouble the node.
 pub const MAX_DUMP_BYTES: usize = 16 * 1024 * 1024;
 
 /// GitHub truncates large gist files in the web view, and a silently
@@ -75,7 +76,7 @@ pub struct Header {
     pub generated: String,
     pub stack: String,
     pub source: String,
-    pub lines: u32,
+    pub lines: Lines,
     pub redacted: String,
 }
 
@@ -182,6 +183,7 @@ fn redact_line(r: &mut Redactor, raw: &str) -> String {
 }
 
 /// Reads one source to completion, grouping its lines into merge records.
+/// Returns whether it stopped early at `MAX_DUMP_BYTES`.
 ///
 /// `Mode::Once` producers end by themselves, so this drains to EOF and needs
 /// none of the pager, thread or signal machinery `run_logs` has. Reading the
@@ -190,9 +192,9 @@ fn redact_line(r: &mut Redactor, raw: &str) -> String {
 fn read_source(
     source: Source,
     target: &LogTarget,
-    lines: u32,
+    lines: Lines,
     merger: &mut Merger,
-) -> Result<(), DumpError> {
+) -> Result<bool, DumpError> {
     // Only a file can be checked up front; a container's absence surfaces as a
     // non-zero exit from `docker logs`. Same split as `run_logs`.
     if let LogTarget::File(p) = target {
@@ -220,11 +222,18 @@ fn read_source(
     // The merger owns this source's record builder. `Mode::Once` reaches a
     // real EOF, so `eof` is what finishes the last record here - `flush_stale`
     // is for the follow-mode producers that never get one.
-    for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|e| DumpError::Io(e.to_string()))?;
-        merger.push_line(source, &line, Instant::now(), wall_clock_ms());
-    }
+    let capped = read_capped(BufReader::new(stdout), MAX_DUMP_BYTES, |line| {
+        merger.push_line(source, line, Instant::now(), wall_clock_ms());
+    })?;
     merger.eof(source);
+
+    // Stopping early leaves the producer blocked on a full pipe, and the kill
+    // is what makes its non-zero exit expected rather than a failure.
+    if capped {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(true);
+    }
 
     let status = child.wait().map_err(|e| DumpError::Io(e.to_string()))?;
     if !status.success() {
@@ -237,7 +246,30 @@ fn read_source(
             stderr: sanitize(stderr.trim()),
         });
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Hands `reader`'s lines to `push` until EOF, or until more than `cap` bytes
+/// have gone by. Returns whether it stopped at the cap.
+///
+/// The output cap in `read_sources` bounds what the artifact holds, but only
+/// after every record is already in memory. With `-n all` the producer is
+/// bounded by nothing but the file's size, so the read itself has to stop.
+fn read_capped(
+    reader: impl BufRead,
+    cap: usize,
+    mut push: impl FnMut(&str),
+) -> Result<bool, DumpError> {
+    let mut bytes: usize = 0;
+    for line in reader.lines() {
+        let line = line.map_err(|e| DumpError::Io(e.to_string()))?;
+        bytes = bytes.saturating_add(line.len() + 1);
+        if bytes > cap {
+            return Ok(true);
+        }
+        push(&line);
+    }
+    Ok(false)
 }
 
 /// Reads every resolved source and returns one merged, tagged, redacted body.
@@ -249,7 +281,7 @@ fn read_source(
 /// all, the first failure is returned.
 fn read_sources(
     sources: &LogSources,
-    lines: u32,
+    lines: Lines,
     r: &mut Redactor,
 ) -> Result<Vec<String>, DumpError> {
     let active = sources.active();
@@ -267,7 +299,17 @@ fn read_sources(
             continue;
         };
         match read_source(*source, target, lines, &mut merger) {
-            Ok(()) => read_any = true,
+            Ok(capped) => {
+                read_any = true;
+                if capped {
+                    notes.push(format!(
+                        "*** tekops: stopped reading the {} log at the {} MiB limit; \
+                         the rest of it is not in this dump.",
+                        source.tag(),
+                        MAX_DUMP_BYTES / (1024 * 1024)
+                    ));
+                }
+            }
             Err(e) => {
                 notes.push(format!(
                     "*** tekops: could not read the {} log: {e}",
@@ -352,15 +394,30 @@ fn target_label(target: &LogTarget) -> String {
 }
 
 /// Where the dump gets written, if anywhere.
+#[derive(Debug, PartialEq, Eq)]
+enum Destination {
+    File(PathBuf),
+    /// `-o -`: the dump alone on stdout, with no path line after it.
+    Stdout,
+    /// `--gist` with no `-o`: the gist is the artifact.
+    Nowhere,
+}
+
+/// `-o` always wins. With no `-o`, `--gist` writes nothing and a plain run
+/// writes the timestamped default. Pure, so the composition is testable without
+/// an upload.
 ///
-/// `-o` always wins. With no `-o`, `--gist` writes nothing (the gist is the
-/// artifact) and a plain run writes the timestamped default. Pure, so the
-/// composition is testable without an upload.
-fn output_path(output: &Option<PathBuf>, gist: bool, now: u64) -> Option<PathBuf> {
+/// `-o -` with `--gist` is refused: `--gist` puts the URL alone on stdout so
+/// it can be piped, and the whole dump in front of it would defeat that.
+fn destination(output: &Option<PathBuf>, gist: bool, now: u64) -> Result<Destination, DumpError> {
     match (output, gist) {
-        (Some(p), _) => Some(p.clone()),
-        (None, false) => Some(PathBuf::from(default_filename(now))),
-        (None, true) => None,
+        (Some(p), true) if p.as_os_str() == "-" => Err(DumpError::Io(
+            "-o - and --gist both write to stdout; pick one, or give -o a file".to_string(),
+        )),
+        (Some(p), _) if p.as_os_str() == "-" => Ok(Destination::Stdout),
+        (Some(p), _) => Ok(Destination::File(p.clone())),
+        (None, false) => Ok(Destination::File(PathBuf::from(default_filename(now)))),
+        (None, true) => Ok(Destination::Nowhere),
     }
 }
 
@@ -394,6 +451,20 @@ fn write_dump(path: &Path, content: &str) -> Result<(), DumpError> {
         .map_err(|e| DumpError::Io(format!("could not write {}: {e}", path.display())))?;
     f.write_all(content.as_bytes())
         .map_err(|e| DumpError::Io(format!("could not write {}: {e}", path.display())))
+}
+
+/// Writes the dump to stdout for `-o -`.
+///
+/// A reader that stops early (`| head`) is not an error: the dump is read,
+/// redacted and written, and nobody wanting the rest is the reader's business.
+fn write_stdout(content: &str) -> Result<(), DumpError> {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(content.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(DumpError::Io(format!("could not write to stdout: {e}")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Shows what is about to leave the machine, and asks.
@@ -434,7 +505,7 @@ fn confirm_upload(rendered: &str) -> Result<bool, DumpError> {
 
 pub struct DumpConfig {
     pub sources: LogSources,
-    pub lines: u32,
+    pub lines: Lines,
     pub output: Option<PathBuf>,
     pub gist: bool,
     pub yes: bool,
@@ -450,6 +521,7 @@ pub fn run_dump(cfg: DumpConfig) -> Result<(), DumpError> {
     // `update.rs` running `probe_writable` before the download rather than
     // after it.
     let token = if cfg.gist { Some(read_token()?) } else { None };
+    let dest = destination(&cfg.output, cfg.gist, cfg.now)?;
 
     let mut r = Redactor::new();
 
@@ -491,13 +563,14 @@ pub fn run_dump(cfg: DumpConfig) -> Result<(), DumpError> {
 
     let rendered = render_dump(header.as_ref(), doctor_text.as_deref(), &lines);
 
-    let wrote = output_path(&cfg.output, cfg.gist, cfg.now);
-    if let Some(p) = &wrote {
-        write_dump(p, &rendered)?;
+    match &dest {
+        Destination::File(p) => write_dump(p, &rendered)?,
+        Destination::Stdout => write_stdout(&rendered)?,
+        Destination::Nowhere => {}
     }
 
     eprintln!("redacted {summary}");
-    if let Some(p) = &wrote {
+    if let Destination::File(p) = &dest {
         println!("{}", p.display());
     }
 
@@ -526,7 +599,7 @@ mod tests {
             generated: "2026-09-14T21:30:00Z".to_string(),
             stack: "eth-docker".to_string(),
             source: "container eth-docker-consensus-1".to_string(),
-            lines: 1000,
+            lines: Lines::Last(1000),
             redacted: "47 values across 5 categories".to_string(),
         }
     }
@@ -623,13 +696,82 @@ mod tests {
             bn: Some(LogTarget::File(path)),
             vc: None,
         };
-        let lines = read_sources(&sources, 3, &mut r).unwrap();
+        let lines = read_sources(&sources, Lines::Last(3), &mut r).unwrap();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("<ip-1>"));
         assert!(!lines[0].contains("93.184.216.34"));
         assert!(
             !lines[0].starts_with("[bn] "),
             "a single source carries no tag: {:?}",
+            lines[0]
+        );
+    }
+
+    /// `-n all` is how a whole log, from any client, gets anonymised. Order is
+    /// the file's own, and a line with no timestamp stays where it was.
+    #[test]
+    fn reading_all_lines_yields_the_whole_file_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other-client.log");
+        std::fs::write(
+            &path,
+            "Sep 24 10:00:01 node lighthouse: peer 93.184.216.34\n\
+             no timestamp here\n\
+             Sep 24 09:59:00 node an earlier stamp, later in the file\n",
+        )
+        .unwrap();
+
+        let mut r = Redactor::new();
+        let sources = LogSources {
+            bn: Some(LogTarget::File(path)),
+            vc: None,
+        };
+        let lines = read_sources(&sources, Lines::All, &mut r).unwrap();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("<ip-1>"), "{:?}", lines[0]);
+        assert_eq!(lines[1], "no timestamp here");
+        assert!(lines[2].contains("an earlier stamp"), "{:?}", lines[2]);
+    }
+
+    /// An endless reader is the proof the cap bounds the *read*, not just the
+    /// output: without it this never returns.
+    #[test]
+    fn a_capped_read_stops_at_the_cap_even_on_an_endless_reader() {
+        let mut got = 0;
+        let hit = read_capped(BufReader::new(std::io::repeat(b'\n')), 100, |_| got += 1).unwrap();
+        assert!(hit);
+        assert_eq!(got, 100, "each empty line costs one byte, its newline");
+    }
+
+    #[test]
+    fn a_capped_read_under_the_cap_reads_everything() {
+        let mut got = Vec::new();
+        let hit = read_capped("a\nb\n".as_bytes(), 100, |l| got.push(l.to_string())).unwrap();
+        assert!(!hit);
+        assert_eq!(got, vec!["a", "b"]);
+    }
+
+    /// `-n all` on a months-old log must not read it whole into memory. The
+    /// reader stops at the cap, and says so in the artifact - a dump that
+    /// quietly ends early looks like the node stopped logging.
+    #[test]
+    fn reading_all_of_an_oversized_file_stops_at_the_cap_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        let line = format!("{}\n", "x".repeat(1023));
+        let count = MAX_DUMP_BYTES / line.len() + 100;
+        std::fs::write(&path, line.repeat(count)).unwrap();
+
+        let mut r = Redactor::new();
+        let sources = LogSources {
+            bn: Some(LogTarget::File(path)),
+            vc: None,
+        };
+        let lines = read_sources(&sources, Lines::All, &mut r).unwrap();
+        assert!(lines.len() < count, "read all {count} lines");
+        assert!(
+            lines[0].starts_with("*** tekops: stopped reading the bn log"),
+            "{:?}",
             lines[0]
         );
     }
@@ -641,7 +783,7 @@ mod tests {
             bn: Some(LogTarget::File(PathBuf::from("/nope/absent.log"))),
             vc: None,
         };
-        assert!(read_sources(&sources, 10, &mut r).is_err());
+        assert!(read_sources(&sources, Lines::Last(10), &mut r).is_err());
     }
 
     /// The dump carries the same interleaving the operator saw, so whoever
@@ -667,7 +809,7 @@ mod tests {
             bn: Some(LogTarget::File(bn)),
             vc: Some(LogTarget::File(vc)),
         };
-        let lines = read_sources(&sources, 10, &mut r).unwrap();
+        let lines = read_sources(&sources, Lines::Last(10), &mut r).unwrap();
 
         assert_eq!(lines.len(), 3, "{lines:?}");
         // Ordered by timestamp across sources, not concatenated per source.
@@ -693,7 +835,7 @@ mod tests {
             bn: Some(LogTarget::File(PathBuf::from("/nope/absent.log"))),
             vc: Some(LogTarget::File(vc)),
         };
-        let lines = read_sources(&sources, 10, &mut r).unwrap();
+        let lines = read_sources(&sources, Lines::Last(10), &mut r).unwrap();
 
         assert!(
             lines[0].contains("could not read the bn log"),
@@ -744,15 +886,37 @@ mod tests {
     /// alone writes there, both does both, neither writes the timestamped
     /// default.
     #[test]
-    fn output_path_composes_with_the_gist_flag() {
+    fn destination_composes_with_the_gist_flag() {
         let p = PathBuf::from("chosen.txt");
-        assert_eq!(output_path(&Some(p.clone()), true, 0), Some(p.clone()));
-        assert_eq!(output_path(&Some(p.clone()), false, 0), Some(p));
-        assert_eq!(output_path(&None, true, 0), None);
         assert_eq!(
-            output_path(&None, false, 1_700_000_000),
-            Some(PathBuf::from("tekops-dump-20231114T221320Z.txt"))
+            destination(&Some(p.clone()), true, 0).unwrap(),
+            Destination::File(p.clone())
         );
+        assert_eq!(
+            destination(&Some(p.clone()), false, 0).unwrap(),
+            Destination::File(p)
+        );
+        assert_eq!(destination(&None, true, 0).unwrap(), Destination::Nowhere);
+        assert_eq!(
+            destination(&None, false, 1_700_000_000).unwrap(),
+            Destination::File(PathBuf::from("tekops-dump-20231114T221320Z.txt"))
+        );
+    }
+
+    #[test]
+    fn a_dash_output_is_stdout() {
+        assert_eq!(
+            destination(&Some(PathBuf::from("-")), false, 0).unwrap(),
+            Destination::Stdout
+        );
+    }
+
+    /// `--gist` prints the URL alone on stdout so it can be piped to `pbcopy`.
+    /// The dump on the same stream would bury it, so the pair is refused.
+    #[test]
+    fn a_dash_output_with_gist_is_refused() {
+        let err = destination(&Some(PathBuf::from("-")), true, 0).unwrap_err();
+        assert!(err.to_string().contains("--gist"), "{err}");
     }
 
     /// The dump file is node logs sitting in whatever directory the operator
