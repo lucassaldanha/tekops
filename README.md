@@ -14,8 +14,8 @@ Eth Docker and Rocket Pool deployments.
 tekops is in beta. I run it daily on my own node, and on other nodes I manage,
 but that is only one user 😁
 
-The Eth Docker and Rocket Pool support is covered by tests and I have tested 
-on different setups, but has seen far less real use, so expect rough edges 
+The Eth Docker and Rocket Pool support is covered by tests and I have tested
+on different setups, but it has seen far less real use, so expect rough edges
 there and please open an issue when you hit one.
 
 Until 1.0, anything can change between releases, including flag names, the
