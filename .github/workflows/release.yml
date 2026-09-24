@@ -95,15 +95,11 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
-          # The self-hosted builder, because GitHub bills macOS runners at a
-          # 10x minute multiplier and this is the only job that needs one -
-          # it is most of what a release costs. Matched on [self-hosted,
-          # macOS] rather than the builder's name or its X64 label, so
-          # replacing that machine with an Apple Silicon one needs no change
-          # here. If the builder is offline the job queues until it is back;
-          # GitHub cancels it after 24 hours.
+          # GitHub-hosted and arm64, so the target builds natively. Pinned to
+          # an image version rather than macos-latest, which moves to a new
+          # macOS and Xcode without a change here.
           - target: aarch64-apple-darwin
-            runner: [self-hosted, macOS]
+            runner: macos-15
     steps:
       # Full history: build-release.sh reads the commit timestamp for
       # SOURCE_DATE_EPOCH. The explicit ref is what makes the dispatch path
@@ -114,27 +110,11 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
-      # The builder runs its runner as a LaunchAgent, which inherits launchd's
-      # PATH and never reads the ~/.zprofile line rustup's installer appends -
-      # so an installed, working rustup is invisible to the job and the check
-      # below reports "no rustc at all" on a machine where `rustup --version`
-      # answers fine in a terminal. The runner can be told this with a `.path`
-      # file in its own root directory, but that is state on a machine nobody
-      # can see from here and it is lost the next time the runner is
-      # reinstalled. Saying it in the workflow costs one line and cannot go
-      # missing. Adding a directory that does not exist is harmless, so the
-      # GitHub-hosted legs would not care either - the `if:` is only because
-      # they have no reason to run it.
-      - name: Put rustup's shims on PATH
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
       # Only the macOS leg compiles on the host; the Linux legs compile inside
       # a digest-pinned container that carries its own toolchain. This is the
-      # one place rust-toolchain.toml can be silently ignored, because the
-      # self-hosted builder's Rust is whatever was installed on it rather than
-      # whatever the runner image ships. Failing here is the whole point: an
-      # unpinned compiler produces a perfectly good binary and says nothing.
+      # one place rust-toolchain.toml could be silently ignored - by a Rust on
+      # the runner image that is not rustup's. Failing here is the whole point:
+      # an unpinned compiler produces a perfectly good binary and says nothing.
       - name: Toolchain is the pinned one
         if: matrix.target == 'aarch64-apple-darwin'
         run: scripts/check-toolchain.sh

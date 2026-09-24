@@ -116,146 +116,22 @@ asymmetry is deliberate, because the same script runs on a dev machine that has
 none of this material, and a misspelled secret name is the one way it can bite
 you. The `gh secret list` check is what closes that gap.
 
-## The self-hosted builder
+## The macOS runner
 
-The `aarch64-apple-darwin` leg of the `build` job runs on the self-hosted
-runner labelled `self-hosted, macOS`, not on a GitHub-hosted macOS runner.
-GitHub bills macOS minutes at a 10x multiplier and that job is the only one
-that needs a Mac, so it is most of what a release costs. Everything else -
-`verify`, both Linux legs, the `release` job and all of `ci.yml` - stays on
-GitHub-hosted runners, which are always available and cheap.
+The `aarch64-apple-darwin` leg of the `build` job runs on GitHub-hosted
+`macos-15`, which is arm64, so the target builds natively. It is pinned to an
+image version rather than `macos-latest`, so a new macOS or Xcode arrives only
+when this line changes. Bump it when GitHub announces that image's retirement.
 
-**If the builder is offline the job queues** until the machine comes back.
-GitHub cancels a job that has waited 24 hours. Nothing else in the run is
-blocked until `release`, which needs every build to have finished.
+It used to run on a self-hosted Mac, because GitHub bills macOS minutes at a
+10x multiplier on private repositories. The repository is public now, where
+GitHub-hosted runners cost nothing, and a self-hosted runner on a public
+repository is a liability: a fork's pull request can edit a workflow to target
+it, and one approval runs that code on the machine that builds and signs
+releases. Do not bring one back while the repository is public.
 
-The five signing secrets are handed to the builder the same way they are to a
-GitHub-hosted runner. `sign-macos.sh` was already written for a real machine -
-it saves and restores the keychain search list in an `EXIT` trap, rather than
-assuming a throwaway filesystem - so nothing about it changes here.
-
-### What has to be installed on it
-
-A GitHub-hosted macOS runner arrives with Xcode, rustup and git already on it.
-The builder is a machine someone set up, so every one of those is a thing that
-has to be there and stay there. This is the whole list.
-
-1. **The runner software, labelled `self-hosted` and `macOS`.** Those two
-   labels are what `release.yml`'s matrix matches on. `macOS` is applied
-   automatically by the runner's installer; `self-hosted` likewise. The `X64`
-   label the current builder also carries is deliberately not matched, so
-   replacing the machine with an Apple Silicon one needs no change to the
-   workflow.
-
-2. **The Xcode command line tools**, for `codesign`, `spctl`,
-   `xcrun notarytool`, `ditto`, `security`, `git`, and the linker `cargo`
-   invokes.
-
-       xcode-select --install
-
-   The full Xcode app is not needed on the builder. It is needed once, on your
-   own machine, to create the certificate in step 1 of this document - a
-   different machine and a different job. `notarytool` arrived in the Xcode 13
-   tools; anything older has only the retired `altool`, which this repo does
-   not use.
-
-3. **rustup, and nothing else from Rust.**
-
-       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-   That is the entire Rust setup. `rust-toolchain.toml` names the channel, the
-   components and the targets, so the first `cargo` invocation inside the
-   checkout installs 1.98.0 and the `aarch64-apple-darwin` standard library on
-   its own. **Do not run `rustup target add` by hand** - the manifest already
-   covers it, and a target added outside the pinned toolchain is a second place
-   for it to go stale. **Do not `brew install rust`.** A Homebrew Rust ignores
-   `rust-toolchain.toml` in silence, which is the exact condition
-   `scripts/check-toolchain.sh` fails the release on, and on an Intel Mac it
-   installs into `/usr/local/bin`, which is on launchd's default `PATH` and can
-   therefore end up ahead of the rustup shim.
-
-   `brew install rustup` is a real rustup and does work, but it is the worse
-   path here: the formula is keg-only because it conflicts with `rust`, so it
-   symlinks nothing and needs `$(brew --prefix rustup)/bin` on `PATH` on top of
-   the `~/.cargo/bin` the toolchains still install into. Two entries to get
-   right instead of one, for no gain.
-
-4. **rustup in `~/.cargo/bin`, which is where its own installer puts it.**
-   Nothing else on the builder has to be configured for this, because
-   `release.yml` adds that directory to the job's `PATH` itself - but the
-   reason it has to is worth knowing, since it is the sharp edge here and it
-   produces a failure that reads as if Rust were missing when it is installed
-   and working:
-
-       rustup is not installed, so rust-toolchain.toml's '1.98.0' pin does nothing here
-       this host would build with: no rustc at all
-
-   rustup's installer appends a line to `~/.zprofile` or `~/.bash_profile`. The
-   runner is not a login shell and never reads either, so a LaunchAgent runner
-   inherits launchd's `PATH` and sees no `rustc`. `rustup --version` in your
-   terminal proves nothing about what the job sees.
-
-   The runner can be told this on the machine - it reads a `.path` file from
-   its own root directory and uses it as `PATH` for every job - and that is
-   still how a proxy or any other variable gets in (via a `.env` file in the
-   same directory). It is the wrong place for this one: it is state on a
-   machine nobody can inspect from the repo, and reinstalling the runner
-   silently takes it away again.
-
-   So if you see that message *after* this change, `PATH` is not the cause.
-   Either rustup is not installed (step 3), or it is installed somewhere other
-   than `~/.cargo/bin` - `brew install rustup` being the way that happens.
-   `check-toolchain.sh` tells the two apart: it adds a `note:` line naming
-   `~/.cargo/bin/rustup` when the binary is there and only the `PATH` was
-   wrong.
-
-5. **A logged-in user session.** `sign-macos.sh` creates a throwaway keychain
-   and imports the certificate into it. Keychain operations need a user
-   session, so run the runner as a LaunchAgent (`./svc.sh install`) or from a
-   terminal - a LaunchDaemon with no session fails at the import.
-
-6. **Outbound HTTPS to Apple.** Three separate steps need it and each fails
-   differently: `codesign --timestamp` fetches a secure timestamp,
-   `notarytool submit` uploads and waits, and `spctl --assess` performs a live
-   ticket lookup. A builder that can reach GitHub but not Apple gets through
-   the compile and fails in signing.
-
-The builder does **not** need Docker, `jq`, or anything else this repo shells
-out to - `read-version.sh` and `check-toolchain.sh` are deliberately plain
-`awk`. It does not need Apple Silicon either: nothing in `build-release.sh` or
-`sign-macos.sh` ever *executes* the binary it produces, which is what makes
-building, signing and notarizing an arm64 binary on an Intel Mac work.
-
-### Verifying the builder
-
-Run this on the builder, from a checkout, after setting it up and after any
-change to the machine:
-
-    xcode-select -p
-    git --version
-    xcrun notarytool --version
-    scripts/check-toolchain.sh
-
-`check-toolchain.sh` is the one that matters and is the same check the `build`
-job runs first. Expect `toolchain '<version>' is active`. Both of its failure
-messages name what they found, so neither needs interpreting - but read step 4
-above before concluding from `no rustc at all` that Rust is missing.
-
-That sequence confirms the tools. To confirm the build path itself, run the
-real thing:
-
-    scripts/build-release.sh aarch64-apple-darwin
-
-Without the five signing variables exported, `sign-macos.sh` prints
-`no MACOS_CERT_P12, leaving ... unsigned` and exits 0, so this exercises the
-compile, the cross-target link and the packaging without touching Apple. With
-them exported it is the full dry run from
-[step 3](#3-dry-run-locally-before-touching-the-repository), which is worth
-doing on the builder once rather than only on your own machine.
-
-Both of those run in *your* environment, not the runner's, so they cannot catch
-a `PATH` problem. Dispatching a release is what proves that end to end, and the
-`build` job fails in about a second when it is wrong.
+The hosted image ships Xcode, rustup and git, and `sign-macos.sh` needs nothing
+else - it creates and deletes its own keychain.
 
 ## Cutting a release
 
@@ -416,10 +292,10 @@ after the commit has landed.
   of truth.
 
   That silence is why `scripts/check-toolchain.sh` exists and why the macOS
-  build calls it. A GitHub-hosted runner ships rustup, so the pin binds for free
-  and the check can only pass there; the self-hosted builder's Rust is whatever
-  was installed on it, and the macOS leg is the only job that compiles on the
-  host rather than inside the pinned container. An unpinned compiler produces a
+  build calls it. The macOS leg is the only job that compiles on the host
+  rather than inside the pinned container. A GitHub-hosted runner ships rustup,
+  so the pin binds and the check should always pass there; it is a guard
+  against an image that someday puts another Rust ahead of the shim. An unpinned compiler produces a
   working binary and reports nothing, so without the check the drift has no
   symptom at all - it just ships. The check reads the effective
   `rustc --version` rather than `rustup show`, since something ahead of the shim
@@ -516,7 +392,7 @@ see that module's entry in `docs/ARCHITECTURE.md` for the rest.
 | `notarization was not accepted` | The notarytool output printed directly above says why |
 | `Gatekeeper did not accept ... as notarized` | The `spctl` assessment settled on a rejection after three tries. Check network reachability to Apple from the runner first; a genuine rejection means the ticket was never issued for those bytes |
 | Build succeeds, log reads `no MACOS_CERT_P12, leaving ... unsigned` | The secret is not reaching the runner. Check the name against `release.yml` |
-| `rustup is not installed ...` / `this host would build with: no rustc at all` | Either rustup is not on the builder, or it is and `~/.cargo/bin` is not on the runner's `PATH`. See [the builder's step 4](#what-has-to-be-installed-on-it) |
+| `rustup is not installed ...` / `this host would build with: no rustc at all` | The runner image stopped shipping rustup, or stopped putting `~/.cargo/bin` on `PATH`. The `note:` line, when present, says which |
 | `rust-toolchain.toml pins '<a>' but rustc reports '<b>'` | Something is ahead of the rustup shim on the runner's `PATH`, usually a Homebrew Rust |
 
 ## Why the macOS binary is not stapled

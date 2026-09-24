@@ -6,10 +6,10 @@
 # rust-toolchain.toml is a rustup feature. On a host whose Rust came from
 # anywhere else - Homebrew, a distro package - it is ignored in silence and
 # the build uses whatever compiler happens to be installed. GitHub-hosted
-# runners ship rustup, so the pin binds there for free and this check can only
-# pass. A self-hosted runner is where it can quietly stop being true, which is
-# the whole reason this exists: the failure it catches has no symptom, it just
-# publishes binaries built by a compiler nobody chose.
+# runners ship rustup, so the pin binds there and this should always pass. It
+# guards against the day an image, or a new build host, puts another Rust
+# ahead of the shim: that failure has no symptom, it just publishes binaries
+# built by a compiler nobody chose.
 #
 # Usage: scripts/check-toolchain.sh
 set -euo pipefail
