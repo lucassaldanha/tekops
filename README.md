@@ -7,7 +7,8 @@ Helper CLI for operating a Teku node, run directly on the node over SSH.
     tekops peers                 # peer counts by direction and protocol
 
 **[USAGE.md](USAGE.md) documents every command**, including running against
-Eth Docker and Rocket Pool deployments.
+Eth Docker and Rocket Pool deployments. The same docs are also published at
+https://lucassaldanha.github.io/tekops/.
 
 ## Beta ⚠️
 

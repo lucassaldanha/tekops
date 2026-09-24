@@ -1,0 +1,47 @@
+# The documentation site, published to GitHub Pages by
+# .github/workflows/pages.yml. website/ holds symlinks to README.md and
+# USAGE.md, so the site renders the same text that ships in the release
+# tarball; docs/ is maintainer-only and deliberately not published.
+site_name: tekops
+site_description: Helper CLI for operating a Teku node, run directly on the node over SSH
+site_url: https://lucassaldanha.github.io/tekops/
+repo_url: https://github.com/lucassaldanha/tekops
+repo_name: lucassaldanha/tekops
+edit_uri: ""
+
+docs_dir: website
+exclude_docs: |
+  requirements.txt
+strict: true
+validation:
+  anchors: warn
+
+nav:
+  - Home: README.md
+  - Usage: USAGE.md
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.top
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.superfences
+  - toc:
+      permalink: true
