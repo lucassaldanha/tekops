@@ -362,7 +362,8 @@ A few things to know:
 `--gist` needs a GitHub token, read from `$GITHUB_TOKEN` and then `$GH_TOKEN`.
 GitHub removed anonymous gist creation in 2018, so there is no token-free
 path. The token is checked before a single log line is read, so a missing one
-fails immediately rather than after the work.
+fails immediately rather than after the work. See
+[Getting a token](#getting-a-token) below.
 
 Gists are created **secret**: unlisted and not indexed, but still readable by
 anyone who has the link. There is no `--public` flag. Treat the link as the
@@ -387,6 +388,35 @@ On success the gist URL is the only thing printed to stdout, so
 summary goes to stderr. Dumps over 2 MB are refused rather than uploaded,
 because GitHub truncates large gist files in the web view and a silently
 truncated dump is worse than an error.
+
+#### Getting a token
+
+The token only needs permission to create gists - nothing else. Either kind of
+personal access token works (github.com > Settings > Developer settings >
+Personal access tokens):
+
+- **Fine-grained:** no repository access, and under *Account permissions* set
+  **Gists** to *Read and write*.
+- **Classic:** tick only the **`gist`** scope.
+
+If the `gh` CLI is already logged in on the machine, you can reuse its token
+instead of creating one:
+
+    GITHUB_TOKEN=$(gh auth token) tekops dump-logs --gist
+
+A browser `gh auth login` includes the `gist` scope. If `gh` was set up some
+other way and the upload is rejected, add the scope with
+`gh auth refresh -s gist`.
+
+To keep the token out of your shell history, read it in rather than typing it
+on the command line:
+
+    read -rs GITHUB_TOKEN && export GITHUB_TOKEN
+
+`sudo` drops environment variables by default. If the log is only readable by
+root, pass the token through explicitly:
+
+    sudo --preserve-env=GITHUB_TOKEN tekops dump-logs --gist
 
 ### --doctor
 

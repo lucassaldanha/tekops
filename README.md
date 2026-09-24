@@ -9,6 +9,17 @@ Helper CLI for operating a Teku node, run directly on the node over SSH.
 **[USAGE.md](USAGE.md) documents every command**, including running against
 Eth Docker and Rocket Pool deployments.
 
+## Beta
+
+tekops is in beta. I run it daily on my own node, but that is one node: a
+bare-metal Teku beacon node with a Rocket Pool validator client. The Eth Docker
+and Rocket Pool support is covered by tests but has seen far less real use, so
+expect rough edges there and please open an issue when you hit one.
+
+Until 1.0, anything can change between releases, including flag names, the
+config file format and the `--json` output. Read the release notes before
+updating, and don't build scripts on top of the JSON output yet.
+
 ## About this project
 
 tekops is a personal project I build in my spare time to operate my own node. It
@@ -66,4 +77,4 @@ file needs to reach the node.
 
     cargo build --release
 
-If you prefere to build it yourself.
+If you prefer to build it yourself.
