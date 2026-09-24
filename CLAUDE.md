@@ -30,6 +30,12 @@ directly on the node over SSH. Four groups of commands:
 deliberately do not. **Usage belongs in `USAGE.md`** - adding it back into the
 README is a regression, not a convenience.
 
+The same two files are also the documentation site at
+https://lucassaldanha.github.io/tekops/: `website/` holds symlinks to them,
+`mkdocs.yml` configures it, and `.github/workflows/pages.yml` builds it on
+every PR (strict, so a broken link fails) and deploys it from `master`. Never
+copy content into `website/`, and keep `docs/` out of it.
+
 ## Commands
 
 ```bash
@@ -40,6 +46,7 @@ cargo test health_ready_on_200  # a single test by name
 cargo clippy --all-targets   # lint
 scripts/check.sh             # every CI gate, in CI's order - what pre-push runs
 scripts/build-release.sh <target>   # cross-compile; see docs/RELEASING.md
+uvx --with-requirements website/requirements.txt mkdocs serve   # preview the docs site
 ```
 
 ## Architecture

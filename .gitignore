@@ -6,3 +6,4 @@
 # local signing dry run.
 *.p12
 *.p8
+/site
