@@ -512,10 +512,23 @@ mod tests {
     /// Stands in for a freshly installed tekops: echoes which shell it was
     /// asked for, so a test can tell the refreshed content came from running
     /// this binary rather than from the in-process generator.
+    ///
+    /// The executable is created by a `cp` child, never written from this
+    /// process. A writable fd held here, however briefly, is inherited by any
+    /// child another test thread forks in that window, and exec'ing the file
+    /// while that child still has it open fails with ETXTBSY ("Text file
+    /// busy"). The source file is written here, but it is never exec'd.
     fn fake_binary(dir: &tempfile::TempDir, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        let source = dir.path().join("tekops-stand-in.src");
         let path = dir.path().join("tekops-stand-in");
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&source, body).unwrap();
+        let status = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
