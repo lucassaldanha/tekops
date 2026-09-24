@@ -430,13 +430,7 @@ A doctor failure never fails the dump. If the probes cannot reach the node the
 report says so and the logs are still written - this command exists for the
 case where the node is sick.
 
-## Beacon API commands
-
-`peers`, `health`, `head`, and `log-level` read the Beacon API. They accept
-`--api-url` (or `$TEKOPS_API_URL`) to point at a non-default endpoint
-(default: `http://localhost:5051`).
-
-### peers
+## peers
 
 Prints peer counts grouped by direction and protocol, plus the total, rather
 than one row per peer:
@@ -457,12 +451,12 @@ The Protocol column is derived from each peer's `last_seen_p2p_address`
 multiaddr (QUIC if it advertises a `/quic` component, TCP otherwise) rather
 than the peer's ENR, which the Beacon API doesn't reliably populate.
 
-### health, head
+## health, head
 
 `health` reports health and sync status. `head` reports the chain head slot
 and root plus the finality checkpoints.
 
-### doctor
+## doctor
 
     tekops doctor
     tekops doctor --stack eth-docker
@@ -481,10 +475,10 @@ boxed table.
 It accepts `--api-url` (or `$TEKOPS_API_URL`), `--bn-metric-url` (or
 `$TEKOPS_BN_METRIC_URL`), `--vc-metric-url` (or `$TEKOPS_VC_METRIC_URL`),
 `--stack` (or `$TEKOPS_STACK`), `--data-dir` (or `$TEKOPS_DATA_DIR`), and
-`--json`, the same as the commands above and below it.
+`--json` - see [Endpoints](#endpoints) for the defaults.
 
-**`doctor` applies `docker ps` detection to the port defaults; the other API
-commands don't.** Every other command here reads only `--stack`/`$TEKOPS_STACK`
+**`doctor` applies `docker ps` detection to the port defaults; the other network
+commands don't.** Every other command reads only `--stack`/`$TEKOPS_STACK`
 and, if the endpoint turns out to be unreachable, suggests `--stack` in a hint
 afterward. `doctor` is already running `docker ps` for the container checks, so
 it applies that detection up front to `--api-url`, `--bn-metric-url` and
@@ -536,7 +530,7 @@ indirectly instead (`execution layer` if Teku notices the execution client is
 offline, `validator metrics` if the validator client stops answering its
 scrape).
 
-#### Exit code
+### Exit code
 
 `0` when every check passes or the worst outcome is a warning. `1` when any
 check fails. Unlike `tekops update check`, whose `0` means only that the
@@ -544,7 +538,7 @@ check itself completed, doctor's exit code is a direct function of the
 findings - script against it (`tekops doctor || alert`) rather than assuming
 `0` just means the command ran.
 
-#### Checks
+### Checks
 
 The thresholds below are conservative defaults picked for a home-staker
 mainnet node, not measurements taken from a specific setup - treat them as a
@@ -583,7 +577,7 @@ shapes: `--bn-metric-url` turning out to be a validator client's endpoint
 processes' metrics while `--vc-metric-url` is unreachable, which reads as an
 all-in-one deployment.
 
-#### Sample output
+### Sample output
 
     tekops doctor
 
@@ -613,7 +607,7 @@ finding (versions, mount paths, container names, node error text) is
 sanitized first, the same as everything else tekops prints from data it
 didn't author.
 
-### log-level
+## log-level
 
     tekops log-level info                                  # global change
     tekops log-level debug --filter=tech.pegasys.teku.sync # scoped to loggers
@@ -629,7 +623,7 @@ class); omit
 it entirely to change the global log level - `log_filter` is left out of the
 request body in that case rather than sent as `null` or `[]`.
 
-#### Applying a prepared body from a URL
+### Applying a prepared body from a URL
 
 Working out which Teku packages or classes to turn up is not something an
 operator can reasonably be expected to know. So the same positional also takes
@@ -680,27 +674,11 @@ Notes on the URL:
   `log_filter`, and honouring one while discarding the other silently is worse
   than saying so.
 
-## Metrics commands
+## duties, validators
 
-`duties`, `validators`, and `version` read a Prometheus `/metrics` page
-instead of the Beacon API. `duties` and `validators` read the validator
-client's own page, and accept `--vc-metric-url` (or `$TEKOPS_VC_METRIC_URL`)
-to point at a non-default endpoint (default: `http://localhost:8010/metrics`).
-
-`version` reads both processes' pages, since only one of them exports the
-version metric it's after at a time. It accepts `--bn-metric-url` (or
-`$TEKOPS_BN_METRIC_URL`, default `http://localhost:8008/metrics`) for the
-beacon node alongside `--vc-metric-url` for the validator client. If the two
-resolve to the same URL, tekops scrapes it once rather than twice - that's
-one process exporting both families, the shape an all-in-one deployment
-takes.
-
-If `duties` or `validators`' endpoint responds but doesn't export the metric
-being asked for, they fail with an error rather than reporting a confident
-zero - pointing at the beacon node's metrics port instead of the validator
-client's would otherwise render as "this validator published nothing".
-
-`duties` and `validators` are a local equivalent of Grafana panel queries like
+`duties` and `validators` read the validator client's Prometheus `/metrics`
+page instead of the Beacon API. They are a local equivalent of Grafana panel
+queries like
 `sum(validator_beacon_node_requests_total{method="...",outcome="success"})`.
 `tekops` fetches the raw exposition text and filters/sums locally, since a
 single node's `/metrics` page has no query engine behind it (and no `instance`
@@ -713,14 +691,105 @@ label to filter on - that's added by Prometheus at scrape time).
   (validator_local_validator_counts{instance=~"$system"}))`), and total
   locally-stated ETH balance (summed from `validator_local_validator_balances`,
   reported in Gwei and converted to ETH).
-- **`version`** prints a three-column table (Process, Version, Endpoint), one
-  row for the beacon node and one for the validator client, each version read
-  from the `version` label on that process's own `beacon_teku_version_total`
-  or `validator_teku_version_total`. A process that didn't answer gets the
-  failure reason in place of a version, and the command still exits `0` as
-  long as one of the two answered - both have to be unreachable for `version`
-  to fail. `--json` prints `{"beacon_node": {...}, "validator_client":
-  {...}}`, one object per process rather than a single list.
+
+If the endpoint responds but doesn't export the metric being asked for, they
+fail with an error rather than reporting a confident zero - pointing at the
+beacon node's metrics port instead of the validator client's would otherwise
+render as "this validator published nothing".
+
+## version
+
+Prints a three-column table (Process, Version, Endpoint), one row for the
+beacon node and one for the validator client, each version read from the
+`version` label on that process's own `beacon_teku_version_total` or
+`validator_teku_version_total`.
+
+`version` reads both processes' `/metrics` pages, since only one of them
+exports the version metric it's after at a time. If the two resolve to the
+same URL, tekops scrapes it once rather than twice - that's one process
+exporting both families, the shape an all-in-one deployment takes.
+
+A process that didn't answer gets the failure reason in place of a version,
+and the command still exits `0` as long as one of the two answered - both have
+to be unreachable for `version` to fail. `--json` prints `{"beacon_node":
+{...}, "validator_client": {...}}`, one object per process rather than a
+single list.
+
+## autocomplete
+
+    tekops autocomplete           # detect the shell from $SHELL, show the plan, confirm
+    tekops autocomplete zsh       # install for a named shell (bash, zsh, or fish)
+    tekops autocomplete zsh -y    # skip the confirmation (--yes also works)
+    tekops autocomplete zsh --print   # write the script to stdout, install nothing
+
+Nothing is written until you have seen exactly what will be written and said
+yes. Re-running is safe: the completion script is rewritten, and the rc stanza
+is added once and then recognized and left alone.
+
+What lands where, per shell:
+
+| Shell | Completion script | rc file |
+|-------|-------------------|---------|
+| bash  | `~/.local/share/bash-completion/completions/tekops` | one guarded `source` line |
+| zsh   | `~/.zfunc/_tekops` | `fpath` + `compinit` stanza |
+| fish  | `~/.config/fish/completions/tekops.fish` | none needed |
+
+`$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are honoured where they apply. On
+macOS the bash stanza goes to `~/.bash_profile` rather than `~/.bashrc`,
+because Terminal starts bash as a login shell and a login bash never reads
+`.bashrc`.
+
+bash gets a `source` line even though its directory is `bash-completion`'s own
+auto-loading one, because that package is not installed by default on macOS,
+whose system bash is 3.2. The generated script is self-contained, so sourcing
+it directly works either way.
+
+Start a new shell to pick the completions up.
+
+To remove them, delete the completion script and the three marked lines from
+your rc file. There is no uninstall command.
+
+The script is generated from the CLI definition at the moment you run the
+command, so it can never drift from the commands tekops actually has. It is
+still a snapshot on disk, so `tekops update` re-renders any completion script
+you already have installed, using the newly installed binary.
+
+## update
+
+    tekops update              # check, show current -> latest, confirm, install
+    tekops update check        # check only, never installs
+    tekops update latest       # install the latest release, no prompt
+    tekops update 0.3.0        # install that exact release, no prompt
+    tekops update -y           # take the latest without confirming (--yes also works)
+
+An explicit version installs exactly that, older or newer, so
+`tekops update <previous-version>` is also the rollback.
+
+`tekops update check --json` prints
+`{"current":"0.3.1","latest":"0.4.0","update_available":true}` and exits 0
+whether or not an update exists - 0 means the check succeeded.
+
+The download is verified against the release's `SHA256SUMS` and the new binary
+is run once with `--version` before it replaces anything, so a failed update
+leaves the working binary in place. Note what the checksum proves: it is
+fetched from the same release as the tarball, so it catches corruption and a
+wrong-platform asset, not a compromised repository. The channel guarantee is
+TLS.
+
+If tekops lives in a root-owned directory such as `/usr/local/bin`, run the
+update under `sudo`. It checks for write access before downloading anything,
+so the wrong invocation fails immediately.
+
+After a successful install, any shell completion script you already have is
+re-rendered by running the new binary, so a release that adds a command does
+not leave you completing the old set. Nothing is installed that was not there
+before, and no rc file is touched. If that step fails the update still
+succeeded - it prints a warning naming `tekops autocomplete` as the fix.
+
+If you installed tekops with Homebrew, update it with `brew upgrade tekops`.
+`tekops update` refuses to install over a Homebrew-managed binary, before it
+downloads anything, because Homebrew would still think the old version was
+installed. `tekops update check` works either way.
 
 ## Docker deployments
 
@@ -901,6 +970,22 @@ tekops does not store credentials.
 
 ## Common behaviour
 
+### Endpoints
+
+The commands that read the Beacon API (`peers`, `health`, `head`, `doctor`,
+`log-level`) accept `--api-url` (or `$TEKOPS_API_URL`) to point at a
+non-default endpoint (default: `http://localhost:5051`).
+
+The commands that read a Prometheus `/metrics` page accept `--vc-metric-url`
+(or `$TEKOPS_VC_METRIC_URL`, default `http://localhost:8010/metrics`) for the
+validator client. `version` and `doctor` also read the beacon node's page and
+accept `--bn-metric-url` (or `$TEKOPS_BN_METRIC_URL`, default
+`http://localhost:8008/metrics`).
+
+Those defaults are bare-metal's; the other stacks move them - see
+[Stack profiles](#stack-profiles) and
+[The metrics endpoints](#the-metrics-endpoints).
+
 ### --json
 
 `peers`, `health`, `head`, `log-level`, `duties`, `validators`, and `version`
@@ -926,79 +1011,3 @@ against its own local endpoints, and dropping TLS removes `rustls` and `ring`
 (and all C compilation) from the build, cutting the binary roughly in half.
 An `https://` URL fails immediately with `cannot make HTTPS request because
 no TLS backend is configured` rather than doing anything surprising.
-
-## Shell completion
-
-    tekops autocomplete           # detect the shell from $SHELL, show the plan, confirm
-    tekops autocomplete zsh       # install for a named shell (bash, zsh, or fish)
-    tekops autocomplete zsh -y    # skip the confirmation (--yes also works)
-    tekops autocomplete zsh --print   # write the script to stdout, install nothing
-
-Nothing is written until you have seen exactly what will be written and said
-yes. Re-running is safe: the completion script is rewritten, and the rc stanza
-is added once and then recognized and left alone.
-
-What lands where, per shell:
-
-| Shell | Completion script | rc file |
-|-------|-------------------|---------|
-| bash  | `~/.local/share/bash-completion/completions/tekops` | one guarded `source` line |
-| zsh   | `~/.zfunc/_tekops` | `fpath` + `compinit` stanza |
-| fish  | `~/.config/fish/completions/tekops.fish` | none needed |
-
-`$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` are honoured where they apply. On
-macOS the bash stanza goes to `~/.bash_profile` rather than `~/.bashrc`,
-because Terminal starts bash as a login shell and a login bash never reads
-`.bashrc`.
-
-bash gets a `source` line even though its directory is `bash-completion`'s own
-auto-loading one, because that package is not installed by default on macOS,
-whose system bash is 3.2. The generated script is self-contained, so sourcing
-it directly works either way.
-
-Start a new shell to pick the completions up.
-
-To remove them, delete the completion script and the three marked lines from
-your rc file. There is no uninstall command.
-
-The script is generated from the CLI definition at the moment you run the
-command, so it can never drift from the commands tekops actually has. It is
-still a snapshot on disk, so `tekops update` re-renders any completion script
-you already have installed, using the newly installed binary.
-
-## Updating
-
-    tekops update              # check, show current -> latest, confirm, install
-    tekops update check        # check only, never installs
-    tekops update latest       # install the latest release, no prompt
-    tekops update 0.3.0        # install that exact release, no prompt
-    tekops update -y           # take the latest without confirming (--yes also works)
-
-An explicit version installs exactly that, older or newer, so
-`tekops update <previous-version>` is also the rollback.
-
-`tekops update check --json` prints
-`{"current":"0.3.1","latest":"0.4.0","update_available":true}` and exits 0
-whether or not an update exists - 0 means the check succeeded.
-
-The download is verified against the release's `SHA256SUMS` and the new binary
-is run once with `--version` before it replaces anything, so a failed update
-leaves the working binary in place. Note what the checksum proves: it is
-fetched from the same release as the tarball, so it catches corruption and a
-wrong-platform asset, not a compromised repository. The channel guarantee is
-TLS.
-
-If tekops lives in a root-owned directory such as `/usr/local/bin`, run the
-update under `sudo`. It checks for write access before downloading anything,
-so the wrong invocation fails immediately.
-
-After a successful install, any shell completion script you already have is
-re-rendered by running the new binary, so a release that adds a command does
-not leave you completing the old set. Nothing is installed that was not there
-before, and no rc file is touched. If that step fails the update still
-succeeded - it prints a warning naming `tekops autocomplete` as the fix.
-
-If you installed tekops with Homebrew, update it with `brew upgrade tekops`.
-`tekops update` refuses to install over a Homebrew-managed binary, before it
-downloads anything, because Homebrew would still think the old version was
-installed. `tekops update check` works either way.

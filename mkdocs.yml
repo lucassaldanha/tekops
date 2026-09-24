@@ -45,3 +45,4 @@ markdown_extensions:
   - pymdownx.superfences
   - toc:
       permalink: true
+      toc_depth: 2
