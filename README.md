@@ -41,7 +41,14 @@ that host.
 
 ## Install
 
-Download the binary for your platform from the [latest release](https://github.com/lucassaldanha/tekops/releases/latest):
+With [Homebrew](https://brew.sh), on macOS (Apple silicon) or Linux:
+
+    brew install lucassaldanha/tekops/tekops
+
+This also installs shell completions. Update with `brew upgrade tekops`, not
+`tekops update`.
+
+Or download the binary for your platform from the [latest release](https://github.com/lucassaldanha/tekops/releases/latest):
 
 | Platform | Asset |
 | --- | --- |

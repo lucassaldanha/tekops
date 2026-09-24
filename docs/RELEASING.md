@@ -151,6 +151,9 @@ Either way the run:
 4. Builds, signs and notarizes the three targets.
 5. Creates the tag and publishes the release with generated notes, the three
    tarballs and `SHA256SUMS`.
+6. Renders the Homebrew formula from that `SHA256SUMS` and pushes it to
+   [`lucassaldanha/homebrew-tekops`](https://github.com/lucassaldanha/homebrew-tekops)
+   as `Formula/tekops.rb` - see [The Homebrew tap](#the-homebrew-tap).
 
 **The tag is created last, by `gh release create --target`.** So a failing
 test or a broken macOS signing leg leaves a bump commit on the branch and no
@@ -239,6 +242,35 @@ would otherwise pick an `aarch64` image.
 Both Linux binaries are statically linked with no runtime deps on the node
 (`file` confirms `static-pie linked` for x86_64 and `statically linked` for
 aarch64), so nothing but that one file has to reach it.
+
+## The Homebrew tap
+
+`brew install lucassaldanha/tekops/tekops` reads `Formula/tekops.rb` from
+`lucassaldanha/homebrew-tekops`. Nobody edits that file: the `tap` job in
+`release.yml` overwrites it on every release with the output of
+`scripts/render-formula.sh`, which installs the published tarballs as they are
+(so the macOS binary is the signed one) and fails rather than render a formula
+missing any platform.
+
+The job pushes with the **`TEKOPS_TAP_TOKEN`** repository secret, a
+fine-grained personal access token with access to `homebrew-tekops` only and
+`Contents: Read and write`. `github.token` cannot push to another repository.
+**The token expires** (a year at most); when it does, the `tap` job fails
+with an authentication error on clone, after the release itself has already
+published. Make a new token, then:
+
+    gh secret set TEKOPS_TAP_TOKEN --repo lucassaldanha/tekops
+    gh run rerun <run id> --job <tap job id>
+
+Re-running `tap` for a release that is already in the formula is a no-op, so
+it is always safe to retry.
+
+**Verify a formula change with a real `brew install`, not `brew audit`.**
+Copy the rendered file into a scratch tap under
+`$(brew --repository)/Library/Taps/`, `brew install` it, run `brew test`, then
+`brew uninstall` and `brew untap`. Homebrew's developer commands (`audit`,
+`style`) install gems into Homebrew's own bundle and have broken Homebrew on
+the maintainer's Mac doing it.
 
 ## How the workflows are shaped
 

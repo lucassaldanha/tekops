@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::env;
 use std::fmt;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -1526,6 +1527,7 @@ fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateE
             Ok(())
         }
         UpdateTarget::Prompt | UpdateTarget::Latest => {
+            refuse_if_homebrew()?;
             let prompt = matches!(target, UpdateTarget::Prompt);
             let result = update::check(curl::fetch)?;
             if !result.update_available {
@@ -1541,8 +1543,24 @@ fn run_update(target: UpdateTarget, json: bool, yes: bool) -> Result<(), UpdateE
         // An explicit tag means "make the binary be exactly this", which is
         // both the rollback path and the repair path for a corrupt install, so
         // it neither prompts nor refuses to go backwards.
-        UpdateTarget::Version(version) => install_version(&version),
+        UpdateTarget::Version(version) => {
+            refuse_if_homebrew()?;
+            install_version(&version)
+        }
     }
+}
+
+/// Stops an install before any network call when Homebrew owns the binary.
+/// `check` is left alone: it changes nothing, so it is as useful to a Homebrew
+/// user as to anyone. `current_exe` is the `bin/` symlink when launched through
+/// it, so the Cellar path only shows after canonicalizing.
+fn refuse_if_homebrew() -> Result<(), UpdateError> {
+    let exe = env::current_exe().map_err(|e| UpdateError::Io(e.to_string()))?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    if update::homebrew_managed(&exe) {
+        return Err(UpdateError::HomebrewManaged);
+    }
+    Ok(())
 }
 
 /// The environment-reading half of `tekops autocomplete`; everything it decides

@@ -105,6 +105,7 @@ pub enum UpdateError {
     ExtractFailed(String),
     SmokeTestFailed(String),
     NotWritable { dir: PathBuf, source: String },
+    HomebrewManaged,
     Io(String),
 }
 
@@ -137,6 +138,10 @@ impl fmt::Display for UpdateError {
                 f,
                 "cannot write to {}: {source}\ntry re-running under sudo",
                 dir.display()
+            ),
+            UpdateError::HomebrewManaged => write!(
+                f,
+                "this tekops was installed by Homebrew; run `brew upgrade tekops` instead"
             ),
             UpdateError::Io(msg) => write!(f, "{msg}"),
         }
@@ -305,6 +310,20 @@ fn install_binary(src: &Path, dest: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Whether `exe`, already canonicalized, is a binary Homebrew installed.
+///
+/// Replacing one in place would leave Homebrew recording a version that is no
+/// longer there, and replacing the `bin/` symlink instead would put an
+/// unmanaged file in Homebrew's prefix. Either way the next `brew upgrade`
+/// is working against a lie. Every Homebrew prefix keeps kegs at
+/// `<prefix>/Cellar/<formula>/<version>/`, so that pair is the tell.
+pub fn homebrew_managed(exe: &Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    parts
+        .windows(2)
+        .any(|w| w[0] == "Cellar" && w[1] == "tekops")
+}
+
 /// The tekops build that is running, which is a different question from
 /// `tekops version` (the running Teku's version, read from the metrics
 /// endpoint).
@@ -462,6 +481,38 @@ mod tests {
             script.contains(&format!("asset_target=\"{target}\"")),
             "build-release.sh publishes no asset named {target}"
         );
+    }
+
+    #[test]
+    fn a_binary_in_the_homebrew_cellar_is_homebrew_managed() {
+        for path in [
+            "/opt/homebrew/Cellar/tekops/0.11.0/bin/tekops",
+            "/usr/local/Cellar/tekops/0.11.0/bin/tekops",
+            "/home/linuxbrew/.linuxbrew/Cellar/tekops/0.11.0/bin/tekops",
+        ] {
+            assert!(homebrew_managed(Path::new(path)), "{path}");
+        }
+    }
+
+    /// Only the resolved Cellar path counts. The `bin/` symlink is what a
+    /// caller gets from `current_exe` before canonicalizing, and a hand-copied
+    /// binary in the same prefix is not Homebrew's to manage.
+    #[test]
+    fn anything_outside_the_cellar_is_not_homebrew_managed() {
+        for path in [
+            "/usr/local/bin/tekops",
+            "/opt/homebrew/bin/tekops",
+            "/home/me/Cellar/other/bin/tekops",
+            "/home/me/tekops/Cellar/bin/tekops",
+        ] {
+            assert!(!homebrew_managed(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_homebrew_refusal_says_what_to_run_instead() {
+        let msg = UpdateError::HomebrewManaged.to_string();
+        assert!(msg.contains("brew upgrade tekops"), "{msg}");
     }
 
     #[test]

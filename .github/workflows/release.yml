@@ -181,3 +181,53 @@ jobs:
             --generate-notes \
             artifacts/*.tar.gz \
             artifacts/SHA256SUMS
+
+  # Points the Homebrew tap at the release that was just published. After
+  # `release` rather than inside it: the formula's urls only resolve once the
+  # assets are public, and a failure here leaves a good release that only needs
+  # this job re-run, not a half-published one.
+  tap:
+    name: update homebrew tap
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    # Nothing in this repository is written; the push goes to the tap with its
+    # own token.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      # A fine-grained token scoped to lucassaldanha/homebrew-tekops alone,
+      # Contents: read and write. github.token cannot push to another repo.
+      # Checked explicitly because a missing or misspelled secret is an empty
+      # string, which would otherwise surface as a confusing clone failure.
+      - name: Render and push the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.TEKOPS_TAP_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "TEKOPS_TAP_TOKEN is not set; see docs/RELEASING.md" >&2
+            exit 1
+          fi
+          # The published SHA256SUMS rather than a rebuilt one, so the formula
+          # carries exactly the checksums users download.
+          gh release download "$TAG" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/lucassaldanha/homebrew-tekops.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          scripts/render-formula.sh "$TAG" "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/tap/Formula/tekops.rb"
+          cd "$RUNNER_TEMP/tap"
+          git add Formula/tekops.rb
+          # A re-run for the same release renders the same file; that is done,
+          # not a failure.
+          if git diff --cached --quiet; then
+            echo "formula already at $TAG"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "tekops ${TAG#v}"
+          git push origin HEAD

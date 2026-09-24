@@ -997,3 +997,8 @@ re-rendered by running the new binary, so a release that adds a command does
 not leave you completing the old set. Nothing is installed that was not there
 before, and no rc file is touched. If that step fails the update still
 succeeded - it prints a warning naming `tekops autocomplete` as the fix.
+
+If you installed tekops with Homebrew, update it with `brew upgrade tekops`.
+`tekops update` refuses to install over a Homebrew-managed binary, before it
+downloads anything, because Homebrew would still think the old version was
+installed. `tekops update check` works either way.

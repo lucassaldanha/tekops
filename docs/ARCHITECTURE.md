@@ -1565,6 +1565,18 @@ There is deliberately **no automatic update check**: no startup probe, no
 cache file, no staleness policy, no disable flag. Nothing touches the
 network unless the user typed `update`.
 
+**A Homebrew-installed binary is refused, not updated.** Replacing the keg's
+file would leave Homebrew recording a version that is gone, and replacing the
+`bin/` symlink would put an unmanaged file in Homebrew's prefix; either way
+the next `brew upgrade` works from a false picture. `homebrew_managed` looks
+for `Cellar/tekops` in the canonicalized path - `current_exe()` returns the
+symlink when launched through it, so the check in `cli.rs` canonicalizes
+first. It runs before the network is touched, and `update check` skips it
+because it changes nothing. The formula itself is rendered by
+`scripts/render-formula.sh` from the published `SHA256SUMS`, and
+`tests/homebrew_formula.rs` pins it to the asset names `build-release.sh`
+publishes.
+
 ## `term.rs`
 
 Making untrusted text safe to print to a terminal.
